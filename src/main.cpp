@@ -1,12 +1,14 @@
-// radar_car — Phase 1 board bring-up demo (LCD + Touch + LVGL)
+// VietHUD (formerly radar_car) — Phase 1 board bring-up demo (LCD + Touch + LVGL)
 //
-// SUPERSEDED as the product build 2026-09-14 by src/main_ui_demo.cpp (the
-// real Dashboard/Settings/radar/GNSS app, built by env:uidemo — now
-// platformio.ini's default_envs). This file is kept in the tree and still
-// builds under env:jc3248w535, same role as env:rawtest: a minimal, known-
-// good LCD+touch-only build for isolating display/touch hardware issues from
-// application logic, not something to extend with product features. If
-// you're looking for the actual app, see main_ui_demo.cpp instead.
+// SUPERSEDED as the product build 2026-09-14 by src/main_viethud.cpp (the
+// real Dashboard/Settings/GNSS app, built by env:viethud — now
+// platformio.ini's default_envs; renamed from main_ui_demo.cpp/env:uidemo
+// 2026-09-21 when radar was removed entirely). This file is kept in the
+// tree and still builds under env:jc3248w535, same role as env:rawtest: a
+// minimal, known-good LCD+touch-only build for isolating display/touch
+// hardware issues from application logic, not something to extend with
+// product features. If you're looking for the actual app, see
+// main_viethud.cpp instead.
 //
 // What this proves out on its own:
 //   1. PlatformIO build + flash for the JC3248W535 (ESP32-S3-N16R8V) board
@@ -97,7 +99,7 @@ static void buildDemoScreen() {
     lv_obj_t *title = lv_label_create(scr);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_label_set_text(title, "Radar Car - Phase 1 Bring-up");
+    lv_label_set_text(title, "VietHUD - Phase 1 Bring-up");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
 
     lv_obj_t *subtitle = lv_label_create(scr);
@@ -155,27 +157,27 @@ static void diagnosticsTimerCb(lv_timer_t *) {
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println("\n[radar_car] Phase 1 bring-up demo starting...");
-    Serial.printf("[radar_car] Chip: %s rev %d, %d MHz, %d cores\n", ESP.getChipModel(), ESP.getChipRevision(),
+    Serial.println("\n[viethud-bringup] Phase 1 bring-up demo starting...");
+    Serial.printf("[viethud-bringup] Chip: %s rev %d, %d MHz, %d cores\n", ESP.getChipModel(), ESP.getChipRevision(),
                   ESP.getCpuFreqMHz(), ESP.getChipCores());
-    Serial.printf("[radar_car] Flash: %u MB, PSRAM: %u MB\n", (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)),
+    Serial.printf("[viethud-bringup] Flash: %u MB, PSRAM: %u MB\n", (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)),
                   (unsigned)(ESP.getPsramSize() / (1024 * 1024)));
 
     pinMode(TFT_BL, OUTPUT);
     digitalWrite(TFT_BL, HIGH);
 
     if (!gfx->begin()) {
-        Serial.println("[radar_car] ERROR: display init failed");
+        Serial.println("[viethud-bringup] ERROR: display init failed");
     }
     // NOTE: do NOT call gfx->setRotation() on the raw panel driver — on this
     // board it corrupts the write-address window and the screen stays blank
     // (confirmed on real hardware). TFT_ROTATION is 0 (native portrait) in
     // dispcfg.h specifically to avoid ever exercising that code path.
     gfx->fillScreen(BLACK);
-    Serial.printf("[radar_car] Display ready: %dx%d\n", gfx->width(), gfx->height());
+    Serial.printf("[viethud-bringup] Display ready: %dx%d\n", gfx->width(), gfx->height());
 
     if (!touch.begin()) {
-        Serial.println("[radar_car] ERROR: touch I2C init failed");
+        Serial.println("[viethud-bringup] ERROR: touch I2C init failed");
     }
     touch.setRotation(TFT_ROTATION);
     touch.enableOffsetCorrection(true);
@@ -199,7 +201,7 @@ void setup() {
     buildDemoScreen();
     lv_timer_create(diagnosticsTimerCb, 500, NULL);
 
-    Serial.println("[radar_car] Phase 1 bring-up complete. LVGL demo running.");
+    Serial.println("[viethud-bringup] Phase 1 bring-up complete. LVGL demo running.");
 }
 
 void loop() {
