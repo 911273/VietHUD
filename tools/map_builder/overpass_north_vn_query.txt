@@ -1,0 +1,6 @@
+[out:xml][timeout:600];
+(
+  way["highway"~"^(motorway|trunk|primary|secondary|tertiary|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"](19.8,102.0,23.5,108.5);
+);
+(._;>;);
+out body;
