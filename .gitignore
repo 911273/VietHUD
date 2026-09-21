@@ -1,0 +1,8 @@
+.pio/
+compile_commands.json
+data/speedmap/*.bin
+tools/map_builder/wyn_assets/
+tools/map_builder/__pycache__/
+tools/map_builder/*_output/
+tools/map_builder/output/
+*.osm
