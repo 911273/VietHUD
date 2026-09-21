@@ -3,7 +3,7 @@
 #include "display/DisplayDriver.h" // gfx->width()/height() — orientation-aware layout
 #include "core/AppConfig.h"
 #include "core/NvsStore.h"
-#include "core/SharedState.h" // radarSnapshot()/gnssSnapshot()/roadInfoSnapshot() for the Sensors diagnostics panel
+#include "core/SharedState.h" // gnssSnapshot()/roadInfoSnapshot() for the Sensors diagnostics panel
 #include "map/SpeedLimitManager.h" // speedSourceStr() — Speed Map group in the Sensors tab
 #include "net/WebPortal.h"    // webPortalIsEnabled()/webPortalRequestEnable() — WiFi tab
 #include <string.h>
@@ -18,23 +18,22 @@ struct SliderBinding {
     float divisor;
     const char *unit;
 };
-// 23 in use as of the Radar tracking group (2026-09-15) — this had silently
-// reached exactly 20/20 (this array's old size) before that addition, i.e.
-// the "some headroom left" this comment used to claim was already stale;
-// 32 gives real headroom again, checked by counting addSliderRow() call
-// sites directly rather than trusting the previous comment a second time.
-static SliderBinding sliderBindings[32];
+// 4 in use (Brightness, Dim-after-stopped, GNSS speed-filter smoothing, GNSS
+// fix timeout) after radar removal 2026-09-21 dropped the ~19 radar-only
+// slider rows this array used to size against (was 32 wide for that reason
+// — see git history). Sized with real headroom again, checked by counting
+// addSliderRow() call sites directly rather than trusting an old comment.
+static SliderBinding sliderBindings[8];
 static int sliderCount = 0;
 
 struct SwitchBinding {
     lv_obj_t *sw;
     bool *target;
 };
-// Bumped 8->12 (2026-09-16, alongside adding tripLoggingEnabled) — that
-// addition would have made this array exactly full (8/8) with zero headroom
-// left, the same "silently reached exactly N/N" situation sliderBindings'
-// own comment above already warns against repeating.
-static SwitchBinding switchBindings[12]; // 8 in use as of tripLoggingEnabled (2026-09-16)
+// 2 in use (Alert audio enabled, Trip logging) after radar removal
+// 2026-09-21 dropped the radar-only demo-mode/mount-flip switches this
+// array used to size against (was 12 wide for that reason).
+static SwitchBinding switchBindings[6];
 static int switchCount = 0;
 
 static lv_obj_t *settingsStatusLabel;
@@ -76,13 +75,6 @@ static void onSwitchChanged(lv_event_t *e) {
     *(b->target) = lv_obj_has_state(b->sw, LV_STATE_CHECKED);
     lv_label_set_text(settingsStatusLabel, "");
     clampConfig(cfg); // no switch affects brightness, so no applyConfig() call needed here
-    // Demo mode only takes effect at boot (main_ui_demo.cpp picks
-    // simTaskStart() vs. radarTaskStart() once in setup()) — same reasoning
-    // as screenRotation's own restart requirement, see AppConfig.h's
-    // demoMode comment.
-    if (b->target == &cfg.demoMode) {
-        lv_label_set_text(settingsStatusLabel, "Restart to apply demo mode");
-    }
 }
 
 // Not wired through the generic SwitchBinding/onSwitchChanged above:
@@ -134,9 +126,9 @@ static void onWifiKbReadyOrCancel(lv_event_t *) {
 // Row layout tuned for the ~372px-wide / 260px-tall LANDSCAPE category
 // content panel (see buildSettingsScreen) — panels don't scroll (except the
 // Sensors tab), so every category's total row count x pitch must stay under
-// 260px there. Tightened from 30/24px to 26/22px 2026-09-14 when the Radar
-// tab grew to 8 sliders + a diagnostic row; re-check this budget before
-// adding more rows to any tab.
+// 260px there. Tightened from 30/24px to 26/22px 2026-09-14 (originally for
+// the now-removed Radar tab); re-check this budget before adding more rows
+// to any tab.
 //
 // Width-aware (user-requested 2026-09-15, screen rotation): portrait's
 // content panel is ~220px wide instead of landscape's ~380px — too narrow
@@ -292,11 +284,11 @@ static void addSwitchRow(lv_obj_t *parent, int &y, const char *name, bool *targe
 }
 
 // Read-only diagnostic row (name + live value) — spec section 16.6/16.7
-// "check" fields (Fix, Satellites, Speed, Radar status, Target count).
-// No binding/callback, unlike the slider/switch rows above: the value
-// label is just handed back so refreshSensorsPanel() can update it on a
-// timer. Kept as plain named lv_obj_t* pointers below rather than a generic
-// array — there are only 6 of them and each needs different formatting.
+// "check" fields (GNSS fix, satellites, speed, Speed Map status). No
+// binding/callback, unlike the slider/switch rows above: the value label is
+// just handed back so refreshSensorsPanel() can update it on a timer. Kept
+// as plain named lv_obj_t* pointers below rather than a generic array —
+// there are only a handful and each needs different formatting.
 // Value column position is relative to the parent's real width (not a
 // fixed x=220) for the same portrait-width reasoning addSliderRow() gives —
 // every value shown through this row is short enough (a number, "OK",
@@ -316,14 +308,11 @@ static lv_obj_t *addReadonlyRow(lv_obj_t *parent, int &y, const char *name) {
     return valLbl;
 }
 
-// The radar Link diagnostic row's value ("frames=... errs=... qty=... alarm=...
-// snr=...") is long enough (~40 chars) that it doesn't fit the ~160px-wide
-// value column the two-column addReadonlyRow() layout above gives every
-// other (short: "OK"/a number/"12.3 km/h") readonly row — confirmed by
-// character count against the panel's own ~372px content width, not
-// assumed: at this font, ~150px only fits ~20 characters, well under 40.
-// Stacked instead: name on its own line, value below spanning nearly the
-// full panel width, which comfortably fits the whole string on one line.
+// For a value string long enough (e.g. the WiFi tab's "ON, IP=192.168.4.1")
+// that it doesn't comfortably fit the ~160px-wide value column the
+// two-column addReadonlyRow() layout above gives every other (short:
+// "OK"/a number/"12.3 km/h") readonly row. Stacked instead: name on its own
+// line, value below spanning nearly the full panel width.
 static lv_obj_t *addWideReadonlyRow(lv_obj_t *parent, int &y, const char *name) {
     lv_obj_t *nameLbl = lv_label_create(parent);
     lv_label_set_text(nameLbl, name);
@@ -338,8 +327,7 @@ static lv_obj_t *addWideReadonlyRow(lv_obj_t *parent, int &y, const char *name) 
     return valLbl;
 }
 
-static lv_obj_t *radarStatusVal, *gnssFixVal, *gnssSatsVal, *gnssSpeedRawVal, *gnssSpeedFilteredVal, *targetCountVal;
-static lv_obj_t *radarDiagVal; // Settings > Radar tab — frames/errors/last-frame detail, more than the brief OK/FAULT above
+static lv_obj_t *gnssFixVal, *gnssSatsVal, *gnssSpeedRawVal, *gnssSpeedFilteredVal;
 static lv_obj_t *wifiStatusVal; // Settings > WiFi tab — see refreshSensorsPanel()
 // Settings > Sensors > "Speed Map" group — see refreshSensorsPanel(). Region/
 // version come from speedLimitManagerGetInfo() (static once loaded at boot);
@@ -355,24 +343,7 @@ static void refreshSensorsPanel(lv_timer_t *) {
     // CPU from whatever IS being interacted with.
     if (lv_screen_active() != settingsScreen) return;
 
-    RadarSnapshot radar = radarSnapshot();
     GnssSnapshot gnss = gnssSnapshot();
-
-    lv_label_set_text(radarStatusVal, radar.online ? "OK" : "FAULT");
-    lv_obj_set_style_text_color(radarStatusVal, radar.online ? lv_color_hex(0x33CC66) : lv_color_hex(0xFF3B30), 0);
-
-    int activeCount = 0;
-    for (int i = 0; i < MAX_TARGETS; i++)
-        if (radar.targets[i].active) activeCount++;
-    lv_label_set_text_fmt(targetCountVal, "%d", activeCount);
-
-    // User-reported 2026-09-16 seeing radar FAULT and wanting to be sure
-    // the link is genuinely OK — this is the evidence: live frame/error
-    // counters straight from radar/LD2451.cpp's parser, not just a
-    // collapsed OK/FAULT verdict. A healthy link looks like "frames"
-    // climbing every refresh with "errs" staying flat.
-    lv_label_set_text_fmt(radarDiagVal, "frames=%lu errs=%lu qty=%u alarm=%u snr=%u", radar.framesParsed,
-                           radar.parseErrors, radar.lastTargetQty, radar.lastAlarm, radar.lastSnr);
 
     // Three states — see Dashboard.cpp's gnssStatusWord for why "no fix
     // yet" (SEARCHING, normal while cold-starting/indoors) must read
@@ -560,7 +531,7 @@ static void onRestoreDefaults(lv_event_t *) {
 // pre-built and toggled via LV_OBJ_FLAG_HIDDEN (no rebuild/flicker on
 // switching). Whole screen fits with no scrolling; Save/Defaults stay in a
 // fixed footer visible from every category.
-static const int kCategoryCount = 5;
+static const int kCategoryCount = 3;
 static lv_obj_t *categoryPanels[kCategoryCount];
 static lv_obj_t *navButtons[kCategoryCount];
 
@@ -638,7 +609,7 @@ void buildSettingsScreen() {
     lv_obj_set_style_pad_all(navRail, 4, 0);
     lv_obj_clear_flag(navRail, LV_OBJ_FLAG_SCROLLABLE);
 
-    static const char *kCategoryNames[kCategoryCount] = {"Radar", "Safety", "Display", "Sensors", "WiFi"};
+    static const char *kCategoryNames[kCategoryCount] = {"Display", "Sensors", "WiFi"};
     for (int i = 0; i < kCategoryCount; i++) {
         lv_obj_t *btn = lv_button_create(navRail);
         lv_obj_set_size(btn, NAV_W - 8, 46);
@@ -673,29 +644,14 @@ void buildSettingsScreen() {
         lv_obj_set_style_bg_color(panel, lv_color_hex(0x000000), 0); // pure black — see settingsScreen's own comment above
         lv_obj_set_style_border_width(panel, 0, 0);
         lv_obj_set_style_pad_all(panel, 4, 0);
-        // Every OTHER tab's content fits inside BODY_H with no scrolling
-        // (each one's own row-budget comment says so). The Sensors tab
-        // (i==3) doesn't anymore once the Speed Map diagnostics group is
-        // added below — 7 more fields' worth of rows genuinely doesn't fit
-        // in 260px alongside the existing GNSS/radar live-status rows, and
-        // unlike the Radar tab's earlier close call, tightening row pitch
-        // further isn't enough headroom this time. Scrolling is the
-        // correct answer for a diagnostics tab that's allowed to be long
-        // (spec section 25 calls it "for kiểm tra/cấu hình," not the
-        // driving screen), not a workaround.
-        //
-        // Display (i==2) joined the scrolling tabs 2026-09-16 for the same
-        // reason: Brightness+autoDim+4 switches+Theme+Rotation already used
-        // 242 of the 260px budget, and adding the new "Simple layout"
-        // switch (see cfg.simpleUiMode) pushed it to 268 — 8px over, which
-        // would have silently clipped the bottom of the Rotation row
-        // instead of just not being able to add anything else.
-        //
-        // Radar (i==0) joined 2026-09-21 for the same reason again: its 8
-        // sliders + the wide Link diagnostic row already used 242px, and
-        // adding the new "Radar mounted flipped 180" switch (see
-        // cfg.radarMountFlipped) pushed it to 268 — same 8px overage.
-        if (i == 3 || i == 2 || i == 0) {
+        // Display and WiFi both fit inside BODY_H with no scrolling. Sensors
+        // (i==1) doesn't — the GNSS live-status rows plus the Speed Map
+        // diagnostics group (7 fields) genuinely don't fit in 260px, and
+        // it's allowed to be long (spec section 25 calls it "for kiểm
+        // tra/cấu hình," not the driving screen) rather than needing rows
+        // trimmed to squeeze in. The old Radar/Safety tabs that used to also
+        // need scrolling here are gone entirely (radar removed 2026-09-21).
+        if (i == 1) {
             lv_obj_set_scroll_dir(panel, LV_DIR_VER);
             lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
         } else {
@@ -706,72 +662,18 @@ void buildSettingsScreen() {
     }
 
     int y;
+    // Display tab (categoryPanels[0]) — brightness/dim/theme/rotation plus
+    // the master alert-audio toggle (moved here from the old Safety tab,
+    // which no longer exists — see cfg.audioEnabled's own AppConfig.h
+    // comment for why it's still just a plain on/off, repurposed rather
+    // than removed, when radar was taken out 2026-09-21).
     y = 4;
-    addSliderRow(categoryPanels[0], y, "Max range", &cfg.maxRangeM, 10, 100, 1.0f, " m");
-    addSliderRow(categoryPanels[0], y, "Min target speed", &cfg.minTargetSpeedKmh, 0, 30, 1.0f, " km/h");
-    addSliderRow(categoryPanels[0], y, "Max targets", &cfg.maxTargets, 1, 5, 1.0f, "");
-    // Real LD2451 calibration (spec section 16.1) — pushed to the module at
-    // boot by radar/LD2451.cpp's configureRadar(). Choice buttons, not a
-    // slider (matches the vendor's own BLE config app, which shows this as
-    // a labeled picker — e.g. "Stay away and approach" for the module's
-    // raw value 2 — not a bare number; a slider here hid which of the 3
-    // discrete states was active, same "nut gat chua hop ly" complaint
-    // Theme/Rotation above already got 2026-09-16). Index order matches
-    // LD2451's own byte encoding exactly (0=away,1=approach,2=both), so
-    // onChoiceBtnClicked's `*b->target = (float)i` still writes the same
-    // values configureRadar()'s command 0x0002 byte 2 already expects.
-    static const char *kDirectionLabels[3] = {"Away", "Approach", "Both"};
-    addChoiceRow(categoryPanels[0], y, "Direction", &cfg.radarDirection, kDirectionLabels, 3);
-    addSliderRow(categoryPanels[0], y, "SNR sensitivity", &cfg.radarSnrLevel, 0, 8, 1.0f, "");
-    addSliderRow(categoryPanels[0], y, "Trigger count", &cfg.radarTriggerCount, 1, 10, 1.0f, "");
-    addSliderRow(categoryPanels[0], y, "No-target delay", &cfg.radarNoTargetDelayS, 0, 30, 1.0f, " s");
-    // Lane classification width (radar/LD2451.cpp's classifyRelation()) —
-    // half of the real lane width a target's lateral offset gets compared
-    // against to decide SAME_LANE vs. ADJACENT_LEFT/RIGHT. Added 2026-09-14
-    // alongside the switch from a fixed angle-cone to this distance-based
-    // check, so it's tunable without a firmware rebuild once real targets
-    // let someone judge whether it's classifying correctly.
-    addSliderRow(categoryPanels[0], y, "Lane half-width", &cfg.laneHalfWidthM, 5, 50, 10.0f, " m");
-    // Mounting flip (see core/AppConfig.h's radarMountFlipped comment for
-    // why this is only a 180-degree flip, not a 4-way rotation like the
-    // Display tab's screen Rotation row). Applies live — LD2451.cpp reads
-    // cfg.radarMountFlipped fresh every frame at raw-angle-decode time, no
-    // restart needed.
-    addSwitchRow(categoryPanels[0], y, "Radar mounted flipped 180", &cfg.radarMountFlipped);
-    // Live evidence for "is the radar link actually OK" (user-reported
-    // 2026-09-16) right next to the knobs that affect it — see
-    // refreshSensorsPanel() for what updates this. SNR is the raw per-target
-    // byte (0-255, see SharedState.h's SimTarget::snr) — not yet folded into
-    // confidence (no calibration data exists), shown here so real values can
-    // be observed against real targets before that formula gets written.
-    // Wide row (see addWideReadonlyRow): this value string is too long for
-    // the standard two-column readonly layout.
-    radarDiagVal = addWideReadonlyRow(categoryPanels[0], y, "Link");
-
-    y = 4;
-    addSliderRow(categoryPanels[1], y, "Audio enable speed", &cfg.audioEnableKmh, 40, 120, 1.0f, " km/h");
-    addSliderRow(categoryPanels[1], y, "Hysteresis", &cfg.hysteresisKmh, 1, 10, 1.0f, " km/h");
-    addSliderRow(categoryPanels[1], y, "TTC warning", &cfg.ttcWarnS, 10, 100, 10.0f, " s");
-    addSliderRow(categoryPanels[1], y, "TTC critical", &cfg.ttcCritS, 5, 50, 10.0f, " s");
-    addSliderRow(categoryPanels[1], y, "Min confidence", &cfg.minConfidence, 0, 100, 100.0f, "");
-    // Tailgating/harsh-brake thresholds (added 2026-09-16 — see
-    // core/AppConfig.h's minDistanceM/harshBrakeAccelMps2 comments). Grouped
-    // with the other Safety thresholds above since both feed radar.audioAllowed
-    // the same way ttcWarnS/ttcCritS/minConfidence already do.
-    addSliderRow(categoryPanels[1], y, "Min distance", &cfg.minDistanceM, 1, 20, 1.0f, " m");
-    addSliderRow(categoryPanels[1], y, "Harsh brake sensitivity", &cfg.harshBrakeAccelMps2, 10, 100, 10.0f, " m/s2");
-    addSwitchRow(categoryPanels[1], y, "Audio enabled", &cfg.audioEnabled);
-
-    y = 4;
-    addSliderRow(categoryPanels[2], y, "Brightness", &cfg.brightness, 5, 100, 1.0f, " %");
+    addSwitchRow(categoryPanels[0], y, "Alert audio enabled", &cfg.audioEnabled);
+    addSliderRow(categoryPanels[0], y, "Brightness", &cfg.brightness, 5, 100, 1.0f, " %");
     // Label updated 2026-09-16 alongside the gate itself changing from
     // touch-idle to vehicle-stationary time (see Dashboard.cpp) — "stopped"
     // says what actually starts the timer now.
-    addSliderRow(categoryPanels[2], y, "Dim after stopped", &cfg.autoDimMin, 0, 30, 1.0f, " min");
-    addSwitchRow(categoryPanels[2], y, "Show target ID", &cfg.showId);
-    addSwitchRow(categoryPanels[2], y, "Show target speed", &cfg.showSpeed);
-    addSwitchRow(categoryPanels[2], y, "Show target TTC", &cfg.showTtc);
-    addSwitchRow(categoryPanels[2], y, "Show target angle", &cfg.showAngle);
+    addSliderRow(categoryPanels[0], y, "Dim after stopped", &cfg.autoDimMin, 0, 30, 1.0f, " min");
     // Theme (user-requested 2026-09-15): 0=Auto follows GNSS.cpp's real
     // sunrise/sunset calc (unchanged default behavior), 1=Light/2=Dark force
     // it either way. Applies live — ui/Dashboard.cpp's refreshDashboard()
@@ -780,7 +682,7 @@ void buildSettingsScreen() {
     // Choice buttons, not a slider (user-reported 2026-09-16, "nut gat chua
     // hop ly") — a 3-way enum on a slider hid which option was active.
     static const char *kThemeLabels[3] = {"Auto", "Light", "Dark"};
-    addChoiceRow(categoryPanels[2], y, "Theme", &cfg.themeMode, kThemeLabels, 3);
+    addChoiceRow(categoryPanels[0], y, "Theme", &cfg.themeMode, kThemeLabels, 3);
     // Rotation: does NOT apply live — see onChoiceBtnClicked()'s special
     // case for this field and AppConfig.h's screenRotation comment for why
     // (both Dashboard and Settings are laid out once at boot for whichever
@@ -791,102 +693,67 @@ void buildSettingsScreen() {
     // because a held slider drag was what triggered the touch controller's
     // known stuck-bus quirk (2026-09-14) during the user's own testing.
     static const char *kRotationLabels[4] = {"0", "90", "180", "270"};
-    addChoiceRow(categoryPanels[2], y, "Rotation", &cfg.screenRotation, kRotationLabels, 4);
-    // Simple layout (user-requested 2026-09-16, "giao dien don gian ... tang
-    // tap trung"): hides roadArea's lane-line/target-icon graphic and shows
-    // only the same-lane primary target's distance as one large number —
-    // see AppConfig.h's simpleUiMode comment for why this is a bool/switch
-    // (not a 3rd choice row: the Display tab's 260px budget had no room
-    // left, see buildSettingsScreen's own row-budget comment). Applies live
-    // — ui/Dashboard.cpp's refreshDashboard() re-checks it every tick like
-    // Theme above, no restart needed.
-    addSwitchRow(categoryPanels[2], y, "Simple layout", &cfg.simpleUiMode);
+    addChoiceRow(categoryPanels[0], y, "Rotation", &cfg.screenRotation, kRotationLabels, 4);
 
-    // Sensors — real-hardware check/configure/calibrate (spec 16.6/16.7).
-    // GNSS (u-blox M10N, UART2) went real 2026-09-15, radar (HLK-LD2451,
-    // UART1) went real 2026-09-16 — both rows below reflect live hardware
-    // state, not simulated data. Radar's own calibration knobs (Direction/
-    // SNR/Trigger count/Lane half-width) live in the Radar tab instead of
-    // here, next to the Link diagnostic row they affect.
+    // Sensors tab (categoryPanels[1]) — real-hardware check/configure
+    // (spec 16.6/16.7). GNSS (u-blox M10N, UART2) went real 2026-09-15;
+    // radar (HLK-LD2451) went real 2026-09-16 and was removed entirely
+    // 2026-09-21 (GPS-only VietHUD product) — the old Radar-status/
+    // Radar-tracking rows that used to live here are gone with it.
     y = 4;
-    // Demo mode (user-requested 2026-09-16, "them 1 nut bat tat thu nghiem
-    // trong menu") — placed here rather than the Radar tab (already at its
-    // row-budget limit, see that tab's own comment) or Display (same
-    // problem after Theme/Rotation's choice rows). Sensors already scrolls
-    // (below), so there's no overflow risk, and this IS fundamentally a
-    // "which sensor data source" toggle — thematically the closest fit.
-    addSwitchRow(categoryPanels[3], y, "Demo mode (fake radar)", &cfg.demoMode);
-    // Trip logging (added 2026-09-16, see log/TripLogger.h) — placed here for
-    // the same "Sensors tab already scrolls, no row-budget pressure" reason
-    // demoMode's own comment above gives.
-    addSwitchRow(categoryPanels[3], y, "Trip logging (SD card)", &cfg.tripLoggingEnabled);
+    // Trip logging (added 2026-09-16, see log/TripLogger.h).
+    addSwitchRow(categoryPanels[1], y, "Trip logging (SD card)", &cfg.tripLoggingEnabled);
     y += 6; // extra breathing room before the real live-status rows below
 
-    lv_obj_t *sensorsHeader1 = lv_label_create(categoryPanels[3]);
+    lv_obj_t *sensorsHeader1 = lv_label_create(categoryPanels[1]);
     lv_label_set_text(sensorsHeader1, "Live status");
     lv_obj_set_style_text_color(sensorsHeader1, lv_color_hex(0x7C8A9A), 0);
     lv_obj_set_pos(sensorsHeader1, 4, y);
     y += 20;
-    radarStatusVal = addReadonlyRow(categoryPanels[3], y, "Radar");
-    targetCountVal = addReadonlyRow(categoryPanels[3], y, "Active targets");
-    gnssFixVal = addReadonlyRow(categoryPanels[3], y, "GNSS fix");
-    gnssSatsVal = addReadonlyRow(categoryPanels[3], y, "Satellites");
-    gnssSpeedRawVal = addReadonlyRow(categoryPanels[3], y, "Speed (raw)");
-    gnssSpeedFilteredVal = addReadonlyRow(categoryPanels[3], y, "Speed (filtered)");
+    gnssFixVal = addReadonlyRow(categoryPanels[1], y, "GNSS fix");
+    gnssSatsVal = addReadonlyRow(categoryPanels[1], y, "Satellites");
+    gnssSpeedRawVal = addReadonlyRow(categoryPanels[1], y, "Speed (raw)");
+    gnssSpeedFilteredVal = addReadonlyRow(categoryPanels[1], y, "Speed (filtered)");
 
     y += 6;
-    lv_obj_t *sensorsHeader2 = lv_label_create(categoryPanels[3]);
+    lv_obj_t *sensorsHeader2 = lv_label_create(categoryPanels[1]);
     lv_label_set_text(sensorsHeader2, "GNSS calibration");
     lv_obj_set_style_text_color(sensorsHeader2, lv_color_hex(0x7C8A9A), 0);
     lv_obj_set_pos(sensorsHeader2, 4, y);
     y += 20;
-    addSliderRow(categoryPanels[3], y, "Speed filter smoothing", &cfg.gnssSpeedFilterAlpha, 5, 90, 100.0f, "");
-    addSliderRow(categoryPanels[3], y, "Fix timeout", &cfg.gnssFixTimeoutS, 10, 100, 10.0f, " s");
-
-    // Radar tracking calibration (radar/LD2451.cpp's updateTracks(), spec
-    // section 9.1's "phải là configurable/tunable" persistence values) —
-    // placed here rather than the Radar tab (already at its row-budget
-    // limit, see that tab's own comment) and this tab already scrolls.
-    y += 6;
-    lv_obj_t *sensorsHeader4 = lv_label_create(categoryPanels[3]);
-    lv_label_set_text(sensorsHeader4, "Radar tracking");
-    lv_obj_set_style_text_color(sensorsHeader4, lv_color_hex(0x7C8A9A), 0);
-    lv_obj_set_pos(sensorsHeader4, 4, y);
-    y += 20;
-    addSliderRow(categoryPanels[3], y, "Confirm frames", &cfg.radarTrackConfirmFrames, 2, 3, 1.0f, "");
-    addSliderRow(categoryPanels[3], y, "Loss timeout", &cfg.radarTrackLossS, 2, 20, 10.0f, " s");
-    addSliderRow(categoryPanels[3], y, "Filter smoothing", &cfg.radarTrackFilterAlpha, 10, 90, 100.0f, "");
+    addSliderRow(categoryPanels[1], y, "Speed filter smoothing", &cfg.gnssSpeedFilterAlpha, 5, 90, 100.0f, "");
+    addSliderRow(categoryPanels[1], y, "Fix timeout", &cfg.gnssFixTimeoutS, 10, 100, 10.0f, " s");
 
     // Speed Map diagnostics (spec section 25) — offline microSD map-matching
-    // status, see map/SpeedLimitManager.h. This group is why categoryPanels[3]
-    // needed to become scrollable above: it doesn't fit in 260px alongside
+    // status, see map/SpeedLimitManager.h. This group is why categoryPanels[1]
+    // needs to be scrollable above: it doesn't fit in 260px alongside
     // everything already in this tab.
     y += 6;
-    lv_obj_t *sensorsHeader3 = lv_label_create(categoryPanels[3]);
+    lv_obj_t *sensorsHeader3 = lv_label_create(categoryPanels[1]);
     lv_label_set_text(sensorsHeader3, "Speed Map");
     lv_obj_set_style_text_color(sensorsHeader3, lv_color_hex(0x7C8A9A), 0);
     lv_obj_set_pos(sensorsHeader3, 4, y);
     y += 20;
-    speedMapStatusVal = addReadonlyRow(categoryPanels[3], y, "Status");
-    speedMapRegionVal = addReadonlyRow(categoryPanels[3], y, "Region");
-    speedMapVersionVal = addReadonlyRow(categoryPanels[3], y, "Version");
-    speedMapLimitVal = addReadonlyRow(categoryPanels[3], y, "Current limit");
-    speedMapSourceVal = addReadonlyRow(categoryPanels[3], y, "Source");
-    speedMapMatchVal = addReadonlyRow(categoryPanels[3], y, "Match");
-    speedMapRoadIdVal = addReadonlyRow(categoryPanels[3], y, "Road ID");
+    speedMapStatusVal = addReadonlyRow(categoryPanels[1], y, "Status");
+    speedMapRegionVal = addReadonlyRow(categoryPanels[1], y, "Region");
+    speedMapVersionVal = addReadonlyRow(categoryPanels[1], y, "Version");
+    speedMapLimitVal = addReadonlyRow(categoryPanels[1], y, "Current limit");
+    speedMapSourceVal = addReadonlyRow(categoryPanels[1], y, "Source");
+    speedMapMatchVal = addReadonlyRow(categoryPanels[1], y, "Match");
+    speedMapRoadIdVal = addReadonlyRow(categoryPanels[1], y, "Road ID");
 
     // WiFi tab (user-requested 2026-09-14 alongside the Dashboard's 4s hold
     // gesture — see net/WebPortal.h). Defaults OFF every boot; this switch
     // and the gesture both funnel through the same webPortalRequestEnable().
-    bool wifiTabNarrow = lv_obj_get_width(categoryPanels[4]) < kNarrowPanelThreshold;
+    bool wifiTabNarrow = lv_obj_get_width(categoryPanels[2]) < kNarrowPanelThreshold;
     y = 4;
     {
-        lv_obj_t *nameLbl = lv_label_create(categoryPanels[4]);
+        lv_obj_t *nameLbl = lv_label_create(categoryPanels[2]);
         lv_label_set_text(nameLbl, "WiFi enabled");
         lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
         lv_obj_set_pos(nameLbl, 4, y + 3);
-        wifiEnableSwitch = lv_switch_create(categoryPanels[4]);
-        lv_obj_set_pos(wifiEnableSwitch, lv_obj_get_width(categoryPanels[4]) - 46, y);
+        wifiEnableSwitch = lv_switch_create(categoryPanels[2]);
+        lv_obj_set_pos(wifiEnableSwitch, lv_obj_get_width(categoryPanels[2]) - 46, y);
         lv_obj_add_event_cb(wifiEnableSwitch, onWifiSwitchChanged, LV_EVENT_VALUE_CHANGED, NULL);
         y += 26;
     }
@@ -895,17 +762,17 @@ void buildSettingsScreen() {
     // threshold/reasoning as addSliderRow()'s own narrow case — the fixed
     // x=140/width=220 landscape layout below would run off the edge of a
     // ~220px-wide portrait content column otherwise.
-    lv_obj_t *ssidLbl = lv_label_create(categoryPanels[4]);
+    lv_obj_t *ssidLbl = lv_label_create(categoryPanels[2]);
     lv_label_set_text(ssidLbl, "SSID");
     lv_obj_set_style_text_color(ssidLbl, lv_color_hex(0xCCD6E0), 0);
-    wifiSsidTa = lv_textarea_create(categoryPanels[4]);
+    wifiSsidTa = lv_textarea_create(categoryPanels[2]);
     lv_textarea_set_one_line(wifiSsidTa, true);
     lv_textarea_set_max_length(wifiSsidTa, sizeof(cfg.wifiSsid) - 1);
     lv_textarea_set_text(wifiSsidTa, cfg.wifiSsid);
     if (wifiTabNarrow) {
         lv_obj_set_pos(ssidLbl, 4, y);
         lv_obj_set_pos(wifiSsidTa, 4, y + 18);
-        lv_obj_set_size(wifiSsidTa, lv_obj_get_width(categoryPanels[4]) - 8, 28);
+        lv_obj_set_size(wifiSsidTa, lv_obj_get_width(categoryPanels[2]) - 8, 28);
         y += 50;
     } else {
         lv_obj_set_pos(ssidLbl, 4, y + 6);
@@ -921,10 +788,10 @@ void buildSettingsScreen() {
     // blank and tapping elsewhere keeps the existing password unchanged —
     // onWifiKbReadyOrCancel() only overwrites cfg.wifiPassword with
     // whatever's actually typed.
-    lv_obj_t *passLbl = lv_label_create(categoryPanels[4]);
+    lv_obj_t *passLbl = lv_label_create(categoryPanels[2]);
     lv_label_set_text(passLbl, "Password");
     lv_obj_set_style_text_color(passLbl, lv_color_hex(0xCCD6E0), 0);
-    wifiPasswordTa = lv_textarea_create(categoryPanels[4]);
+    wifiPasswordTa = lv_textarea_create(categoryPanels[2]);
     lv_textarea_set_one_line(wifiPasswordTa, true);
     lv_textarea_set_password_mode(wifiPasswordTa, true);
     lv_textarea_set_max_length(wifiPasswordTa, sizeof(cfg.wifiPassword) - 1);
@@ -932,7 +799,7 @@ void buildSettingsScreen() {
     if (wifiTabNarrow) {
         lv_obj_set_pos(passLbl, 4, y);
         lv_obj_set_pos(wifiPasswordTa, 4, y + 18);
-        lv_obj_set_size(wifiPasswordTa, lv_obj_get_width(categoryPanels[4]) - 8, 28);
+        lv_obj_set_size(wifiPasswordTa, lv_obj_get_width(categoryPanels[2]) - 8, 28);
         y += 50;
     } else {
         lv_obj_set_pos(passLbl, 4, y + 6);
@@ -942,11 +809,11 @@ void buildSettingsScreen() {
     }
     lv_obj_add_event_cb(wifiPasswordTa, onWifiTaClicked, LV_EVENT_CLICKED, NULL);
 
-    wifiStatusVal = addWideReadonlyRow(categoryPanels[4], y, "Status");
+    wifiStatusVal = addWideReadonlyRow(categoryPanels[2], y, "Status");
 
     // NOT called eagerly here: buildSettingsScreen() runs before
     // sharedStateInit() in main_ui_demo.cpp's setup(), so
-    // radarSnapshot()/gnssSnapshot()'s mutex doesn't exist yet — an eager
+    // gnssSnapshot()'s mutex doesn't exist yet — an eager
     // call here crashed real hardware 2026-09-15 (xQueueSemaphoreTake
     // assert on a NULL queue, boot-looping). The 500ms timer's first tick
     // fires from loop() well after sharedStateInit() has run, so the rows

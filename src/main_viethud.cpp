@@ -1,43 +1,35 @@
-// radar_car — UI verification demo (real sensors, LVGL UI still shared with
-// the eventual production build)
+// VietHUD — GPS-only offline speed-limit/camera/traffic-sign warning device.
+// Radar (HLK-LD2451) and everything built around it were removed entirely
+// 2026-09-21 — this is a full product replacement, not a side-by-side demo
+// (see docs/VietHUD_offline_speed_alert_plan.md and README.md). Renamed
+// from main_ui_demo.cpp at the same time: this is now the one true app
+// entry point, no longer a "UI verification demo" layered on top of
+// something else — see git history if the earlier radar/demo-mode content
+// is ever needed for reference.
 //
-// GNSS (u-blox M10N, UART2) went real 2026-09-15, radar (HLK-LD2451, UART1)
-// went real 2026-09-16 — see gnss/GNSS.h and radar/LD2451.h, and
-// include/pincfg.h for both wirings. SimTask (radar/SimTask.h) is fully
-// retired now that both sensors it used to fake are real; the file is kept
-// for reference/history but no longer started. This build exercises the
-// Dashboard layout, target rendering, TTC/risk color coding, the
-// audio-gate hysteresis display, the radar/GNSS fail-safe states, and a
-// Settings screen (spec sections 16-17, 33-34, 52-61) against real sensor
-// data end to end.
+// GNSS (u-blox M10N, UART2) has been real since 2026-09-15 — see gnss/GNSS.h
+// and include/pincfg.h for the wiring. This build exercises the Dashboard
+// layout, the offline microSD speed-limit/camera/sign map matching, and a
+// Settings screen against real sensor data end to end.
 //
 // Settings changes have real, visible effect (they're not a dead mockup):
-// TTC thresholds recolor targets live, max range/min speed get pushed to
-// the LD2451 itself at boot (radar/LD2451.cpp's configureRadar()) as well
-// as rescaling the Dashboard, the audio-gate hysteresis pair drives the
-// Audio status dot, and the Brightness slider drives the *real* backlight
-// via LEDC PWM. Settings persist to NVS (ESP32 Preferences) across reboots.
-//
-// Not implemented from the spec yet: Basic/Advanced gating with long-press
-// (section 17) — nothing here is safety-certified yet, so it's left as one
-// flat Settings screen. Radar direction/SNR/trigger-count and a lane
-// half-width are in Settings > Radar and get pushed to the LD2451 / used by
-// LD2451.cpp's classifyRelation() — but a real lane-CORRIDOR model (multiple
-// lanes, curvature, etc — Phase 5) still doesn't exist; classifyRelation()
-// is a single-corridor lateral-offset check standing in for it. No buzzer
-// yet (Phase 7).
+// the Brightness slider drives the *real* backlight via LEDC PWM, Theme/
+// Rotation apply live or on next boot as documented in Settings.cpp, and
+// the alert-audio toggle gates both tone chimes and voice playback
+// (audio/AudioPlayer.h). Settings persist to NVS (ESP32 Preferences)
+// across reboots.
 //
 // This file is a thin orchestrator (module split 2026-09-14 — see
-// C:\Users\phamq\.claude\plans\idempotent-herding-zebra.md and
 // docs/V1.2_hardening_proposal.md section A): setup()/loop() wire together
-// core/ (config + mutex-protected shared state), display/, radar/ (LD2451),
-// gnss/ (GNSS), touch/ (TouchTask), net/ (WebPortal — WiFi AP + live
-// telemetry/config/OTA over HTTP, added 2026-09-14), map/ (SpeedLimitManager
-// — offline microSD speed-limit map matching by GNSS position+heading, added
-// 2026-09-15, see map/SpeedMapFormat.h for the binary database spec), and
+// core/ (config + mutex-protected shared state), display/, gnss/ (GNSS),
+// touch/ (TouchTask), net/ (WebPortal — WiFi AP + live telemetry/config/OTA
+// over HTTP, added 2026-09-14), map/ (SpeedLimitManager — offline microSD
+// speed-limit/camera/sign map matching by GNSS position+heading, added
+// 2026-09-15, see map/SpeedMapFormat.h for the binary database spec),
+// audio/ (AudioPlayer — tone chimes + queued Vietnamese voice playback), and
 // ui/ (Dashboard, Settings). The sensor tasks run independently on Core 0;
-// this file's setup()/loop() IS the UI/render task on Core 1 (the default Arduino
-// loopTask core).
+// this file's setup()/loop() IS the UI/render task on Core 1 (the default
+// Arduino loopTask core).
 
 #include <Arduino.h>
 #include <lvgl.h>
@@ -55,8 +47,6 @@
 #include "map/SpeedLimitManager.h"
 #include "log/TripLogger.h"
 #include "net/WebPortal.h"
-#include "radar/LD2451.h"
-#include "radar/SimTask.h" // TEMP DEMO 2026-09-16 — see radarTaskStart()/simTaskStart() swap below, revert before real driving use
 #include "touch/TouchTask.h"
 #include "ui/Dashboard.h"
 #include "ui/Settings.h"
@@ -91,15 +81,11 @@ static void touch_read_cb(lv_indev_t *, lv_indev_data_t *data) {
 void setup() {
     Serial.begin(115200);
     delay(200);
-    // Banner corrected 2026-09-21 — it still claimed "simulated data, no
-    // real sensors" long after the LD2451 and M10N both went real (see this
-    // file's own header), which is exactly the kind of stale line that
-    // makes a log misleading when something goes wrong in the field.
-    Serial.println("\n[uidemo] radar_car — real LD2451 radar + M10N GNSS + offline speed map");
+    Serial.println("\n[viethud] VietHUD — offline GPS speed-limit/camera/sign warning device");
     // Shared with log/TripLogger.cpp, which persists the same string into
     // every session's CSV — see tripLogResetReasonStr()'s own comment for
     // why that matters (a reset mid-drive has no serial monitor attached).
-    Serial.printf("[uidemo] last reset reason: %s\n", tripLogResetReasonStr());
+    Serial.printf("[viethud] last reset reason: %s\n", tripLogResetReasonStr());
 
     // Last-resort recovery for a genuinely stuck I2C transaction (touch
     // driver's own endTransmission()/requestFrom() error handling + bus
@@ -131,7 +117,7 @@ void setup() {
     lv_color_t *drawBuf1 = (lv_color_t *)heap_caps_malloc(bufBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     lv_color_t *drawBuf2 = (lv_color_t *)heap_caps_malloc(bufBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!drawBuf1 || !drawBuf2) {
-        Serial.println("[uidemo] WARN: internal RAM draw buffers failed, falling back to PSRAM");
+        Serial.println("[viethud] WARN: internal RAM draw buffers failed, falling back to PSRAM");
         if (drawBuf1) heap_caps_free(drawBuf1);
         if (drawBuf2) heap_caps_free(drawBuf2);
         drawBuf1 = (lv_color_t *)heap_caps_malloc(bufBytes, MALLOC_CAP_SPIRAM);
@@ -153,21 +139,9 @@ void setup() {
     lv_screen_load(dashboardScreen);
 
     sharedStateInit();
-    // cfg.demoMode (Settings > Radar > "Demo mode", user-requested
-    // 2026-09-16 "them 1 nut bat tat thu nghiem trong menu") swaps the real
-    // HLK-LD2451 task for radar/SimTask.cpp's simulated moving targets —
-    // lets the Dashboard be exercised/tuned without real hardware (e.g.
-    // indoors). Defaults OFF; only takes effect at boot (this check), not
-    // live — see AppConfig.h's demoMode comment for why.
-    if (cfg.demoMode) {
-        Serial.println("[uidemo] DEMO MODE ON (Settings > Radar) — simulated radar targets, not real LD2451 data");
-        simTaskStart(); // Core 0 — fake radar targets, see radar/SimTask.cpp
-    } else {
-        radarTaskStart(); // Core 0 — real HLK-LD2451 on UART1
-    }
-    gnssTaskStart();  // Core 0 — real GNSS M10N on UART2 (unaffected by demoMode — always real)
+    gnssTaskStart();  // Core 0 — real GNSS M10N on UART2
     webPortalInit(); // Core 0 — WiFi AP + local web server, starts with WiFi OFF — see net/WebPortal.h
-    speedLimitManagerStart(); // Core 0 — microSD speed-limit map matching, see map/SpeedLimitManager.h
+    speedLimitManagerStart(); // Core 0 — microSD speed-limit/camera/sign map matching, see map/SpeedLimitManager.h
     tripLoggerStart(); // Core 0 — microSD trip/event CSV logging, see log/TripLogger.h
     // (Was disabled 2026-09-15 after two SPI-peripheral-contention
     // regressions — see pincfg.h's SD_MMC_CLK_PIN comment. Root cause: the
@@ -180,17 +154,12 @@ void setup() {
     lv_timer_create(simTimerCb, 150, NULL);
     lv_timer_create(burnInTimerCb, 60000, NULL);
 
-    Serial.println("[uidemo] running — hold the screen 1s to open Settings");
+    Serial.println("[viethud] running — hold the screen 1s to open Settings");
 }
 
 void loop() {
     esp_task_wdt_reset();
 
-    // TEMP diagnostic (2026-09-21, "kiem tra va phan tich file log") — see
-    // setup()'s own comment. Fires once, well past the USB-CDC
-    // reattachment gap, so the dump actually lands in a capturable serial
-    // log instead of a boot-time print that's already lost by the time
-    // anything can connect and start reading.
     static uint32_t lastTick = millis();
     static uint32_t lastHb = 0;
     uint32_t now0 = millis();

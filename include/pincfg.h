@@ -27,15 +27,6 @@
 #define GNSS_RX_PIN 17 // ESP32 RX, fed by the GPS module's TX
 #define GNSS_TX_PIN 18 // ESP32 TX, drives the GPS module's RX
 
-// Radar (HLK-LD2451, UART1) — real wiring as connected and confirmed by
-// the user 2026-09-16: "RX-IO5, TX-IO6" (the module's own pin labels),
-// i.e. LD2451 RX -> RADAR_TX_PIN, LD2451 TX -> RADAR_RX_PIN, same
-// TX/RX-crossed convention as GNSS above. This is close to but not
-// identical to the spec section 19 placeholder (RX=6/TX=7) — real wiring
-// wins; update this if the harness is ever rewired.
-#define RADAR_RX_PIN 6 // ESP32 RX, fed by the LD2451's TX
-#define RADAR_TX_PIN 5 // ESP32 TX, drives the LD2451's RX
-
 // Onboard microSD/TF slot — CONFIRMED 2026-09-15 from the vendor-adjacent
 // demo project for this exact board (refob/Arduino_JC3248W535_LVGL9.4,
 // Arduino/mp3_player/pincfg_JC3248W535.h — its TFT_CS/TFT_SCK/TFT_SDA0-3/

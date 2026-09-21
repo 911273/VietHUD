@@ -3,24 +3,10 @@
 #include <freertos/semphr.h>
 
 static SemaphoreHandle_t stateMutex;
-static RadarSnapshot radarState;
 static GnssSnapshot gnssState;
 static RoadInfoSnapshot roadInfoState;
 
 void sharedStateInit() { stateMutex = xSemaphoreCreateMutex(); }
-
-void radarPublish(const RadarSnapshot &s) {
-    xSemaphoreTake(stateMutex, portMAX_DELAY);
-    radarState = s;
-    xSemaphoreGive(stateMutex);
-}
-
-RadarSnapshot radarSnapshot() {
-    xSemaphoreTake(stateMutex, portMAX_DELAY);
-    RadarSnapshot copy = radarState;
-    xSemaphoreGive(stateMutex);
-    return copy;
-}
 
 void gnssPublish(const GnssSnapshot &s) {
     xSemaphoreTake(stateMutex, portMAX_DELAY);

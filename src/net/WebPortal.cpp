@@ -18,8 +18,8 @@
 
 // AP mode, not STA: this rides in a vehicle, so "join the existing network"
 // isn't a stable concept the way it is for a fixed installation — the
-// device brings its own hotspot instead, same reasoning as GNSS/radar being
-// wired directly rather than depending on anything external. SSID/password
+// device brings its own hotspot instead, same reasoning as GNSS being wired
+// directly rather than depending on anything external. SSID/password
 // now live in AppConfig (cfg.wifiSsid/cfg.wifiPassword — editable from
 // Settings > WiFi or /config), not hardcoded here.
 static WebServer server(80);
@@ -46,16 +46,6 @@ void webPortalStatusText(char *buf, size_t cap) {
     else snprintf(buf, cap, "OFF");
 }
 
-static const char *relationStr(Relation r) {
-    switch (r) {
-        case SAME_LANE: return "SAME_LANE";
-        case ADJACENT_LEFT: return "ADJACENT_LEFT";
-        case ADJACENT_RIGHT: return "ADJACENT_RIGHT";
-        case OPPOSITE: return "OPPOSITE";
-        default: return "UNKNOWN";
-    }
-}
-
 // ---------------------------------------------------------------------
 // "/" — live telemetry page. Static HTML/CSS/JS (PROGMEM, no per-request
 // formatting needed) that polls /api/status every 500ms and fills in the
@@ -65,7 +55,7 @@ static const char *relationStr(Relation r) {
 // ---------------------------------------------------------------------
 static const char kIndexHtml[] PROGMEM = R"HTML(<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Radar Car - Live</title>
+<title>VietHUD - Live</title>
 <style>
 body{background:#0B0F14;color:#CCD6E0;font-family:sans-serif;margin:0;padding:12px}
 h1{font-size:18px;color:#fff;margin:0 0 12px}
@@ -79,7 +69,7 @@ h1{font-size:18px;color:#fff;margin:0 0 12px}
 nav a{color:#4AA3FF;margin-right:16px;font-size:13px;text-decoration:none}
 </style></head><body>
 <nav><a href="/">Live</a><a href="/triplog">Trip logs</a><a href="/config">Config</a><a href="/update">OTA Update</a></nav>
-<h1>Radar Car - Live Telemetry</h1>
+<h1>VietHUD - Live Telemetry</h1>
 <div class="grid" id="grid"></div>
 <script>
 function card(label, value, cls) {
@@ -92,32 +82,22 @@ async function tick() {
     let html = '';
     // Speed-camera-ahead — full-width amber card, same warning color/meaning
     // as the on-device Dashboard's own banner (ui/Dashboard.cpp's
-    // cameraAheadLabel: a known, upcoming hazard, not a live collision risk,
-    // hence its own color rather than reusing .ok/.warn/.bad above). Only
-    // rendered while a camera is actually ahead, not as an always-present
-    // "no camera" card — matches the on-device banner's own hide/show logic.
+    // cameraAheadLabel: a known, upcoming hazard). Only rendered while a
+    // camera is actually ahead, not as an always-present "no camera" card
+    // — matches the on-device banner's own hide/show logic.
     if (d.cameraAhead) {
       const c = d.cameraAhead;
       const limitTxt = (c.speedLimitKmh !== null) ? ' (' + c.speedLimitKmh.toFixed(0) + ' km/h)' : '';
       html += '<div class="card camera"><div class="label">Speed camera ahead</div><div class="value">' +
               c.distanceM.toFixed(0) + ' m' + limitTxt + '</div></div>';
     }
-    html += card('Radar link', d.radar.online ? 'OK' : 'FAULT', d.radar.online ? 'ok' : 'bad');
-    html += card('Frames / errors', d.radar.framesParsed + ' / ' + d.radar.parseErrors);
-    html += card('Active targets', d.radar.activeTargets);
-    html += card('Last qty / alarm / snr', d.radar.lastQty + ' / ' + d.radar.lastAlarm + ' / ' + d.radar.lastSnr);
-    if (d.radar.primary) {
-      const p = d.radar.primary;
-      html += card('Primary distance', p.distanceM.toFixed(1) + ' m');
-      html += card('Primary TTC', isFinite(p.ttcS) ? p.ttcS.toFixed(1) + ' s' : '--');
-      html += card('Primary relation', p.relation);
-      html += card('Primary SNR', p.snr);
-    }
     html += card('GNSS fix', d.gnss.fix ? 'OK' : (d.gnss.linkAlive ? 'SEARCHING' : 'FAULT'),
                   d.gnss.fix ? 'ok' : (d.gnss.linkAlive ? 'warn' : 'bad'));
     html += card('Satellites', d.gnss.satCount);
     html += card('Speed (filtered)', d.gnss.speedKmh.toFixed(1) + ' km/h');
     html += card('Speed (raw)', d.gnss.rawSpeedKmh.toFixed(1) + ' km/h');
+    html += card('Speed map', d.speedMap.loaded ? 'LOADED' : 'NOT LOADED', d.speedMap.loaded ? 'ok' : 'bad');
+    html += card('Speed limit', d.speedMap.limitValid ? d.speedMap.limitKmh.toFixed(0) + ' km/h' : '--');
     html += card('Free internal RAM', d.mem.freeInternalKB + ' KB (min ' + d.mem.minFreeInternalKBEver + ' KB)');
     html += card('Free PSRAM', d.mem.freePsramKB + ' KB');
     html += card('Uptime', Math.floor(d.uptimeMs / 1000) + ' s');
@@ -139,30 +119,12 @@ static void handleIndex() { server.send_P(200, "text/html", kIndexHtml); }
 // ~1.5KB buffer is safer off a FreeRTOS task's stack than on it.
 // ---------------------------------------------------------------------
 // Bumped 1536->1792 (2026-09-21) alongside adding the "camera" object below
-// — same "comfortable margin over measured worst case" convention as
-// radarTaskStart()'s stack sizing, not a tight fit.
+// — a comfortable margin over measured worst case, not a tight fit.
 static char statusBuf[1792];
 
 static void handleApiStatus() {
-    RadarSnapshot radar = radarSnapshot();
     GnssSnapshot gnss = gnssSnapshot();
     RoadInfoSnapshot road = roadInfoSnapshot();
-
-    int activeCount = 0;
-    for (int i = 0; i < MAX_TARGETS; i++)
-        if (radar.targets[i].active) activeCount++;
-
-    char primaryBuf[192] = "null";
-    if (radar.primaryIdx >= 0) {
-        SimTarget &p = radar.targets[radar.primaryIdx];
-        snprintf(primaryBuf, sizeof(primaryBuf),
-                 "{\"idx\":%d,\"distanceM\":%.1f,\"ttcS\":%s,\"speedKmh\":%.1f,\"angleDeg\":%.0f,"
-                 "\"relation\":\"%s\",\"confidence\":%.2f,\"snr\":%.0f,\"tooClose\":%s}",
-                 radar.primaryIdx, (double)p.distanceM,
-                 isinf(p.ttcS) ? "null" : String(p.ttcS, 1).c_str(), (double)(p.closingSpeedMps * 3.6f),
-                 (double)p.angleDeg, relationStr(p.relation), (double)p.confidence, (double)p.snr,
-                 p.tooClose ? "true" : "false");
-    }
 
     // Speed-camera-ahead (user-requested 2026-09-21, "them the hien phia
     // truoc co camera") — same map/SpeedLimitManager.cpp's matchCameraAhead()
@@ -182,18 +144,16 @@ static void handleApiStatus() {
 
     snprintf(statusBuf, sizeof(statusBuf),
              "{\"uptimeMs\":%lu,"
-             "\"radar\":{\"online\":%s,\"framesParsed\":%lu,\"parseErrors\":%lu,\"lastQty\":%u,\"lastAlarm\":%u,"
-             "\"lastSnr\":%u,\"audioAllowed\":%s,\"harshBrakeWarning\":%s,\"activeTargets\":%d,\"primary\":%s},"
              "\"gnss\":{\"fix\":%s,\"linkAlive\":%s,\"satCount\":%d,\"speedKmh\":%.1f,\"rawSpeedKmh\":%.1f,"
              "\"timeValid\":%s,\"utcHour\":%d,\"utcMinute\":%d},"
+             "\"speedMap\":{\"loaded\":%s,\"limitValid\":%s,\"limitKmh\":%.0f},"
              "\"cameraAhead\":%s,"
              "\"mem\":{\"freeInternalKB\":%u,\"minFreeInternalKBEver\":%u,\"freePsramKB\":%u}}",
-             (unsigned long)millis(), radar.online ? "true" : "false", (unsigned long)radar.framesParsed,
-             (unsigned long)radar.parseErrors, radar.lastTargetQty, radar.lastAlarm, radar.lastSnr,
-             radar.audioAllowed ? "true" : "false", radar.harshBrakeWarning ? "true" : "false", activeCount,
-             primaryBuf, gnss.fix ? "true" : "false",
+             (unsigned long)millis(), gnss.fix ? "true" : "false",
              gnss.linkAlive ? "true" : "false", gnss.satCount, (double)gnss.egoSpeedKmh, (double)gnss.rawSpeedKmh,
-             gnss.timeValid ? "true" : "false", gnss.utcHour, gnss.utcMinute, cameraBuf,
+             gnss.timeValid ? "true" : "false", gnss.utcHour, gnss.utcMinute,
+             road.mapLoaded ? "true" : "false", road.valid ? "true" : "false",
+             road.valid ? (double)road.speedLimitKmh : 0.0, cameraBuf,
              (unsigned)(freeInternal / 1024), (unsigned)(minFreeInternal / 1024), (unsigned)(ESP.getFreePsram() / 1024));
 
     server.send(200, "application/json", statusBuf);
@@ -294,7 +254,7 @@ static void handleTripLogGet() {
     // Chunked through sdMgrReadFileChunk() rather than a single read into
     // RAM: a long drive's CSV has no fixed upper bound, and this keeps the
     // SD mutex held only per 1KB chunk instead of for the whole transfer
-    // (the radar/GNSS/map tasks all share that same card).
+    // (the map/trip-log tasks both share that same card).
     uint8_t buf[1024];
     int first = sdMgrReadFileChunk(path, 0, buf, sizeof(buf));
     if (first < 0) {
@@ -340,25 +300,6 @@ static size_t appendCheckbox(char *buf, size_t cap, size_t len, const char *name
                            value ? " checked" : "", label);
 }
 
-// 3-way labeled picker for cfg.radarDirection — mirrors ui/Settings.cpp's
-// addChoiceRow() switch from a raw 0/1/2 number field to labeled options
-// (matching the vendor's own BLE config app's "Stay away and approach"
-// wording, not a bare number). Option values are the LD2451's own byte
-// encoding (0=away,1=approach,2=both — see radar/LD2451.cpp's configureRadar()),
-// so handleConfigPost()'s existing argFloat("radarDirection", ...) needs no
-// change: a <select> submits the same numeric string a <input type=number>
-// would have.
-static size_t appendDirectionSelect(char *buf, size_t cap, size_t len, float value) {
-    static const char *kLabels[3] = {"Away only", "Approach only", "Both (away + approach)"};
-    len += snprintf(buf + len, len < cap ? cap - len : 0, "<label>Direction<select name=\"radarDirection\">");
-    for (int i = 0; i < 3; i++) {
-        len += snprintf(buf + len, len < cap ? cap - len : 0, "<option value=\"%d\"%s>%s</option>", i,
-                         ((int)(value + 0.5f) == i) ? " selected" : "", kLabels[i]);
-    }
-    len += snprintf(buf + len, len < cap ? cap - len : 0, "</select></label>");
-    return len;
-}
-
 // Password field's value is deliberately left BLANK rather than pre-filled
 // with cfg.wifiPassword — echoing a saved password back into a form is bad
 // practice even on a local-only device, and handleConfigPost() below treats
@@ -375,7 +316,7 @@ static void handleConfigGet() {
     size_t len = 0;
     len += snprintf(configBuf + len, sizeof(configBuf) - len,
                      "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-                     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Radar Car - "
+                     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>VietHUD - "
                      "Config</title><style>"
                      "body{background:#0B0F14;color:#CCD6E0;font-family:sans-serif;margin:0;padding:12px}"
                      "h1{font-size:18px;color:#fff}nav a{color:#4AA3FF;margin-right:16px;font-size:13px;"
@@ -393,45 +334,14 @@ static void handleConfigGet() {
                      "</style></head><body>"
                      "<nav><a href=\"/\">Live</a><a href=\"/config\">Config</a><a href=\"/update\">OTA "
                      "Update</a></nav>"
-                     "<h1>Radar Car - Configuration</h1><form method=\"POST\" action=\"/config\">");
+                     "<h1>VietHUD - Configuration</h1><form method=\"POST\" action=\"/config\">");
 
-    len += snprintf(configBuf + len, sizeof(configBuf) - len, "<fieldset><legend>Radar</legend>");
-    len = appendField(configBuf, sizeof(configBuf), len, "maxRangeM", "Max range (m)", cfg.maxRangeM, 1, 10, 100);
-    len = appendField(configBuf, sizeof(configBuf), len, "minTargetSpeedKmh", "Min target speed (km/h)",
-                       cfg.minTargetSpeedKmh, 1, 0, 30);
-    len = appendField(configBuf, sizeof(configBuf), len, "maxTargets", "Max targets", cfg.maxTargets, 1, 1, 5);
-    len = appendDirectionSelect(configBuf, sizeof(configBuf), len, cfg.radarDirection);
-    len = appendField(configBuf, sizeof(configBuf), len, "radarSnrLevel", "SNR sensitivity", cfg.radarSnrLevel, 1, 0,
-                       8);
-    len = appendField(configBuf, sizeof(configBuf), len, "radarTriggerCount", "Trigger count",
-                       cfg.radarTriggerCount, 1, 1, 10);
-    len = appendField(configBuf, sizeof(configBuf), len, "radarNoTargetDelayS", "No-target delay (s)",
-                       cfg.radarNoTargetDelayS, 1, 0, 30);
-    len = appendField(configBuf, sizeof(configBuf), len, "laneHalfWidthM", "Lane half-width (m)",
-                       cfg.laneHalfWidthM, 0.1f, 0.5f, 5);
-    len += snprintf(configBuf + len, sizeof(configBuf) - len, "</fieldset><fieldset><legend>Safety</legend>");
-    len = appendField(configBuf, sizeof(configBuf), len, "audioEnableKmh", "Audio enable speed (km/h)",
-                       cfg.audioEnableKmh, 1, 40, 120);
-    len = appendField(configBuf, sizeof(configBuf), len, "hysteresisKmh", "Hysteresis (km/h)", cfg.hysteresisKmh, 1,
-                       1, 10);
-    len = appendField(configBuf, sizeof(configBuf), len, "ttcWarnS", "TTC warning (s)", cfg.ttcWarnS, 0.1f, 1, 10);
-    len = appendField(configBuf, sizeof(configBuf), len, "ttcCritS", "TTC critical (s)", cfg.ttcCritS, 0.1f, 0.5f,
-                       5);
-    len = appendField(configBuf, sizeof(configBuf), len, "minConfidence", "Min confidence (0-1)", cfg.minConfidence,
-                       0.01f, 0, 1);
-    len = appendField(configBuf, sizeof(configBuf), len, "minDistanceM", "Min distance (m)", cfg.minDistanceM, 0.5f,
-                       1, 20);
-    len = appendField(configBuf, sizeof(configBuf), len, "harshBrakeAccelMps2", "Harsh brake sensitivity (m/s2)",
-                       cfg.harshBrakeAccelMps2, 0.5f, 1, 10);
-    len = appendCheckbox(configBuf, sizeof(configBuf), len, "audioEnabled", "Audio enabled", cfg.audioEnabled);
+    len += snprintf(configBuf + len, sizeof(configBuf) - len, "<fieldset><legend>Alerts</legend>");
+    len = appendCheckbox(configBuf, sizeof(configBuf), len, "audioEnabled", "Alert audio enabled", cfg.audioEnabled);
     len += snprintf(configBuf + len, sizeof(configBuf) - len, "</fieldset><fieldset><legend>Display</legend>");
     len = appendField(configBuf, sizeof(configBuf), len, "brightness", "Brightness (%)", cfg.brightness, 1, 5, 100);
     len = appendField(configBuf, sizeof(configBuf), len, "autoDimMin", "Auto-dim after (min)", cfg.autoDimMin, 1, 0,
                        30);
-    len = appendCheckbox(configBuf, sizeof(configBuf), len, "showId", "Show target ID", cfg.showId);
-    len = appendCheckbox(configBuf, sizeof(configBuf), len, "showSpeed", "Show target speed", cfg.showSpeed);
-    len = appendCheckbox(configBuf, sizeof(configBuf), len, "showTtc", "Show target TTC", cfg.showTtc);
-    len = appendCheckbox(configBuf, sizeof(configBuf), len, "showAngle", "Show target angle", cfg.showAngle);
     len += snprintf(configBuf + len, sizeof(configBuf) - len, "</fieldset><fieldset><legend>Sensors (GNSS)</legend>");
     len = appendField(configBuf, sizeof(configBuf), len, "gnssSpeedFilterAlpha", "Speed filter smoothing",
                        cfg.gnssSpeedFilterAlpha, 0.01f, 0.05f, 0.90f);
@@ -458,21 +368,6 @@ static float argFloat(const char *name, float fallback) {
 }
 
 static void handleConfigPost() {
-    cfg.maxRangeM = argFloat("maxRangeM", cfg.maxRangeM);
-    cfg.minTargetSpeedKmh = argFloat("minTargetSpeedKmh", cfg.minTargetSpeedKmh);
-    cfg.maxTargets = argFloat("maxTargets", cfg.maxTargets);
-    cfg.radarDirection = argFloat("radarDirection", cfg.radarDirection);
-    cfg.radarSnrLevel = argFloat("radarSnrLevel", cfg.radarSnrLevel);
-    cfg.radarTriggerCount = argFloat("radarTriggerCount", cfg.radarTriggerCount);
-    cfg.radarNoTargetDelayS = argFloat("radarNoTargetDelayS", cfg.radarNoTargetDelayS);
-    cfg.laneHalfWidthM = argFloat("laneHalfWidthM", cfg.laneHalfWidthM);
-    cfg.audioEnableKmh = argFloat("audioEnableKmh", cfg.audioEnableKmh);
-    cfg.hysteresisKmh = argFloat("hysteresisKmh", cfg.hysteresisKmh);
-    cfg.ttcWarnS = argFloat("ttcWarnS", cfg.ttcWarnS);
-    cfg.ttcCritS = argFloat("ttcCritS", cfg.ttcCritS);
-    cfg.minConfidence = argFloat("minConfidence", cfg.minConfidence);
-    cfg.minDistanceM = argFloat("minDistanceM", cfg.minDistanceM);
-    cfg.harshBrakeAccelMps2 = argFloat("harshBrakeAccelMps2", cfg.harshBrakeAccelMps2);
     cfg.brightness = argFloat("brightness", cfg.brightness);
     cfg.autoDimMin = argFloat("autoDimMin", cfg.autoDimMin);
     cfg.gnssSpeedFilterAlpha = argFloat("gnssSpeedFilterAlpha", cfg.gnssSpeedFilterAlpha);
@@ -488,10 +383,6 @@ static void handleConfigPost() {
     }
     // Checkboxes only appear in POST data when checked — an absent arg means unchecked, not "leave unchanged".
     cfg.audioEnabled = server.hasArg("audioEnabled");
-    cfg.showId = server.hasArg("showId");
-    cfg.showSpeed = server.hasArg("showSpeed");
-    cfg.showTtc = server.hasArg("showTtc");
-    cfg.showAngle = server.hasArg("showAngle");
     cfg.tripLoggingEnabled = server.hasArg("tripLoggingEnabled");
 
     sanitizeConfig(cfg);
@@ -515,14 +406,14 @@ static void handleConfigPost() {
 // ---------------------------------------------------------------------
 static const char kUpdateHtml[] PROGMEM = R"HTML(<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Radar Car - OTA Update</title>
+<title>VietHUD - OTA Update</title>
 <style>body{background:#0B0F14;color:#CCD6E0;font-family:sans-serif;margin:0;padding:12px}
 h1{font-size:18px;color:#fff}nav a{color:#4AA3FF;margin-right:16px;font-size:13px;text-decoration:none}
 button{background:#2E7D4F;color:#fff;border:0;border-radius:6px;padding:10px 20px;font-size:14px}
 p.warn{color:#E0C020}</style></head><body>
 <nav><a href="/">Live</a><a href="/triplog">Trip logs</a><a href="/config">Config</a><a href="/update">OTA Update</a></nav>
-<h1>Radar Car - OTA Firmware Update</h1>
-<p class="warn">Upload a .bin built for env:uidemo. Do not power off during upload — the device reboots automatically when done.</p>
+<h1>VietHUD - OTA Firmware Update</h1>
+<p class="warn">Upload a .bin built for env:viethud. Do not power off during upload — the device reboots automatically when done.</p>
 <form method="POST" action="/update" enctype="multipart/form-data">
 <input type="file" name="update" accept=".bin"><br><br>
 <button type="submit">Upload and flash</button>
@@ -559,7 +450,7 @@ static void applyWifiState(bool enable) {
     if (enable == wifiActuallyEnabled) return;
     if (enable) {
         WiFi.mode(WIFI_AP);
-        const char *ssid = cfg.wifiSsid[0] ? cfg.wifiSsid : "RadarCar"; // guard an emptied-out SSID field
+        const char *ssid = cfg.wifiSsid[0] ? cfg.wifiSsid : "VietHUD"; // guard an emptied-out SSID field
         size_t pwLen = strlen(cfg.wifiPassword);
         bool secured = pwLen >= 8; // WPA2 minimum — WiFi.softAP() silently fails to secure below this
         bool ok = secured ? WiFi.softAP(ssid, cfg.wifiPassword) : WiFi.softAP(ssid);

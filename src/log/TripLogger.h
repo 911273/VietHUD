@@ -2,8 +2,10 @@
 
 // Lightweight per-session driving log to the microSD card, added 2026-09-16
 // per docs/V1.2_hardening_proposal.md section G's "SD/LittleFS logging"
-// row — lets TTC/distance/confidence thresholds be tuned against how a real
-// drive actually looked, instead of only road-testing by feel.
+// row — originally for tuning TTC/distance/confidence thresholds against a
+// real drive; now (radar removed 2026-09-21) logs GNSS speed plus
+// speed-limit/camera/sign warning state instead, same "review a real drive
+// afterward instead of only road-testing by feel" purpose.
 //
 // Writes go through map/SdCardManager.h's sdMgrAppendLine() (this module
 // never opens an SD file directly — that header's sole-SD-owner rule, now
@@ -15,16 +17,13 @@
 // counter (see TripLogger.cpp) rather than GNSS date — spec section 15.4
 // already establishes that GNSS date/time can't be trusted before a fix,
 // and this needs a stable filename from the moment the task starts, not
-// only once a fix eventually arrives. Two kinds of rows land in it:
-//   - a periodic ~1 Hz sample (ego speed, target count, primary
-//     distance/TTC/risk) for reviewing overall trip shape afterward;
-//   - an immediate row the instant CRITICAL risk, a too-close (tailgating)
-//     condition, or a harsh-braking warning first fires — the "black box"
-//     moments worth finding again without scrubbing every 1 Hz sample.
+// only once a fix eventually arrives. A periodic ~1 Hz sample (ego speed,
+// speed-limit match, camera/sign-ahead state) lands in it for reviewing
+// overall trip shape afterward.
 //
 // Fails open like every other optional subsystem in this project: with no
 // SD card available or cfg.tripLoggingEnabled off, this task simply does
-// nothing each tick — it never blocks or affects the radar/GNSS/UI tasks.
+// nothing each tick — it never blocks or affects the GNSS/UI tasks.
 void tripLoggerStart();
 
 // Human-readable esp_reset_reason(), shared (added 2026-09-21) rather than

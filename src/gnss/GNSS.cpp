@@ -200,9 +200,8 @@ static void gnssTaskFn(void *) {
     }
 }
 
-// 3072, not the original 4096 — same real-hardware measurement basis as
-// radar/LD2451.cpp's own stack-size comment (2026-09-16 RAM audit): high-
-// water mark never dropped below ~1944 bytes free of 4096, i.e. never used
+// 3072, not the original 4096 — real-hardware measurement (2026-09-16 RAM
+// audit): high-water mark never dropped below ~1944 bytes free of 4096, i.e. never used
 // more than ~2152 bytes, leaving a comfortable ~920-byte (~30%) margin at
 // 3072.
 void gnssTaskStart() { xTaskCreatePinnedToCore(gnssTaskFn, "gnssTask", 3072, NULL, 2, NULL, 0); }
