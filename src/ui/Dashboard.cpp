@@ -1,8 +1,7 @@
 #include "Dashboard.h"
 #include "Settings.h" // settingsScreen, for the hold-to-open-Settings gesture
 #include "core/AppConfig.h"
-#include "core/NvsStore.h" // saveConfigToNVS() — double-tap gesture persists cfg.simpleUiMode immediately
-#include "core/SafeDistanceRules.h" // legalMinFollowDistanceM()
+#include "core/NvsStore.h" // saveConfigToNVS()
 #include "core/SharedState.h"
 #include "display/DisplayDriver.h" // backlightWrite
 #include "gnss/GNSS.h" // gnssMsSinceStationary() — auto-dim's vehicle-stationary gate
@@ -13,23 +12,27 @@
 #include <string.h>
 
 // ---------------------------------------------------------------------
-// Redesigned 2026-09-14 (second pass) into the 3-column layout requested
-// directly: [ speed + audio | road + targets | warning + TTC ], with a top
-// status bar (RADAR/GNSS/clock/settings) and a one-line bottom info bar
-// (lane count / target count / mode). Supersedes the earlier single-panel
-// "ADAS-cluster proposal" layout — see git history for that version.
-//
-// Two decisions carried over unchanged from that discussion, both because
-// the compiled-in LVGL font can't render what the mockup asked for
+// VietHUD Dashboard — GPS-only offline speed-limit/camera/sign warning
+// display. Radar (HLK-LD2451) and everything it drove (TTC/risk-color
+// warning cell, per-target road panel, audio-gate hysteresis, tailgating/
+// harsh-brake banners) was removed entirely 2026-09-21 — this project is no
+// longer a forward-collision radar display, see the repo's own README for
+// the product this became. The layout below is what's left after that
+// removal, reflowed: [ speed + speed-limit sign | sign/camera alert card ],
+// with a top status bar (GNSS/clock/settings) and a one-line bottom info
+// bar (speed-map region/version + GNSS satellite count). Two decisions
+// carried over from the original radar-era layout, both because the
+// compiled-in LVGL font can't render what a nicer mockup would want
 // (verified directly against lv_font_montserrat_14.c's cmap — ASCII +
 // ~60 symbol codepoints only, no emoji, no Vietnamese diacritics):
-//   - All labels stay English/ASCII (no custom Vietnamese font asset).
-//   - Car/warning/sun icons are small generated bitmaps (see
-//     ui/icons/Icons.h for how and why) instead of font glyphs or the
-//     rectangle silhouettes the previous layout used.
-// GPS/Radar/Audio/Settings telltales keep using the built-in LV_SYMBOL_*
-// glyphs (LV_SYMBOL_GPS/AUDIO/MUTE/SETTINGS) — those aren't emoji, they're
-// already part of the compiled font, exactly like before.
+//   - All labels stay English/ASCII (no custom Vietnamese font asset) —
+//     the sign/camera alert card's own text uses plain-ASCII transliterated
+//     Vietnamese (e.g. "KHU DONG DAN CU") for the same reason.
+//   - Warning/sun/moon icons are small generated bitmaps (see
+//     ui/icons/Icons.h for how and why) instead of font glyphs.
+// GPS/Settings telltales keep using the built-in LV_SYMBOL_* glyphs
+// (LV_SYMBOL_GPS/SETTINGS/WIFI) — those aren't emoji, they're already part
+// of the compiled font.
 // ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
@@ -69,35 +72,17 @@ void wakeScreen() {
 
 uint32_t lastTouchAtMs() { return lastTouchMs; }
 
-// Semantic risk color — the ONLY place red/amber/green are used to mean
-// "target danger level". System telltales (GPS/Radar/Audio/ego car) use the
-// cyan accent below instead, precisely so a "system OK" color is never
-// confused with a "target is safe" color (spec section 14.2).
+// Semantic risk color — the ONLY place red/amber/purple are used to mean
+// "something needs the driver's attention" (speeding, an upcoming sign).
+// System telltales (GPS/Settings) use the cyan accent below instead,
+// precisely so a "system OK" color is never confused with a "warning"
+// color (spec section 14.2, carried over from the radar-era Dashboard).
 #define ACCENT_COLOR 0x3FCAD6
 
 // applyTheme()'s last-computed "normal" text color for speedLabel —
 // remembered so refreshDashboard() can restore it after an overspeed
 // tick's red override without needing to know which theme is active itself.
 static lv_color_t currentPrimaryTextColor = lv_color_white();
-
-static lv_color_t riskColor(float ttcS) {
-    if (ttcS > 5.0f) return lv_color_hex(0x33CC66);         // GREEN safe
-    if (ttcS > cfg.ttcWarnS) return lv_color_hex(0xE0C020); // YELLOW caution
-    if (ttcS > cfg.ttcCritS) return lv_color_hex(0xFF8800); // ORANGE warning
-    return lv_color_hex(0xFF3333);                          // RED critical
-}
-
-static const char *riskLabel(float ttcS) {
-    if (ttcS > 5.0f) return "SAFE";
-    if (ttcS > cfg.ttcWarnS) return "CAUTION";
-    if (ttcS > cfg.ttcCritS) return "WARNING";
-    return "CRITICAL";
-}
-
-// legalMinFollowDistanceM() itself now lives in core/SafeDistanceRules.h
-// (feature-requested 2026-09-21, "cac gia tri tren phai nam trong
-// configuration, khong hard-code rai rac trong UI hoac Risk Engine") —
-// this file is a pure consumer, no longer the one that encodes the table.
 
 static void applyTheme(bool daytime); // defined below buildDashboard(), which calls it once at the end to set the initial theme
 
@@ -133,7 +118,6 @@ static const int ROAD_COL_X = PARAM_COL_W;
 static const int COL_TOP = TOP_H, COL_H = SCR_H - TOP_H - BOTTOM_H;
 
 // --- Top bar ---
-static lv_obj_t *radarRing[3], *radarCenterDot, *radarCaption;
 static lv_obj_t *gnssIcon, *gnssCaption;
 static lv_obj_t *sunIcon, *clockLabel;
 static lv_obj_t *gearIcon;
@@ -141,11 +125,10 @@ static lv_obj_t *wifiTopIcon; // shown only while WiFi is on — see refreshDash
 static lv_obj_t *colDividerLine[2];
 
 // --- Left column: speed + speed limit ---
-// Audio icon/state label removed 2026-09-15 (user-requested) — the
-// underlying audio-gate LOGIC (cfg.audioEnabled, radar.audioAllowed —
-// LD2451.cpp/AppConfig.h/Settings.cpp's Safety tab) is untouched, this was
-// only ever the on-screen telltale for it, same as there being no buzzer
-// output yet either (spec: Phase 7).
+// Audio icon/state label removed 2026-09-15 (user-requested) — never
+// re-added; cfg.audioEnabled (AppConfig.h) is now the sign/camera/speed-
+// limit alert-audio master toggle (Settings > Display), with no on-screen
+// telltale, same as there being no buzzer output yet either.
 static lv_obj_t *leftCol;
 static lv_obj_t *speedLabel, *kmhCaption;
 // Speed limit shown as an actual Vietnamese regulatory sign (QCVN 41:2019/
@@ -160,37 +143,14 @@ static lv_obj_t *speedLabel, *kmhCaption;
 // hidden.
 static lv_obj_t *speedLimitSign, *speedLimitValueLabel;
 
-// --- Middle column: distance readout + road + targets ---
+// --- Middle column: sign/camera alert card ---
 static lv_obj_t *midCol;
-static lv_obj_t *primaryDistLabel;
-// Legal minimum following-distance caption (user-requested 2026-09-21,
-// "hien thi khoang cach giua 2 xe cho phep theo luat giao thong dua tren
-// toc do di chuyen") — only used in Simple layout, where roadArea is
-// hidden and there's real open space below the big distance number; in
-// Full layout the same info is appended inline into primaryDistLabel's own
-// string instead (see legalMinFollowDistanceM()'s call site) since there's
-// no spare vertical room there (roadArea starts just a few px below it).
-static lv_obj_t *legalDistCaption;
-static lv_obj_t *roadArea;
-static lv_obj_t *targetIcon[MAX_TARGETS];
-static lv_obj_t *targetLabels[MAX_TARGETS];
-static lv_obj_t *primaryRing; // single shared ring, repositioned onto whichever target is primary
-static lv_obj_t *faultLabel;
-// Sudden-closing-speed ("harsh braking ahead") banner, added 2026-09-16 —
-// deliberately its own object, not folded into warningFlashOverlay below:
-// that overlay is reserved for TTC-based imminent-collision risk only (see
-// applyTheme()'s "one color = one specific risk" comment on speedLabel) and
-// this is a materially different signal (a sudden closing-rate spike, which
-// can fire even while TTC itself is still SAFE/CAUTION). One shared object
-// works for both orientations since it's created once in buildDashboard()
-// itself, not per-layout — see that function.
-static lv_obj_t *harshBrakeLabel;
 // Upcoming speed-limit-change banner (user-requested 2026-09-21, "canh bao
-// gioi han toc do doan duong tiep theo, bao truoc khoang 100m") — same
-// shared-object/one-shared-widget-for-both-orientations pattern as
-// harshBrakeLabel above. Own dedicated color (blue, a common real-world
-// "informational" road-sign color), deliberately NOT red/amber, so it
-// never reads as a safety alert the way the TTC/speeding overlays do —
+// gioi han toc do doan duong tiep theo, bao truoc khoang 100m") — one
+// shared widget, built once, working unchanged in either orientation (see
+// its build site in buildDashboard()). Own dedicated color (blue, a common
+// real-world "informational" road-sign color), deliberately NOT red/amber,
+// so it never reads as a safety alert the way the speeding overlay does —
 // this is advance notice of a rule change ahead, not a danger warning.
 static lv_obj_t *aheadLimitLabel;
 // Speed-camera-ahead banner (feature-requested 2026-09-21, "tai du lieu ve
@@ -212,7 +172,7 @@ static lv_obj_t *alertDistLabel = nullptr;
 static lv_obj_t *alertUnitLabel = nullptr;
 static lv_obj_t *alertSubLabel = nullptr;
 static lv_obj_t *alertProgressBar = nullptr;
-static lv_obj_t *alertRadarHint = nullptr;
+static lv_obj_t *alertFooterLabel = nullptr;
 
 static void buildTrafficCard(lv_obj_t *parent, int w, int h) {
     trafficCard = lv_obj_create(parent);
@@ -269,151 +229,34 @@ static void buildTrafficCard(lv_obj_t *parent, int w, int h) {
     lv_obj_set_style_radius(alertProgressBar, 3, 0);
     lv_obj_set_style_radius(alertProgressBar, 3, LV_PART_INDICATOR);
 
-    // Radar target hint at very bottom
-    alertRadarHint = lv_label_create(trafficCard);
-    lv_obj_set_style_text_font(alertRadarHint, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(alertRadarHint, lv_color_hex(0x607890), 0);
-    lv_obj_align(alertRadarHint, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_label_set_text(alertRadarHint, "Radar: San sang");
+    // Region/version hint at very bottom (was a live radar-target hint
+    // before radar removal 2026-09-21 — see bottomInfoLabel below, which
+    // already shows this same speed-map info in the outer bottom bar; this
+    // card-local line stays a static "Offline VietHUD" caption instead of
+    // duplicating a value that changes every tick right above it).
+    alertFooterLabel = lv_label_create(trafficCard);
+    lv_obj_set_style_text_font(alertFooterLabel, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(alertFooterLabel, lv_color_hex(0x607890), 0);
+    lv_obj_align(alertFooterLabel, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_label_set_text(alertFooterLabel, "VietHUD - Offline GPS speed guide");
 }
-
-// --- Right column: warning + TTC ---
-static lv_obj_t *rightCol;
-static lv_obj_t *warningIconObj;
-static lv_obj_t *riskWordLabel;
-static lv_obj_t *ttcValueLabel, *ttcCaption;
 
 // --- Bottom info bar ---
 static lv_obj_t *bottomInfoLabel;
 
-// --- Full-screen WARNING/CRITICAL flash overlay ---
-static lv_obj_t *warningFlashOverlay;
 // Full-screen speeding overlay (user-requested 2026-09-16, "neu vuot qua
 // toc do toi da thi cung canh bao bang layer mau toan man hinh", then "qua
-// toc do cung nhap nhay de tang su chu y") — deliberately its own object/
-// color, not folded into warningFlashOverlay above, for the exact same
-// "one color = one specific risk" reason harshBrakeLabel's own comment
-// gives: warningFlashOverlay's red/amber already mean "imminent collision"
-// (TTC-based); reusing either color here would make "you're speeding" read
-// as "you're about to hit something". Blinks (own rate, distinct from both
-// TTC tiers) — see refreshDashboard()'s own comment on this overlay.
+// toc do cung nhap nhay de tang su chu y") — its own dedicated color
+// (0xB33DC6, distinct from the red/amber the sign/camera banners use) so
+// speeding never reads as "you're about to hit something" or gets confused
+// with a routine sign notice. Blinks at its own rate — see
+// refreshDashboard()'s own comment on this overlay.
 static lv_obj_t *speedingFlashOverlay;
 
 // --- WiFi on/off gesture toast (see onDashLongPressedRepeat()/showWifiToast() below) ---
 static lv_obj_t *wifiToastLabel;
 static uint32_t wifiToastUntilMs = 0;
 static void showWifiToast(bool on); // defined below buildDashboard(), called from onDashLongPressedRepeat() above it
-
-// Landscape-only road-panel geometry, inside midCol's own coordinate space
-// (portrait's road panel is positioned/sized separately in
-// buildDashboardPortrait(), which doesn't use these).
-static const int ROAD_X = 8, ROAD_Y = 32; // a couple px below primaryDistLabel, avoids touching it
-static const int ROAD_W = ROAD_COL_W - 2 * ROAD_X;  // 224 (was 272 when the road column was 288 wide)
-static const int ROAD_H = COL_H - ROAD_Y - 6;       // small bottom margin only — no ego-car caption anymore
-
-// Reads roadArea's ACTUAL current size rather than a fixed constant — makes
-// this callable unchanged from both buildDashboardLandscape() (which sizes
-// roadArea to ROAD_W/ROAD_H above) and buildDashboardPortrait() (which sizes
-// it differently for a tall narrow screen), and keeps refreshDashboard()'s
-// own target-placement math (which reads the same real size) automatically
-// consistent with whatever this function actually drew.
-static void buildRoadLanes() {
-    int roadW = lv_obj_get_width(roadArea), roadH = lv_obj_get_height(roadArea);
-    int centerX = roadW / 2;
-    int topHalf = (int)(roadW * 0.16f); // road is narrow near the top (far away)
-    int botHalf = roadW / 2;            // and fills the full width at the bottom (near)
-    int top = 6, bottom = roadH - 6;
-
-    // NOTE: lv_line_set_points() stores a POINTER into whatever buffer you
-    // pass — it does not copy — so each line needs its OWN stable storage.
-    // Two edges used to share one buffer here; the second memcpy silently
-    // overwrote the first line's points too, so both edges rendered the
-    // same line on top of each other. Confirmed on real hardware
-    // 2026-09-14. Fixed by giving each line its own array slot, never
-    // reused across different line objects — applied below to every line
-    // this function draws (edges, dashed dividers, distance gridlines).
-    static lv_point_precise_t edgePts[2][2];
-    auto edgeLine = [&](int slot, int topX, int botX) {
-        lv_obj_t *line = lv_line_create(roadArea);
-        lv_obj_set_style_line_color(line, lv_color_hex(0x3A4A5C), 0);
-        lv_obj_set_style_line_width(line, 2, 0);
-        lv_obj_set_style_line_rounded(line, true, 0);
-        lv_point_precise_t localPts[2] = {{(lv_value_precise_t)topX, (lv_value_precise_t)top},
-                                           {(lv_value_precise_t)botX, (lv_value_precise_t)bottom}};
-        memcpy(edgePts[slot], localPts, sizeof(localPts));
-        lv_line_set_points(line, edgePts[slot], 2);
-        lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
-    };
-    edgeLine(0, centerX - topHalf, centerX - botHalf);
-    edgeLine(1, centerX + topHalf, centerX + botHalf);
-
-    // Two dashed lane dividers, symmetric about centerX, marking the edge
-    // of MY lane (spec-style ego corridor) — not 3 equal lanes anymore.
-    // User-requested 2026-09-15: the ego lane should read as the dominant
-    // lane, with the two side lanes only partially visible at the edges
-    // (so a car sitting in/entering one still shows up, without implying
-    // it's sharing equal billing with the lane you're actually in). Fixed
-    // at kMainLaneFrac of the full road width regardless of lane count —
-    // there's no real lane-corridor model yet (Phase 5), same reasoning
-    // AppConfig.h gives for not having a real laneWidth setting.
-    static const float kMainLaneFrac = 0.6f; // ego lane share of total width; each side sliver gets (1-0.6)/2 = 20%
-    int dashCount = 5;
-    int span = bottom - top;
-    static lv_point_precise_t dashPts[2][5][2];
-    auto dashedDivider = [&](int dividerSlot, float sideSign) {
-        for (int i = 0; i < dashCount; i++) {
-            int y0 = top + (span * i) / dashCount + 4;
-            int y1 = top + (span * (i + 1)) / dashCount - 8;
-            if (y1 <= y0) continue;
-            float t0 = (float)(y0 - top) / (float)span, t1 = (float)(y1 - top) / (float)span;
-            int x0 = centerX + (int)(sideSign * (topHalf + (botHalf - topHalf) * t0) * kMainLaneFrac);
-            int x1 = centerX + (int)(sideSign * (topHalf + (botHalf - topHalf) * t1) * kMainLaneFrac);
-
-            lv_obj_t *dash = lv_line_create(roadArea);
-            lv_obj_set_style_line_color(dash, lv_color_hex(0x556678), 0);
-            lv_obj_set_style_line_width(dash, 2, 0);
-            lv_point_precise_t local[2] = {{(lv_value_precise_t)x0, (lv_value_precise_t)y0},
-                                            {(lv_value_precise_t)x1, (lv_value_precise_t)y1}};
-            memcpy(dashPts[dividerSlot][i], local, sizeof(local));
-            lv_line_set_points(dash, dashPts[dividerSlot][i], 2);
-            lv_obj_clear_flag(dash, LV_OBJ_FLAG_CLICKABLE);
-        }
-    };
-    dashedDivider(0, -1.0f);
-    dashedDivider(1, 1.0f);
-
-    // Distance gridlines at 25/50/75% of the current max range (spec
-    // section 14.1's road view didn't have any distance reference at all —
-    // user-requested 2026-09-15, "chia lane duong theo cac muc khoang cach
-    // toi da la 100m"). Fractions, not fixed meter values: since a
-    // gridline's screen position only depends on the FRACTION of max range
-    // (normDist, same as target placement below), not on the max-range
-    // value itself, these never need to move even when cfg.maxRangeM
-    // changes in Settings — only what real-world distance they'd label
-    // would change, and there's no on-screen label to update. 100% would
-    // sit right on the panel's own top border, so it's skipped as
-    // redundant.
-    static lv_point_precise_t gridPts[3][2];
-    static const float kGridFractions[3] = {0.25f, 0.5f, 0.75f};
-    for (int i = 0; i < 3; i++) {
-        // Mirrors the target screenY formula in refreshDashboard() so a
-        // target at exactly this fraction of max range sits on the line.
-        int y = roadH - (int)(kGridFractions[i] * (roadH - 24)) - 12;
-        if (y < top) y = top;
-        if (y > bottom) y = bottom;
-        float t = (float)(y - top) / (float)span;
-        int halfW = (int)(topHalf + (botHalf - topHalf) * t);
-
-        lv_obj_t *grid = lv_line_create(roadArea);
-        lv_obj_set_style_line_color(grid, lv_color_hex(0x223040), 0);
-        lv_obj_set_style_line_width(grid, 1, 0);
-        lv_point_precise_t local[2] = {{(lv_value_precise_t)(centerX - halfW), (lv_value_precise_t)y},
-                                        {(lv_value_precise_t)(centerX + halfW), (lv_value_precise_t)y}};
-        memcpy(gridPts[i], local, sizeof(local));
-        lv_line_set_points(grid, gridPts[i], 2);
-        lv_obj_clear_flag(grid, LV_OBJ_FLAG_CLICKABLE);
-    }
-}
 
 // Long-press-to-open-Settings feedback: a ring that sweeps closed over the
 // hold duration, so a press registers visually right away instead of the
@@ -429,55 +272,30 @@ static void hideHoldRing() {
     lv_obj_add_flag(holdRing, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Three gestures share the same press-and-hold on dashRoot, distinguished by
+// Two gestures share the same press-and-hold on dashRoot, distinguished by
 // duration: ~1s (HOLD_PRESS_MS, the existing ring animation's own duration,
-// user-requested 2026-09-14) opens Settings; holding to 2s+ instead toggles
-// Simple layout (user-requested 2026-09-21, "bam giu de chuyen sang che do
-// simple va nguoc lai"); holding all the way to 4s+ toggles WiFi. Each
-// longer tier suppresses the shorter one(s) that would otherwise fire on
-// release — a 4s WiFi hold doesn't ALSO open Settings, and a 2s
-// Simple-layout hold doesn't either. LVGL's indev only exposes ONE
-// long-press threshold directly (lv_indev_set_long_press_time(), already
-// used for the 1s point) — the 2s/4s points are measured by hand from
-// pressStartMs, sampled on LV_EVENT_LONG_PRESSED_REPEAT (which LVGL fires
-// periodically for as long as the press continues past the 1s mark).
+// user-requested 2026-09-14) opens Settings; holding to 4s+ instead toggles
+// WiFi. The longer tier suppresses the shorter one on release — a 4s WiFi
+// hold doesn't ALSO open Settings. LVGL's indev only exposes ONE long-press
+// threshold directly (lv_indev_set_long_press_time(), already used for the
+// 1s point) — the 4s point is measured by hand from pressStartMs, sampled
+// on LV_EVENT_LONG_PRESSED_REPEAT (which LVGL fires periodically for as
+// long as the press continues past the 1s mark).
+//
+// A third tier (2s hold) and a double-tap gesture used to live here too,
+// both toggling cfg.simpleUiMode (a radar-target-distance display mode) —
+// removed 2026-09-21 alongside cfg.simpleUiMode itself when radar was taken
+// out entirely (there's no more target distance for that mode to show).
 static uint32_t pressStartMs = 0;
 static bool longPressFired = false;    // past the 1s mark at least
-static bool simpleModeToggledThisPress = false; // past the 2s mark — latched so it can't fire twice for one press
 static bool wifiToggledThisPress = false; // past the 4s mark — latched so it can't fire twice for one press
-static const uint32_t kSimpleModeHoldMs = 2000;
-static const uint32_t kWifiHoldMs = 4000; // bumped from 3000 (2026-09-21) to make room for the new 2s Simple-layout tier in between
-
-// Double-tap gesture (user-requested 2026-09-21, "double click vao man
-// hinh de chuyen giua che do don gian va che do binh thuong") — toggles
-// cfg.simpleUiMode the same way the 2s hold above does; kept as a second,
-// alternative trigger for the same action rather than replacing the hold
-// gesture with it, since the user asked for the hold gesture separately
-// without saying to remove this one. Tracked separately from the
-// press-and-hold state above: a "quick tap" here means release happened
-// before the 1s long-press mark (same threshold the Settings-open gesture
-// already uses), so this can never fire from the same physical touch as
-// any of the three hold gestures — all are mutually exclusive by
-// construction.
-static uint32_t lastQuickTapMs = 0;
-// Widened 400->600->2000 (2026-09-21, user-reported "thu double tap mai
-// khong duoc") — real-hardware [tapDbg] capture showed the user's actual
-// gap between two taps running 1283-3279ms, an order of magnitude past a
-// typical mouse-double-click window; 2000ms comfortably covers that
-// without meaningfully risking two UNRELATED taps within 2s of each other,
-// since nothing else on this Dashboard responds to a quick tap at all.
-static const uint32_t kDoubleTapWindowMs = 2000;
+static const uint32_t kWifiHoldMs = 4000;
 
 // Guards onDashReleasedOrLost's body from running more than once per
-// physical press — added 2026-09-21 debugging the double-tap gesture not
-// registering. LVGL can fire BOTH LV_EVENT_RELEASED and LV_EVENT_PRESS_LOST
+// physical press. LVGL can fire BOTH LV_EVENT_RELEASED and LV_EVENT_PRESS_LOST
 // for what a user experiences as one clean tap (this board's touch
 // controller has a known occasional stuck/glitch quirk — see
-// AXS15231BTouch.cpp — that can plausibly trigger this). Without this
-// guard, a single real tap firing both events would consume the double-tap
-// window against itself (the 2nd spurious event reads as "the 2nd tap of a
-// pair" a few milliseconds after the 1st), leaving no window open for the
-// user's actual 2nd physical tap.
+// AXS15231BTouch.cpp — that can plausibly trigger this).
 static bool releaseHandledThisPress = false;
 
 static void onDashPressed(lv_event_t *e) {
@@ -498,7 +316,6 @@ static void onDashPressed(lv_event_t *e) {
 
     pressStartMs = millis();
     longPressFired = false;
-    simpleModeToggledThisPress = false;
     wifiToggledThisPress = false;
     releaseHandledThisPress = false;
 }
@@ -507,12 +324,6 @@ static void onDashLongPressed(lv_event_t *) { longPressFired = true; }
 
 static void onDashLongPressedRepeat(lv_event_t *) {
     uint32_t heldMs = millis() - pressStartMs;
-    if (!simpleModeToggledThisPress && heldMs >= kSimpleModeHoldMs) {
-        simpleModeToggledThisPress = true;
-        cfg.simpleUiMode = !cfg.simpleUiMode;
-        saveConfigToNVS(cfg);
-        Serial.printf("[uidemo] Simple layout %s via 2s hold gesture\n", cfg.simpleUiMode ? "ON" : "OFF");
-    }
     if (wifiToggledThisPress) return;
     if (heldMs < kWifiHoldMs) return;
     wifiToggledThisPress = true;
@@ -528,40 +339,10 @@ static void onDashReleasedOrLost(lv_event_t *) {
     if (releaseHandledThisPress) return; // see its own declaration comment
     releaseHandledThisPress = true;
     if (wifiToggledThisPress) return; // already handled above — don't also open Settings
-    if (simpleModeToggledThisPress) return; // already handled above — don't also open Settings
     if (longPressFired) {
         lv_screen_load(settingsScreen);
         return;
     }
-
-    // Quick-tap double-click: toggles Simple layout (see cfg.simpleUiMode's
-    // own comment for what the two modes are). Persisted immediately, not
-    // left to Settings' own Save button — a gesture made directly on the
-    // Dashboard has no separate "confirm" step the way a Settings session
-    // does, so the choice needs to survive a restart on its own.
-    uint32_t now = millis();
-    if (now - lastQuickTapMs < kDoubleTapWindowMs) {
-        lastQuickTapMs = 0; // consume the pair — a 3rd rapid tap starts a fresh pair, doesn't re-trigger instantly
-        cfg.simpleUiMode = !cfg.simpleUiMode;
-        saveConfigToNVS(cfg);
-        Serial.printf("[uidemo] Simple layout %s via double-tap gesture\n", cfg.simpleUiMode ? "ON" : "OFF");
-    } else {
-        lastQuickTapMs = now;
-    }
-}
-
-// Small helper: a borderless, non-interactive circular object — used for
-// the radar-sweep rings and the primary-target lock ring. Plain vector
-// dots/rings, not bitmaps, so they cost nothing extra against the
-// flash/PSRAM budget.
-static lv_obj_t *makeDot(lv_obj_t *parent, int diam) {
-    lv_obj_t *o = lv_obj_create(parent);
-    lv_obj_set_size(o, diam, diam);
-    lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(o, 0, 0);
-    lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE);
-    return o;
 }
 
 // Plain, non-interactive container — used for the top-bar row and the three
@@ -595,67 +376,29 @@ static lv_obj_t *makeIcon(lv_obj_t *parent, const lv_image_dsc_t *src) {
 // ---------------------------------------------------------------------
 static void buildDashboardLandscape(lv_obj_t *scr) {
     // ---------------- Top status bar ----------------
-    // Two zones now (was three), matching the 50/50 body split below:
-    // topLeft sits over PARAM_COL (radar + GNSS — both sensor-health
-    // telltales, natural fit alongside the numeric readouts on that side),
-    // topRight sits over ROAD_COL (sun/clock + settings gear — trip/time
-    // info alongside the road view). Reworked 2026-09-16 for the "chia doi
-    // man hinh" request; topRight's internal arrangement (sun-left/clock-
-    // growing-right, gear pinned right, wifi left of gear) is copied
-    // unchanged from buildDashboardPortrait()'s own topRight, already
-    // proven there.
+    // Two zones, matching the 50/50 body split below: topLeft sits over
+    // PARAM_COL, topRight over ROAD_COL (sun/clock + settings gear — trip/
+    // time info alongside the alert card). topRight's internal arrangement
+    // (sun-left/clock-growing-right, gear pinned right, wifi left of gear)
+    // is copied unchanged from buildDashboardPortrait()'s own topRight,
+    // already proven there.
     //
     // Status is color-only, no OK/FAULT/SEARCH words (direct request):
-    // GREEN = normal, RED = fault (nothing received/offline), blinking
-    // AMBER = pending/searching (module alive, just no fix yet). RADAR
-    // only has two real states in this sim (online/offline), so it never
-    // blinks — see refreshDashboard().
+    // GREEN = normal, RED = fault (nothing received at all), blinking AMBER
+    // = pending/searching (module alive, just no fix yet) — see
+    // refreshDashboard(). The radar status cluster that used to share this
+    // bar with GNSS was removed 2026-09-21 (radar removed entirely); GNSS
+    // now centers alone in topLeft's full 240px width instead of a 120px
+    // half-zone.
     lv_obj_t *topLeft = makePane(scr, 0, 0, PARAM_COL_W, TOP_H);
     lv_obj_t *topRight = makePane(scr, ROAD_COL_X, 0, ROAD_COL_W, TOP_H);
 
-    // radarCx shifted 17->35 (user-requested 2026-09-16, "can chinh can doi
-    // lai vi tri bieu tuong radar, GNSS, time") — previously the radar
-    // cluster+caption sat jammed against topLeft's left edge while GNSS sat
-    // jammed against its right edge, leaving a big dead gap between them.
-    // topLeft is 240px wide; treating it as two even 120px zones (matching
-    // the param-cell grid's own even-split reasoning) and centering the
-    // radar cluster+"RADAR" caption block (~69px wide: 18px cluster + 6px
-    // gap + ~45px text) in the LEFT zone gives (120-69)/2 = ~26px left
-    // margin, i.e. cluster center at 26+9 = 35.
-    static const int kRadarDiam[3] = {6, 12, 18};
-    int radarCx = 35, radarCy = TOP_H / 2;
-    for (int i = 0; i < 3; i++) {
-        radarRing[i] = lv_obj_create(topLeft);
-        lv_obj_set_size(radarRing[i], kRadarDiam[i], kRadarDiam[i]);
-        lv_obj_set_pos(radarRing[i], radarCx - kRadarDiam[i] / 2, radarCy - kRadarDiam[i] / 2);
-        lv_obj_set_style_radius(radarRing[i], LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_opa(radarRing[i], LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(radarRing[i], 1, 0);
-        lv_obj_clear_flag(radarRing[i], LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_clear_flag(radarRing[i], LV_OBJ_FLAG_CLICKABLE);
-    }
-    radarCenterDot = makeDot(topLeft, 3);
-    lv_obj_set_pos(radarCenterDot, radarCx - 1, radarCy - 1);
-
-    // Chained with lv_obj_align_to() off each element's ACTUAL rendered
-    // size, not guessed pixel gaps — a fixed offset guess is exactly how
-    // "some icons overlapping" happened (user-reported 2026-09-15): the
-    // guessed gaps didn't account for the real glyph widths. align_to
-    // can't overlap regardless of font metrics, so this is fixed for good,
-    // not just for this font/size.
-    radarCaption = lv_label_create(topLeft);
-    lv_label_set_text(radarCaption, "RADAR");
-    lv_obj_align_to(radarCaption, radarRing[2], LV_ALIGN_OUT_RIGHT_MID, 6, 0); // ring[2] = the outer 18px ring, the cluster's true right edge
-
-    // GNSS centered in topLeft's RIGHT 120px zone (was pinned hard to
-    // topLeft's own right edge, leaving the same kind of dead-gap imbalance
-    // radarCx's own comment above describes). Icon+"GNSS" caption is ~64px
-    // wide (20px GPS glyph + 4px gap + ~40px text); centered in a 120px zone
-    // gives (120-64)/2 = 28px margin, so the icon's left edge sits at
-    // 120 (zone start) + 28 = 148 from topLeft's own left edge.
+    // GNSS icon+"GNSS" caption is ~64px wide (20px GPS glyph + 4px gap +
+    // ~40px text); centered in topLeft's full 240px width gives (240-64)/2
+    // = 88px left margin.
     gnssIcon = lv_label_create(topLeft);
     lv_label_set_text(gnssIcon, LV_SYMBOL_GPS);
-    lv_obj_align(gnssIcon, LV_ALIGN_LEFT_MID, 148, 0);
+    lv_obj_align(gnssIcon, LV_ALIGN_LEFT_MID, 88, 0);
 
     gnssCaption = lv_label_create(topLeft);
     lv_label_set_text(gnssCaption, "GNSS");
@@ -666,8 +409,8 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     // other order (icon chained off the clock) would break the moment the
     // clock's digit count/width changes. Centered in topRight's LEFT 120px
     // zone (was pinned to topRight's own left edge — user-requested
-    // 2026-09-16 rebalance, same reasoning as radarCx/gnssIcon above): block
-    // is ~71px wide (22px icon + 4px gap + ~45px "HH:MM" text), centered in
+    // 2026-09-16 rebalance, same centering reasoning gnssIcon above uses):
+    // block is ~71px wide (22px icon + 4px gap + ~45px "HH:MM" text), centered in
     // 120px gives (120-71)/2 = ~25px left margin.
     sunIcon = makeIcon(topRight, &sun_icon);
     lv_obj_align(sunIcon, LV_ALIGN_LEFT_MID, 25, 0);
@@ -684,7 +427,7 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 
     // WiFi indicator (user-requested 2026-09-14) — chained off gearIcon's
     // actual left edge via align_to, same "no guessed pixel gaps" reasoning
-    // as radarCaption/gnssCaption above. Cyan accent, not red/amber/green:
+    // as gnssCaption above. Cyan accent, not red/amber/green:
     // this is a system telltale ("WiFi radio is on"), not a target-risk
     // color (spec section 14.2 — see ACCENT_COLOR's own comment). Hidden by
     // default: WiFi itself defaults OFF at boot (net/WebPortal.h), and
@@ -724,24 +467,20 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
         colDividerLine[1] = line;
     }
 
-    // ---------------- Param column (left half): speed, limit, warning, TTC ----------------
-    // A 2x2 grid now (user-requested 2026-09-16: "chia thanh bang 2x2, Toc do
-    // thuc te/Toc do toi da, Canh bao/TTC") — replaces the single evenly-
-    // spaced column from the previous pass (which itself replaced an even
-    // earlier mismatched two-sub-column split; see git history/prior
-    // comments in this area for that lineage). leftCol is still the outer
-    // 240x264 container; four equal 120x132 cells sit inside it as its own
-    // children, each hosting one group centered via TOP_MID relative to
-    // ITS cell — applyTheme() only themes specific widgets by name, never
-    // leftCol or these cells, so this restructuring is safe.
+    // ---------------- Param column (left half): speed + speed limit ----------------
+    // A 2x1 stack (was a 2x2 grid — the bottom-left Warning and bottom-right
+    // TTC cells were radar-only and removed 2026-09-21 alongside radar
+    // itself; this reclaims that freed half of leftCol for the top two
+    // cells, now full-width instead of quarter-width). leftCol is still the
+    // outer 240x264 container; two equal 240x132 cells stack inside it —
+    // applyTheme() only themes specific widgets by name, never leftCol or
+    // these cells, so this restructuring is safe.
     leftCol = makePane(scr, 0, COL_TOP, PARAM_COL_W, COL_H);
-    static const int kCellW = PARAM_COL_W / 2, kCellH = COL_H / 2; // 120 x 132
-    lv_obj_t *cellSpeed = makePane(leftCol, 0, 0, kCellW, kCellH);           // top-left: actual speed
-    lv_obj_t *cellLimit = makePane(leftCol, kCellW, 0, kCellW, kCellH);      // top-right: speed limit sign
-    lv_obj_t *cellWarn = makePane(leftCol, 0, kCellH, kCellW, kCellH);       // bottom-left: warning
-    lv_obj_t *cellTtc = makePane(leftCol, kCellW, kCellH, kCellW, kCellH);   // bottom-right: TTC
+    static const int kCellH = COL_H / 2; // 132
+    lv_obj_t *cellSpeed = makePane(leftCol, 0, 0, PARAM_COL_W, kCellH);       // top: actual speed
+    lv_obj_t *cellLimit = makePane(leftCol, 0, kCellH, PARAM_COL_W, kCellH);  // bottom: speed limit sign
 
-    // Top-left — ego speed. Bumped 28->36->48 (user-requested 2026-09-16 then
+    // Top — ego speed. Bumped 28->36->48 (user-requested 2026-09-16 then
     // 2026-09-21, "tang kich thuoc cac so hien thi len nua") —
     // LV_FONT_MONTSERRAT_48 enabled in lv_conf.h (already needed for Simple
     // layout's distance number). y positioned (not simply centered in the
@@ -762,10 +501,10 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     lv_label_set_text(kmhCaption, "km/h");
     lv_obj_align(kmhCaption, LV_ALIGN_TOP_MID, 0, 94);
 
-    // Top-right — speed limit sign, 88px diameter, vertically centered in
-    // the 132px cell ((132-88)/2 = 22) and horizontally centered in the
-    // 120px cell (comfortably clears the sign's own 9px border on both
-    // sides: (120-88)/2 = 16).
+    // Bottom — speed limit sign, 88px diameter, centered in the now
+    // full-width 240x132 cell (comfortably clears the sign's own 9px
+    // border either way: (240-88)/2 = 76 horizontal, (132-88)/2 = 22
+    // vertical).
     //
     // Speed limit for the current road segment (user-requested 2026-09-15,
     // "ngay dưới phần hiển thị tốc độ xe chạy" — right below ego speed,
@@ -812,98 +551,17 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     lv_obj_set_style_text_font(speedLimitValueLabel, &lv_font_montserrat_32, 0);
     lv_obj_align_to(speedLimitValueLabel, speedLimitSign, LV_ALIGN_CENTER, 0, 0);
 
-    // Bottom-left — warning (30px icon + 18px word, centered as a block:
-    // top margin (132-48)/2 = 42).
-    warningIconObj = makeIcon(cellWarn, &warning_icon); // fixed true color — see Icons.h
-    lv_obj_align(warningIconObj, LV_ALIGN_TOP_MID, 0, 42);
-
-    riskWordLabel = lv_label_create(cellWarn);
-    lv_obj_align(riskWordLabel, LV_ALIGN_TOP_MID, 0, 76);
-
-    // Bottom-right — TTC. Bumped 24->36 (user-requested 2026-09-21, "tang
-    // kich thuoc cac so hien thi len nua") — top kept at 42 (same start as
-    // before), caption pushed 76->86 since the number's own bottom edge
-    // moved from 42+27=69 to 42+40=82 (font 36's line_height=40) — needs to
-    // clear that plus a small gap.
-    ttcValueLabel = lv_label_create(cellTtc);
-    lv_obj_set_style_text_font(ttcValueLabel, &lv_font_montserrat_36, 0);
-    lv_obj_set_style_text_color(ttcValueLabel, lv_color_white(), 0);
-    lv_obj_align(ttcValueLabel, LV_ALIGN_TOP_MID, 0, 42);
-
-    ttcCaption = lv_label_create(cellTtc);
-    lv_label_set_text(ttcCaption, "TTC");
-    lv_obj_align(ttcCaption, LV_ALIGN_TOP_MID, 0, 86);
-
-    // ---------------- Road column (right half): distance + road + targets ----------------
+    // ---------------- Road column (right half): sign/camera alert card ----------------
+    // Used to also hold a radar road/target view (primaryDistLabel, roadArea,
+    // per-target icons/labels) beneath the alert card — all removed
+    // 2026-09-21 alongside radar itself. buildTrafficCard() is now the
+    // column's only content; sized to use most of the freed vertical room
+    // (was a fixed 224x224 leaving roadArea below it; COL_H is 264 here and
+    // the card is positioned at a fixed y=8, so 250 leaves a clean 6px
+    // bottom margin instead of overflowing the column).
     midCol = makePane(scr, ROAD_COL_X, COL_TOP, ROAD_COL_W, COL_H);
 
-    buildTrafficCard(midCol, 224, 224);
-
-    primaryDistLabel = lv_label_create(midCol);
-    lv_obj_set_style_text_font(primaryDistLabel, &lv_font_montserrat_24, 0);
-    lv_obj_align(primaryDistLabel, LV_ALIGN_TOP_MID, 0, 2);
-
-    // Simple-layout-only (see its own declaration comment) — positioned
-    // below where primaryDistLabel sits once centered by the simpleUiMode
-    // block (48pt font, line_height 52, so its bottom edge is roughly
-    // 26px below CENTER; +14px gap).
-    legalDistCaption = lv_label_create(midCol);
-    lv_obj_align(legalDistCaption, LV_ALIGN_CENTER, 0, 40);
-    lv_obj_add_flag(legalDistCaption, LV_OBJ_FLAG_HIDDEN);
-
-    // roadArea's own colors are NOT themed — it stays a consistently dark
-    // panel in both Day and Night (like the schematic "road view" in most
-    // cluster/nav UIs), only the chrome around it switches with
-    // gnss.daytime. See applyTheme() below.
-    roadArea = lv_obj_create(midCol);
-    lv_obj_set_pos(roadArea, ROAD_X, ROAD_Y);
-    lv_obj_set_size(roadArea, ROAD_W, ROAD_H);
-    lv_obj_set_style_bg_color(roadArea, lv_color_hex(0x12181F), 0);
-    lv_obj_set_style_border_color(roadArea, lv_color_hex(0x243040), 0);
-    lv_obj_set_style_border_width(roadArea, 1, 0);
-    lv_obj_set_style_radius(roadArea, 8, 0);
-    lv_obj_clear_flag(roadArea, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(roadArea, LV_OBJ_FLAG_CLICKABLE);
-    // Same root cause as Settings.cpp's 2026-09-16 invisible-choice-button
-    // bug: lv_obj_get_width/height() only reflect a pending lv_obj_set_size()
-    // after the next redraw (LVGL's own documented behavior), but this whole
-    // screen is built inside setup() before LVGL has ever redrawn once.
-    // buildRoadLanes() right below reads roadArea's size back — without this,
-    // it silently got 0x0 and drew every lane line/dash/grid mark with zero
-    // extent, i.e. invisible, in every orientation (user-reported 2026-09-16,
-    // "khong hien thi vach chia lane duong").
-    lv_obj_update_layout(roadArea);
-    lv_obj_add_flag(roadArea, LV_OBJ_FLAG_HIDDEN); // trafficCard takes visual precedence
-
-    buildRoadLanes();
-
-    faultLabel = lv_label_create(roadArea);
-    lv_obj_set_style_text_color(faultLabel, lv_color_hex(0xFF5544), 0);
-    lv_obj_set_style_text_align(faultLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(faultLabel);
-    lv_obj_add_flag(faultLabel, LV_OBJ_FLAG_HIDDEN);
-
-    // Primary-target lock ring — spatial referencing (AR-HUD study: exact
-    // on-target highlighting gives the most stable visual attention).
-    // Created once here, just repositioned/shown in refreshDashboard().
-    primaryRing = lv_obj_create(roadArea);
-    lv_obj_set_style_radius(primaryRing, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(primaryRing, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(primaryRing, 2, 0);
-    lv_obj_set_style_border_color(primaryRing, lv_color_hex(ACCENT_COLOR), 0);
-    lv_obj_clear_flag(primaryRing, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(primaryRing, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(primaryRing, LV_OBJ_FLAG_HIDDEN);
-
-    for (int i = 0; i < MAX_TARGETS; i++) {
-        targetIcon[i] = makeIcon(roadArea, &car_icon);
-        lv_obj_set_style_image_recolor_opa(targetIcon[i], LV_OPA_COVER, 0);
-        lv_obj_add_flag(targetIcon[i], LV_OBJ_FLAG_HIDDEN);
-
-        targetLabels[i] = lv_label_create(roadArea);
-        lv_obj_set_style_text_color(targetLabels[i], lv_color_hex(0xCCCCCC), 0);
-        lv_obj_add_flag(targetLabels[i], LV_OBJ_FLAG_HIDDEN);
-    }
+    buildTrafficCard(midCol, 224, 250);
 
     // ---------------- Bottom info bar ----------------
     bottomInfoLabel = lv_label_create(scr);
@@ -914,41 +572,22 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 // Portrait content (rotation 0/2, 320x480) — a different ARRANGEMENT of the
 // exact same widgets/information as buildDashboardLandscape() above, not a
 // parametric reflow of it (see this file's own layout-constants comment for
-// why). Stacked top-to-bottom instead of 3 side-by-side columns: status bar,
-// then speed+limit-sign side by side, then the road/target view (given the
-// most vertical room — a receding road naturally suits a tall screen better
-// than it suited landscape's 3-way split), then TTC/warning, then the same
-// bottom info bar.
+// why). Stacked top-to-bottom: status bar, then speed+limit-sign side by
+// side, then the sign/camera alert card (given the most vertical room —
+// used to be a receding radar road/target view here before radar was
+// removed 2026-09-21; the alert card fills that same freed space now).
 // ---------------------------------------------------------------------
 static void buildDashboardPortrait(lv_obj_t *scr) {
     const int scrW = 320, scrH = 480; // both rotation 0 and 2 produce exactly this — see AppConfig.h's screenRotation
     const int pTopH = 30, pBottomH = 26;
     const int pSpeedRowH = 116;
-    const int pWarnRowH = 40;
     const int pPad = 8;
 
-    // ---------------- Top status bar (one row, all three telltales) ----------------
-    lv_obj_t *topLeft = makePane(scr, 0, 0, scrW / 2, pTopH);
+    // ---------------- Top status bar ----------------
+    // topLeft used to also hold a radar status cluster (removed 2026-09-21
+    // alongside radar itself) — GNSS/clock/sun/gear/wifi all still live in
+    // topRight unchanged, topLeft is just empty space now.
     lv_obj_t *topRight = makePane(scr, scrW / 2, 0, scrW / 2, pTopH);
-
-    static const int kRadarDiam[3] = {6, 12, 18};
-    int radarCx = 17, radarCy = pTopH / 2;
-    for (int i = 0; i < 3; i++) {
-        radarRing[i] = lv_obj_create(topLeft);
-        lv_obj_set_size(radarRing[i], kRadarDiam[i], kRadarDiam[i]);
-        lv_obj_set_pos(radarRing[i], radarCx - kRadarDiam[i] / 2, radarCy - kRadarDiam[i] / 2);
-        lv_obj_set_style_radius(radarRing[i], LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_opa(radarRing[i], LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(radarRing[i], 1, 0);
-        lv_obj_clear_flag(radarRing[i], LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_clear_flag(radarRing[i], LV_OBJ_FLAG_CLICKABLE);
-    }
-    radarCenterDot = makeDot(topLeft, 3);
-    lv_obj_set_pos(radarCenterDot, radarCx - 1, radarCy - 1);
-
-    radarCaption = lv_label_create(topLeft);
-    lv_label_set_text(radarCaption, "RADAR");
-    lv_obj_align_to(radarCaption, radarRing[2], LV_ALIGN_OUT_RIGHT_MID, 6, 0);
 
     // Narrower than landscape's top-mid zone, so GNSS/clock/sun share the
     // right half instead of their own dedicated middle zone.
@@ -1029,84 +668,15 @@ static void buildDashboardPortrait(lv_obj_t *scr) {
     lv_obj_set_style_text_font(speedLimitValueLabel, &lv_font_montserrat_32, 0);
     lv_obj_align_to(speedLimitValueLabel, speedLimitSign, LV_ALIGN_CENTER, 0, 0);
 
-    // ---------------- Road/target view — the big middle area ----------------
-    midCol = makePane(scr, 0, pTopH + pSpeedRowH, scrW, scrH - pTopH - pSpeedRowH - pWarnRowH - pBottomH);
-    // lv_obj_get_height(midCol) below needs midCol's just-set size committed
-    // now rather than at the next redraw (see roadArea's own update_layout
-    // comment in buildDashboardLandscape() for the full explanation) —
-    // otherwise it reads back 0 and roadArea below ends up with a negative
-    // height.
-    lv_obj_update_layout(midCol);
+    // ---------------- Sign/camera alert card — the big middle area ----------------
+    // Used to hold a radar road/target view (primaryDistLabel, roadArea,
+    // per-target icons/labels) plus a separate Warning/TTC strip below it —
+    // both removed 2026-09-21 alongside radar itself. buildTrafficCard() now
+    // fills this whole reclaimed area instead.
+    midCol = makePane(scr, 0, pTopH + pSpeedRowH, scrW, scrH - pTopH - pSpeedRowH - pBottomH);
+    lv_obj_update_layout(midCol); // see buildDashboardLandscape()'s own comment on why this commit-now call matters
 
-    primaryDistLabel = lv_label_create(midCol);
-    lv_obj_set_style_text_font(primaryDistLabel, &lv_font_montserrat_24, 0);
-    lv_obj_align(primaryDistLabel, LV_ALIGN_TOP_MID, 0, 2);
-
-    // Simple-layout-only — see its declaration comment and the landscape
-    // builder's identical block above.
-    legalDistCaption = lv_label_create(midCol);
-    lv_obj_align(legalDistCaption, LV_ALIGN_CENTER, 0, 40);
-    lv_obj_add_flag(legalDistCaption, LV_OBJ_FLAG_HIDDEN);
-
-    roadArea = lv_obj_create(midCol);
-    lv_obj_set_pos(roadArea, pPad, 32);
-    lv_obj_set_size(roadArea, scrW - 2 * pPad, lv_obj_get_height(midCol) - 32 - 6);
-    lv_obj_set_style_bg_color(roadArea, lv_color_hex(0x12181F), 0);
-    lv_obj_set_style_border_color(roadArea, lv_color_hex(0x243040), 0);
-    lv_obj_set_style_border_width(roadArea, 1, 0);
-    lv_obj_set_style_radius(roadArea, 8, 0);
-    lv_obj_clear_flag(roadArea, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(roadArea, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_update_layout(roadArea); // see buildDashboardLandscape()'s own comment on this call
-
-    buildRoadLanes();
-
-    faultLabel = lv_label_create(roadArea);
-    lv_obj_set_style_text_color(faultLabel, lv_color_hex(0xFF5544), 0);
-    lv_obj_set_style_text_align(faultLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(faultLabel);
-    lv_obj_add_flag(faultLabel, LV_OBJ_FLAG_HIDDEN);
-
-    primaryRing = lv_obj_create(roadArea);
-    lv_obj_set_style_radius(primaryRing, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(primaryRing, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(primaryRing, 2, 0);
-    lv_obj_set_style_border_color(primaryRing, lv_color_hex(ACCENT_COLOR), 0);
-    lv_obj_clear_flag(primaryRing, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(primaryRing, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(primaryRing, LV_OBJ_FLAG_HIDDEN);
-
-    for (int i = 0; i < MAX_TARGETS; i++) {
-        targetIcon[i] = makeIcon(roadArea, &car_icon);
-        lv_obj_set_style_image_recolor_opa(targetIcon[i], LV_OPA_COVER, 0);
-        lv_obj_add_flag(targetIcon[i], LV_OBJ_FLAG_HIDDEN);
-
-        targetLabels[i] = lv_label_create(roadArea);
-        lv_obj_set_style_text_color(targetLabels[i], lv_color_hex(0xCCCCCC), 0);
-        lv_obj_add_flag(targetLabels[i], LV_OBJ_FLAG_HIDDEN);
-    }
-
-    // ---------------- Warning/TTC row — one horizontal strip ----------------
-    rightCol = makePane(scr, 0, scrH - pBottomH - pWarnRowH, scrW, pWarnRowH);
-
-    warningIconObj = makeIcon(rightCol, &warning_icon);
-    lv_obj_align(warningIconObj, LV_ALIGN_LEFT_MID, 16, 0);
-
-    riskWordLabel = lv_label_create(rightCol);
-    lv_obj_align_to(riskWordLabel, warningIconObj, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
-
-    ttcCaption = lv_label_create(rightCol);
-    lv_label_set_text(ttcCaption, "TTC");
-    lv_obj_align(ttcCaption, LV_ALIGN_RIGHT_MID, -16, -12);
-
-    // Bumped 24->28 only (not matching landscape's 36) — this whole row is
-    // a cramped 40px-tall strip (pWarnRowH), unlike landscape's 132px-tall
-    // cell; 28 is as far as this can grow without the number visibly
-    // colliding with ttcCaption above it in the same tight row.
-    ttcValueLabel = lv_label_create(rightCol);
-    lv_obj_set_style_text_font(ttcValueLabel, &lv_font_montserrat_28, 0);
-    lv_obj_set_style_text_color(ttcValueLabel, lv_color_white(), 0);
-    lv_obj_align(ttcValueLabel, LV_ALIGN_RIGHT_MID, -16, 10);
+    buildTrafficCard(midCol, scrW - 2 * pPad, lv_obj_get_height(midCol) - 16);
 
     // ---------------- Bottom info bar ----------------
     bottomInfoLabel = lv_label_create(scr);
@@ -1148,36 +718,16 @@ void buildDashboard() {
         buildDashboardLandscape(scr);
     }
 
-    // Full-screen color flash for WARNING/CRITICAL risk (user-requested
-    // 2026-09-15: the color-coded distance warning should flash the WHOLE
-    // screen via an overlay, not stay confined to small text/icons —
-    // amber/yellow for the medium ("vừa") tier, red for the dangerous
-    // ("nguy hiểm") tier). Translucent, not opaque, so speed/TTC/etc stay
-    // readable through it. Toggled via the HIDDEN flag on a slow (250 or
-    // 500ms) cadence in refreshDashboard() — gated so the color/visibility
-    // only change when they actually need to, never every 150ms tick: a
-    // full-screen invalidation is the single most expensive thing this UI
-    // can ask the Canvas driver to do (see DisplayDriver.h's full-frame-
-    // flush note and the roadArea critical-border comment below for the
-    // measured cost of getting this gating wrong).
-    warningFlashOverlay = lv_obj_create(scr);
-    lv_obj_set_pos(warningFlashOverlay, 0, 0);
-    lv_obj_set_size(warningFlashOverlay, scrW, scrH);
-    lv_obj_set_style_border_width(warningFlashOverlay, 0, 0);
-    lv_obj_set_style_radius(warningFlashOverlay, 0, 0);
-    lv_obj_set_style_bg_opa(warningFlashOverlay, LV_OPA_30, 0);
-    lv_obj_clear_flag(warningFlashOverlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(warningFlashOverlay, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(warningFlashOverlay, LV_OBJ_FLAG_HIDDEN);
-
-    // Speeding overlay (user-requested 2026-09-16) — same shared-object/
-    // translucent/HIDDEN-toggle pattern as warningFlashOverlay just above,
-    // own dedicated color (0xB33DC6, matches STATUS_SPEEDING defined below
-    // buildDashboard() — same "not visible here yet" reason harshBrakeLabel
-    // right below hardcodes STATUS_AMBER's value too) so it never gets
-    // mistaken for a collision-risk flash. Fixed color at build time, not
-    // reassigned in refreshDashboard() like warningFlashOverlay's color is
-    // — speeding has no tiers to switch between.
+    // Full-screen speeding overlay (user-requested 2026-09-16) — translucent,
+    // not opaque, so speed/limit/etc stay readable through it. Toggled via
+    // the HIDDEN flag on its own blink cadence in refreshDashboard() —
+    // gated so the color/visibility only change when they actually need to,
+    // never every 150ms tick: a full-screen invalidation is the single most
+    // expensive thing this UI can ask the Canvas driver to do (see
+    // DisplayDriver.h's full-frame-flush note). Used to share this pattern
+    // with a TTC-based warningFlashOverlay (red/amber, imminent-collision
+    // risk) — removed 2026-09-21 alongside radar itself, so speeding is now
+    // the only full-screen flash this Dashboard has.
     speedingFlashOverlay = lv_obj_create(scr);
     lv_obj_set_pos(speedingFlashOverlay, 0, 0);
     lv_obj_set_size(speedingFlashOverlay, scrW, scrH);
@@ -1189,29 +739,13 @@ void buildDashboard() {
     lv_obj_clear_flag(speedingFlashOverlay, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(speedingFlashOverlay, LV_OBJ_FLAG_HIDDEN);
 
-    // Sudden-closing-speed banner (added 2026-09-16) — a small pill at the
-    // top-center of the FULL screen (scr, not roadArea — same "one shared
-    // object, built once here" reasoning as warningFlashOverlay right
-    // above, so it works unchanged in either orientation). Deliberately
-    // solid/opaque and drawn after the top status bar/road panel, so it can
-    // briefly cover a corner of either during the rare, urgent moment it's
-    // actually shown — acceptable same as warningFlashOverlay itself
-    // temporarily dimming readability during a real CRITICAL event.
-    harshBrakeLabel = lv_label_create(scr);
-    lv_label_set_text(harshBrakeLabel, "SUDDEN CLOSING SPEED");
-    lv_obj_set_style_bg_color(harshBrakeLabel, lv_color_hex(0xE0C020), 0); // matches STATUS_AMBER (defined below buildDashboard(), not visible here yet)
-    lv_obj_set_style_bg_opa(harshBrakeLabel, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(harshBrakeLabel, lv_color_black(), 0);
-    lv_obj_set_style_pad_hor(harshBrakeLabel, 10, 0);
-    lv_obj_set_style_pad_ver(harshBrakeLabel, 4, 0);
-    lv_obj_set_style_radius(harshBrakeLabel, 6, 0);
-    lv_obj_align(harshBrakeLabel, LV_ALIGN_TOP_MID, 0, 2);
-    lv_obj_add_flag(harshBrakeLabel, LV_OBJ_FLAG_HIDDEN);
-
-    // Positioned just below harshBrakeLabel (y=28 vs. its y=2) so the two
-    // stack rather than overlap on the rare tick both happen to be visible
-    // at once. Text set live in refreshDashboard() (the actual upcoming
-    // limit number isn't known until then).
+    // Positioned at the FULL screen's top-center (scr, not the alert card —
+    // one shared object, built once here, works unchanged in either
+    // orientation). Used to stack below a radar "sudden closing speed"
+    // banner (y=28 vs. that banner's y=2) — that banner is gone with radar
+    // (2026-09-21), so this now sits at the top spot itself. Text set live
+    // in refreshDashboard() (the actual upcoming limit number isn't known
+    // until then).
     aheadLimitLabel = lv_label_create(scr);
     lv_obj_set_style_bg_color(aheadLimitLabel, lv_color_hex(0x2F7CE0), 0);
     lv_obj_set_style_bg_opa(aheadLimitLabel, LV_OPA_COVER, 0);
@@ -1219,11 +753,11 @@ void buildDashboard() {
     lv_obj_set_style_pad_hor(aheadLimitLabel, 10, 0);
     lv_obj_set_style_pad_ver(aheadLimitLabel, 4, 0);
     lv_obj_set_style_radius(aheadLimitLabel, 6, 0);
-    lv_obj_align(aheadLimitLabel, LV_ALIGN_TOP_MID, 0, 28);
+    lv_obj_align(aheadLimitLabel, LV_ALIGN_TOP_MID, 0, 2);
     lv_obj_add_flag(aheadLimitLabel, LV_OBJ_FLAG_HIDDEN);
 
-    // Positioned below both banners above (y=54) — see cameraAheadLabel's
-    // own declaration comment for the color/stacking reasoning.
+    // Positioned below aheadLimitLabel above (y=28) — see its own
+    // declaration comment for the color/stacking reasoning.
     cameraAheadLabel = lv_label_create(scr);
     lv_obj_set_style_bg_color(cameraAheadLabel, lv_color_hex(0xE0A020), 0);
     lv_obj_set_style_bg_opa(cameraAheadLabel, LV_OPA_COVER, 0);
@@ -1231,7 +765,7 @@ void buildDashboard() {
     lv_obj_set_style_pad_hor(cameraAheadLabel, 10, 0);
     lv_obj_set_style_pad_ver(cameraAheadLabel, 4, 0);
     lv_obj_set_style_radius(cameraAheadLabel, 6, 0);
-    lv_obj_align(cameraAheadLabel, LV_ALIGN_TOP_MID, 0, 54);
+    lv_obj_align(cameraAheadLabel, LV_ALIGN_TOP_MID, 0, 28);
     lv_obj_add_flag(cameraAheadLabel, LV_OBJ_FLAG_HIDDEN);
 
     // Traffic sign banner (Khu dan cu, cam vuot, tram thu phi, den tin hieu)
@@ -1242,7 +776,7 @@ void buildDashboard() {
     lv_obj_set_style_pad_hor(trafficSignLabel, 10, 0);
     lv_obj_set_style_pad_ver(trafficSignLabel, 4, 0);
     lv_obj_set_style_radius(trafficSignLabel, 6, 0);
-    lv_obj_align(trafficSignLabel, LV_ALIGN_TOP_MID, 0, 82);
+    lv_obj_align(trafficSignLabel, LV_ALIGN_TOP_MID, 0, 54);
     lv_obj_add_flag(trafficSignLabel, LV_OBJ_FLAG_HIDDEN);
 
     // Hold-to-open-Settings progress ring — created last so it draws on top
@@ -1296,17 +830,16 @@ static void showWifiToast(bool on) {
     wifiToastUntilMs = millis() + 1500;
 }
 
-// Day/Night color theme for the chrome AROUND the road panel — background,
-// captions, primary readouts, gear icon, column dividers, bottom info bar
-// (user-requested 2026-09-15, driven by the same gnss.daytime sunrise/
-// sunset calc already used for the clock icon). The road panel itself
-// (background/lane lines/target labels) stays a consistently dark
-// schematic view in both themes — same reasoning most cluster/nav UIs keep
-// their map/camera area dark regardless of day/night, see the comment
-// where roadArea is created. Risk/status colors (red/amber/green,
-// ACCENT_COLOR) also stay theme-independent everywhere: changing a safety
-// color's hue between Day and Night would undermine the "color only means
-// risk" rule (spec section 14.2), not serve it.
+// Day/Night color theme for the chrome — background, captions, primary
+// readouts, gear icon, column dividers, bottom info bar (user-requested
+// 2026-09-15, driven by the same gnss.daytime sunrise/sunset calc already
+// used for the clock icon). The sign/camera alert card (buildTrafficCard())
+// stays a consistently dark panel in both themes instead — same reasoning
+// most cluster/nav UIs keep their map/camera area dark regardless of day/
+// night. Risk/status colors (red/amber/purple, ACCENT_COLOR) also stay
+// theme-independent everywhere: changing a safety color's hue between Day
+// and Night would undermine the "color only means risk" rule (spec section
+// 14.2), not serve it.
 static void applyTheme(bool daytime) {
     lv_color_t rootBg, captionText, primaryText, clockText, gearColor, dividerColor, bottomText;
     if (daytime) {
@@ -1338,7 +871,6 @@ static void applyTheme(bool daytime) {
     lv_obj_set_style_bg_color(dashboardScreen, rootBg, 0);
     lv_obj_set_style_bg_color(dashRoot, rootBg, 0);
 
-    lv_obj_set_style_text_color(radarCaption, captionText, 0);
     lv_obj_set_style_text_color(gnssCaption, captionText, 0);
     lv_obj_set_style_text_color(clockLabel, clockText, 0);
     lv_obj_set_style_text_color(gearIcon, gearColor, 0);
@@ -1346,10 +878,8 @@ static void applyTheme(bool daytime) {
 
     // speedLabel's themed color is remembered (not just applied) because
     // refreshDashboard() overrides it to red on top of this whenever the
-    // driver is over the matched speed limit — same theme-independent-
-    // override pattern riskWordLabel/ttcValueLabel already use for their
-    // own safety coloring, just layered on a label that ALSO needs a normal
-    // themed color the rest of the time.
+    // driver is over the matched speed limit — a theme-independent override
+    // on a label that ALSO needs a normal themed color the rest of the time.
     currentPrimaryTextColor = primaryText;
     lv_obj_set_style_text_color(speedLabel, primaryText, 0);
     lv_obj_set_style_text_color(kmhCaption, captionText, 0);
@@ -1358,17 +888,9 @@ static void applyTheme(bool daytime) {
     // section 14.2's "a safety color must mean the same thing in both
     // themes" reasoning extends naturally to "a regulatory sign doesn't
     // recolor itself for you either"). See refreshDashboard().
-    lv_obj_set_style_text_color(primaryDistLabel, primaryText, 0);
-    lv_obj_set_style_text_color(ttcCaption, captionText, 0);
 
     lv_obj_set_style_text_color(bottomInfoLabel, bottomText, 0);
 }
-
-// Named lerpf (not lerp) — the newer toolchain used by env:uidemo3
-// (Arduino-ESP32 3.x / a more recent libstdc++) already declares
-// `float lerp(float,float,float)` at global scope via <cmath>/C++20,
-// and a same-signature redeclaration is a hard conflict there.
-static float lerpf(float a, float b, float t) { return a + (b - a) * t; }
 
 // GREEN = normal, RED = fault, blinking AMBER = pending/searching — see the
 // top-bar build comment. blinkOn flips at ~1Hz (500ms/500ms) off the same
@@ -1383,6 +905,26 @@ static float lerpf(float a, float b, float t) { return a + (b - a) * t; }
 // own color rather than reusing STATUS_RED.
 #define STATUS_SPEEDING 0xB33DC6
 
+// Queues the numbered voice clip for kmh (data/speedmap/sounds/vi/speed/
+// <N>.mp3) — ONLY if it exactly matches one of the values actually staged
+// there (Task C/E, 2026-09-21). Deliberately does not round/approximate to
+// the nearest available number: speaking "80" for an actual 82 km/h limit
+// would be misinformation, not a rounding nicety, so an unmatched value
+// just gets no spoken number (the tone chime + on-screen text still show
+// it exactly).
+static void queueSpeedVoice(float kmh) {
+    static const int kKnownSpeeds[] = {20, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100, 120};
+    int kmhInt = (int)lroundf(kmh);
+    for (size_t i = 0; i < sizeof(kKnownSpeeds) / sizeof(kKnownSpeeds[0]); i++) {
+        if (kKnownSpeeds[i] == kmhInt) {
+            char speedFile[24];
+            snprintf(speedFile, sizeof(speedFile), "speed/%d.mp3", kmhInt);
+            audioQueueVoice(speedFile);
+            return;
+        }
+    }
+}
+
 void refreshDashboard() {
     // Auto-hide the WiFi toggle toast (see showWifiToast()) — checked here
     // rather than a dedicated timer since refreshDashboard() already runs
@@ -1394,7 +936,6 @@ void refreshDashboard() {
 
     // Single mutex-protected read per refresh — everything below uses these
     // local copies, never the live shared state (see core/SharedState.h).
-    RadarSnapshot radar = radarSnapshot();
     GnssSnapshot gnss = gnssSnapshot();
 
     // Auto-wake the instant real movement resumes (not just on touch) — the
@@ -1405,12 +946,6 @@ void refreshDashboard() {
     if (screenDimmed && gnss.fix && gnss.egoSpeedKmh > kGnssMotionThresholdKmh) wakeScreen();
 
     // --- Top bar: color-only status (no OK/FAULT/SEARCH words) ---
-    // RADAR only has two real states in this sim (online/offline) — no
-    // "searching" telemetry exists for it, so it's a plain green/red dot.
-    lv_color_t radarColor = radar.online ? lv_color_hex(STATUS_GREEN) : lv_color_hex(STATUS_RED);
-    for (int i = 0; i < 3; i++) lv_obj_set_style_border_color(radarRing[i], radarColor, 0);
-    lv_obj_set_style_bg_color(radarCenterDot, radarColor, 0);
-
     // GNSS has a real third state: module alive and sending valid NMEA but
     // no fix yet (normal while cold-starting/indoors, not an error) versus
     // nothing received at all (an actual wiring/power/baud problem) — see
@@ -1460,8 +995,7 @@ void refreshDashboard() {
     // follows the real sunrise/sunset calc below unchanged; Light/Dark
     // override it either way. Re-themes only on an actual CHANGE in the
     // resulting effective value (either gnss.daytime changing under Auto,
-    // or cfg.themeMode itself changing) — same gating rule as the roadArea
-    // critical-border flash below: touching lv_obj_set_style_*
+    // or cfg.themeMode itself changing) — touching lv_obj_set_style_*
     // unconditionally every 150ms would mean re-invalidating the whole
     // screen background + every themed label on every tick for nothing.
     bool effectiveDaytime = cfg.themeMode == 1.0f    ? true
@@ -1475,64 +1009,7 @@ void refreshDashboard() {
         applyTheme(effectiveDaytime);
     }
 
-    // Simple layout (user-requested 2026-09-16, cfg.simpleUiMode — see
-    // AppConfig.h's comment): swap the graphical road view for one big
-    // same-lane-distance number, gated on an actual mode CHANGE, same
-    // "don't restyle every tick for nothing" discipline as the theme block
-    // just above. primaryDistLabel's own text/color is still set further
-    // below by the existing distance-readout code (unchanged) — this block
-    // only handles what differs between the two layouts: whether roadArea
-    // is visible at all, and the label's font/position.
-    static bool lastSimpleUiMode = false;
-    static bool simpleUiModeInit = false;
-    if (!simpleUiModeInit || cfg.simpleUiMode != lastSimpleUiMode) {
-        simpleUiModeInit = true;
-        lastSimpleUiMode = cfg.simpleUiMode;
-        if (cfg.simpleUiMode) {
-            lv_obj_add_flag(roadArea, LV_OBJ_FLAG_HIDDEN);
-            // 48, not 36 — user-requested 2026-09-16 "con so khoang cach to
-            // hon nua" after first seeing 36 on real hardware. Largest
-            // built-in Montserrat size (lv_conf.h); still comfortably fits
-            // "999 m" within roadArea's narrowest real width (landscape's
-            // ~224px column).
-            lv_obj_set_style_text_font(primaryDistLabel, &lv_font_montserrat_48, 0);
-            lv_obj_align(primaryDistLabel, LV_ALIGN_CENTER, 0, 0);
-            // legalDistCaption's own text is set every tick further below
-            // (needs the current speed) — just make it visible here.
-            lv_obj_clear_flag(legalDistCaption, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_clear_flag(roadArea, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_font(primaryDistLabel, &lv_font_montserrat_24, 0);
-            lv_obj_align(primaryDistLabel, LV_ALIGN_TOP_MID, 0, 2);
-            lv_obj_add_flag(legalDistCaption, LV_OBJ_FLAG_HIDDEN); // Full layout shows the same info inline instead — see below
-        }
-    }
-
     // --- Left column ---
-    // Demo-mode display overlay (user-requested 2026-09-16, "demo (fake
-    // sensor) khong hien thi toc do toi da, toc do thuc te"): SimTask only
-    // fakes radar targets — GNSS itself is deliberately NEVER faked (see
-    // gnssTaskStart()'s own "unaffected by demoMode — always real" comment,
-    // a real-position safety invariant that must not be touched). That
-    // means indoors, with no real fix, ego speed and the speed-limit sign
-    // had nothing to show at all — defeating demo mode's whole point of
-    // previewing every Dashboard function before a real drive. This overlay
-    // only kicks in when cfg.demoMode is on AND there's genuinely no real
-    // fix yet, so a real fix outdoors always wins over the fake numbers the
-    // instant one arrives. Display-only: does not touch gnss/road, so
-    // nothing downstream (audio gate, TTC, auto-dim wake, the GNSS status
-    // icon) is affected — this only fills the two cells the user pointed
-    // at. Fake limit is a fixed, plausible urban value (50 km/h) so the
-    // oscillating fake speed also demonstrates the "over the limit" red
-    // color at its peaks.
-    bool demoNoFix = cfg.demoMode && !gnss.fix;
-    float demoSpeedKmh = 0;
-    if (demoNoFix) {
-        demoSpeedKmh = 45.0f + 45.0f * sinf(millis() / 8000.0f);
-        if (demoSpeedKmh < 0) demoSpeedKmh = 0;
-    }
-    static const float kDemoSpeedLimitKmh = 50.0f;
-
     // Speed limit read first: whether the driver is currently speeding
     // decides speedLabel's own color just below, so the compliance check
     // needs to happen before speedLabel is touched. map/SpeedLimitManager.cpp
@@ -1540,20 +1017,17 @@ void refreshDashboard() {
     // and a current GNSS fix matched against it — checking .valid alone is
     // suffient, no separate gnss.fix check needed for the sign itself.
     RoadInfoSnapshot road = roadInfoSnapshot();
-    bool roadValidOrDemo = road.valid || demoNoFix;
-    float effectiveSpeedLimitKmh = road.valid ? road.speedLimitKmh : kDemoSpeedLimitKmh;
-    static const float kSpeedingMarginKmh = 5.0f; // absorbs GPS speed-filter noise right at the boundary, same hysteresis-style reasoning as the audio-gate's own margin (AppConfig.h's hysteresisKmh)
-    bool speeding = roadValidOrDemo && (gnss.fix || demoNoFix) &&
-                    (demoNoFix ? demoSpeedKmh : gnss.egoSpeedKmh) > effectiveSpeedLimitKmh + kSpeedingMarginKmh;
+    static const float kSpeedingMarginKmh = 5.0f; // absorbs GPS speed-filter noise right at the boundary
+    bool speeding = road.valid && gnss.fix && gnss.egoSpeedKmh > road.speedLimitKmh + kSpeedingMarginKmh;
 
-    if (gnss.fix || demoNoFix) {
+    if (gnss.fix) {
         // NOTE: LVGL's builtin vsnprintf has %f support compiled out when
         // LV_USE_FLOAT=0 (our lv_conf.h) — passing %f to lv_label_set_text_fmt
         // silently corrupts the varargs and crashes (LoadProhibited).
         // Confirmed on real hardware 2026-09-14. Format floats with the real
         // libc snprintf into a buffer instead, then set the plain string.
         char buf[16];
-        snprintf(buf, sizeof(buf), "%.0f", demoNoFix ? demoSpeedKmh : gnss.egoSpeedKmh);
+        snprintf(buf, sizeof(buf), "%.0f", (double)gnss.egoSpeedKmh);
         lv_label_set_text(speedLabel, buf);
     } else {
         lv_label_set_text(speedLabel, "--");
@@ -1569,18 +1043,11 @@ void refreshDashboard() {
 
     // Full-screen speeding overlay (user-requested 2026-09-16, "neu vuot
     // qua toc do toi da thi cung canh bao bang layer mau toan man hinh",
-    // then "qua toc do cung nhap nhay de tang su chu y"). Uses
-    // speedingFlashOverlay, its OWN dedicated color/object — not
-    // warningFlashOverlay below, which stays reserved for imminent-
-    // collision TTC risk, a fundamentally different kind of danger;
-    // conflating "you're speeding" with "you're about to hit something"
-    // under the same color would blur exactly the "one color = one
-    // specific risk" rule spec section 14.2 exists to protect. Blinks at
-    // 400ms — deliberately between the TTC overlay's own two rates
-    // (500ms WARNING, 250ms CRITICAL below) so it reads as its own
-    // distinct urgency, not a re-skin of either TTC tier. Same "only touch
-    // the flag on an actual blink-phase flip" gating as the TTC overlay
-    // uses, not unconditionally every 150ms tick.
+    // then "qua toc do cung nhap nhay de tang su chu y"). Blinks at 400ms —
+    // its own distinct rate/color (0xB33DC6) so it's never mistaken for a
+    // routine sign/camera banner. Same "only touch the flag on an actual
+    // blink-phase flip" gating as every other flash/banner in this
+    // function, not unconditionally every 150ms tick.
     {
         static bool lastSpeedingVisible = false;
         bool speedingFlashOn = speeding && (millis() / 400) % 2 == 0;
@@ -1598,9 +1065,9 @@ void refreshDashboard() {
     // and a stale center would look off — align_to recomputes from the
     // sign's actual geometry, same "no guessed offsets" rule this file
     // uses everywhere else.
-    if (roadValidOrDemo) {
+    if (road.valid) {
         char buf[8];
-        snprintf(buf, sizeof(buf), "%.0f", (double)effectiveSpeedLimitKmh);
+        snprintf(buf, sizeof(buf), "%.0f", (double)road.speedLimitKmh);
         lv_label_set_text(speedLimitValueLabel, buf);
         lv_obj_set_style_text_color(speedLimitValueLabel, lv_color_black(), 0);
         lv_obj_clear_flag(speedLimitSign, LV_OBJ_FLAG_HIDDEN);
@@ -1618,6 +1085,7 @@ void refreshDashboard() {
     static bool lastAheadVisible = false;
     static float lastAheadLimit = -1;
     if (road.aheadLimitValid != lastAheadVisible || road.aheadSpeedLimitKmh != lastAheadLimit) {
+        bool newlyVisible = (road.aheadLimitValid && !lastAheadVisible);
         lastAheadVisible = road.aheadLimitValid;
         lastAheadLimit = road.aheadSpeedLimitKmh;
         if (road.aheadLimitValid) {
@@ -1625,8 +1093,17 @@ void refreshDashboard() {
             snprintf(buf, sizeof(buf), "Ahead: %.0f km/h in %.0fm", (double)road.aheadSpeedLimitKmh,
                      (double)road.aheadDistanceM);
             lv_label_set_text(aheadLimitLabel, buf);
-            lv_obj_align(aheadLimitLabel, LV_ALIGN_TOP_MID, 0, 28); // re-center: text width just changed
+            lv_obj_align(aheadLimitLabel, LV_ALIGN_TOP_MID, 0, 2); // re-center: text width just changed
             lv_obj_clear_flag(aheadLimitLabel, LV_OBJ_FLAG_HIDDEN);
+            // No existing tone call for this banner before Task E (it was
+            // visual-only) — audioPlaySignNotice()'s gentle chime is reused
+            // here rather than inventing a third tone shape, same "cheap,
+            // instant" role it already plays for the sign banner below.
+            if (newlyVisible) {
+                audioPlaySignNotice();
+                audioQueueVoice("tocdogioihan.mp3");
+                queueSpeedVoice(road.aheadSpeedLimitKmh);
+            }
         } else {
             lv_obj_add_flag(aheadLimitLabel, LV_OBJ_FLAG_HIDDEN);
         }
@@ -1648,10 +1125,12 @@ void refreshDashboard() {
                 snprintf(buf, sizeof(buf), "Camera in %.0fm", (double)road.cameraAheadDistanceM);
             }
             lv_label_set_text(cameraAheadLabel, buf);
-            lv_obj_align(cameraAheadLabel, LV_ALIGN_TOP_MID, 0, 54);
+            lv_obj_align(cameraAheadLabel, LV_ALIGN_TOP_MID, 0, 28);
             lv_obj_clear_flag(cameraAheadLabel, LV_OBJ_FLAG_HIDDEN);
             if (newlyVisible) {
-                audioPlayCameraAlert();
+                audioPlayCameraAlert(); // immediate tone chime — cheap, instant, plays while the voice line below queues
+                audioQueueVoice("speedcamera.mp3");
+                if (road.cameraSpeedLimitKmh >= 0) queueSpeedVoice(road.cameraSpeedLimitKmh);
             }
         } else {
             lv_obj_add_flag(cameraAheadLabel, LV_OBJ_FLAG_HIDDEN);
@@ -1708,10 +1187,20 @@ void refreshDashboard() {
             } else {
                 lv_obj_set_style_bg_color(trafficSignLabel, lv_color_hex(0x209060), 0); // Green
             }
-            lv_obj_align(trafficSignLabel, LV_ALIGN_TOP_MID, 0, 82);
+            lv_obj_align(trafficSignLabel, LV_ALIGN_TOP_MID, 0, 54);
             lv_obj_clear_flag(trafficSignLabel, LV_OBJ_FLAG_HIDDEN);
             if (newlyVisible) {
-                audioPlaySignNotice();
+                audioPlaySignNotice(); // immediate tone chime — cheap, instant, plays while the voice line below queues
+                // Only resident-area/no-overtaking/toll/traffic-light have a
+                // matching voice asset in data/speedmap/sounds/vi/ (Task C) —
+                // no fallback fabricated for anything else; see AudioPlayer.h.
+                switch (currentSignType) {
+                    case 2: audioQueueVoice(road.residentAreaIsStart ? "batdaukhudancu.mp3" : "hetkhudongdancu.mp3"); break;
+                    case 3: audioQueueVoice(road.noOvertakingIsStart ? "camvuot.mp3" : "hetcamvuot.mp3"); break;
+                    case 5: audioQueueVoice("tramthuphi.mp3"); break;
+                    case 6: audioQueueVoice("chuydentinhieugiaothong.mp3"); break;
+                    default: break;
+                }
             }
         } else {
             lv_obj_add_flag(trafficSignLabel, LV_OBJ_FLAG_HIDDEN);
@@ -1834,285 +1323,31 @@ void refreshDashboard() {
             lv_obj_set_style_border_color(trafficCard, lv_color_hex(0x223040), 0);
         }
 
-        // Mini radar hint at bottom of card
-        if (radar.online && radar.primaryIdx >= 0) {
-            char rBuf[40];
-            snprintf(rBuf, sizeof(rBuf), "Radar: Xe truoc %.0fm (TTC %.1fs)",
-                     (double)radar.targets[radar.primaryIdx].distanceM,
-                     (double)radar.targets[radar.primaryIdx].ttcS);
-            lv_label_set_text(alertRadarHint, rBuf);
-            lv_obj_set_style_text_color(alertRadarHint, lv_color_hex(0xE0C020), 0);
-        } else if (radar.online) {
-            lv_label_set_text(alertRadarHint, "Radar: San sang (Khong xe truoc)");
-            lv_obj_set_style_text_color(alertRadarHint, lv_color_hex(0x4A6278), 0);
-        } else {
-            lv_label_set_text(alertRadarHint, "Radar: Khong ket noi");
-            lv_obj_set_style_text_color(alertRadarHint, lv_color_hex(0x4A6278), 0);
-        }
+        // alertFooterLabel's text is otherwise static (set once at build,
+        // see buildTrafficCard()) — it used to be a live "radar target
+        // ahead" hint, updated every tick here; radar is gone (2026-09-21)
+        // so there's nothing live to report in this card anymore.
     }
-
-    // --- Middle column: road panel border flash on CRITICAL ---
-    static bool lastCriticalState = false;
-    bool criticalNow = radar.online && radar.primaryIdx >= 0 && radar.targets[radar.primaryIdx].ttcS <= cfg.ttcCritS;
-    if (criticalNow != lastCriticalState) {
-        lastCriticalState = criticalNow;
-        if (criticalNow) {
-            lv_obj_set_style_border_color(roadArea, lv_color_hex(0xFF3B30), 0);
-            lv_obj_set_style_border_width(roadArea, 3, 0);
-        } else {
-            lv_obj_set_style_border_color(roadArea, lv_color_hex(0x243040), 0);
-            lv_obj_set_style_border_width(roadArea, 1, 0);
-        }
-    }
-
-    // --- Full-screen WARNING/CRITICAL flash ---
-    // Two tiers only, not all four risk levels: CAUTION/SAFE stay
-    // inline-color-only, no screen flash — flashing on every caution would
-    // desensitize the driver to it well before it actually matters. Same
-    // gating discipline as the roadArea border above: color only changes
-    // on a tier transition, visibility only changes on an actual blink-
-    // phase flip, never unconditionally every tick.
-    {
-        bool isCritical = false, shouldFlash = false;
-        if (radar.online && radar.primaryIdx >= 0) {
-            float primaryTtc = radar.targets[radar.primaryIdx].ttcS;
-            isCritical = primaryTtc <= cfg.ttcCritS;
-            bool isWarning = !isCritical && primaryTtc <= cfg.ttcWarnS;
-            shouldFlash = isCritical || isWarning;
-        }
-
-        static bool lastFlashCritical = false;
-        static bool lastFlashVisible = false;
-        bool flashOn = false;
-        if (shouldFlash) {
-            uint32_t period = isCritical ? 250 : 500; // faster blink = more urgent
-            flashOn = (millis() / period) % 2 == 0;
-            if (isCritical != lastFlashCritical) {
-                lastFlashCritical = isCritical;
-                lv_obj_set_style_bg_color(warningFlashOverlay, lv_color_hex(isCritical ? STATUS_RED : STATUS_AMBER), 0);
-            }
-        }
-        if (flashOn != lastFlashVisible) {
-            lastFlashVisible = flashOn;
-            if (flashOn) lv_obj_clear_flag(warningFlashOverlay, LV_OBJ_FLAG_HIDDEN);
-            else lv_obj_add_flag(warningFlashOverlay, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
-
-    if (!radar.online) {
-        lv_label_set_text(faultLabel, "RADAR FAULT\n(no signal)");
-        lv_obj_clear_flag(faultLabel, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(faultLabel, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    // Sudden-closing-speed banner — visibility only, no blink (unlike the
-    // TTC flash above): this is already a rare, momentary event by
-    // construction (radar.harshBrakeWarning only fires while the closing
-    // rate is actually accelerating fast), so a steady banner reads clearly
-    // without needing a blink to draw attention.
-    if (radar.harshBrakeWarning) lv_obj_clear_flag(harshBrakeLabel, LV_OBJ_FLAG_HIDDEN);
-    else lv_obj_add_flag(harshBrakeLabel, LV_OBJ_FLAG_HIDDEN);
-
-    // Dynamic, not the fixed ROAD_W/ROAD_H constants — those only describe
-    // the landscape layout; reading roadArea's real size here keeps this
-    // math correct regardless of which orientation actually built it (see
-    // buildRoadLanes()'s own comment for the same reasoning).
-    int roadW = lv_obj_get_width(roadArea), roadH = lv_obj_get_height(roadArea);
-    int activeCount = 0;
-    bool primaryRingPlaced = false;
-    static const int kCarBaseW = 40, kCarBaseH = 33; // matches car_icon's real 40x33 (front-view design, 2026-09-15)
-
-    for (int i = 0; i < MAX_TARGETS; i++) {
-        SimTarget &t = radar.targets[i];
-        if (!t.active) {
-            lv_obj_add_flag(targetIcon[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(targetLabels[i], LV_OBJ_FLAG_HIDDEN);
-            continue;
-        }
-        activeCount++;
-
-        // Reads the real independently-filtered channel directly (target-
-        // tracking requirement #9, 2026-09-21) instead of recomputing it
-        // from distance*sin(angle) — t.angleDeg is now only a derived
-        // diagnostic value (see SharedState.h's SimTarget::lateralM
-        // comment), not the authoritative lateral-position source.
-        float lateral = t.lateralM;
-        float normDist = t.distanceM / cfg.maxRangeM;
-        if (normDist > 1) normDist = 1;
-        if (normDist < 0) normDist = 0;
-
-        int screenX = roadW / 2 + (int)((lateral / 6.0f) * (roadW / 2));
-        if (screenX < 16) screenX = 16;
-        if (screenX > roadW - 16) screenX = roadW - 16;
-        int screenY = roadH - (int)(normDist * (roadH - 24)) - 12;
-
-        // Perspective: bigger/closer zoom when near, smaller when far.
-        uint32_t zoom = (uint32_t)lerpf(90.0f, 280.0f, 1.0f - normDist);
-        int apparentW = (kCarBaseW * (int)zoom) / 256;
-        int apparentH = (kCarBaseH * (int)zoom) / 256;
-
-        lv_color_t color;
-        if (t.relation == OPPOSITE) color = lv_color_hex(0x4488FF);
-        else if (t.relation == UNKNOWN) color = lv_color_hex(0x8899AA);
-        else color = riskColor(t.ttcS);
-
-        lv_image_set_scale(targetIcon[i], zoom);
-        lv_obj_set_pos(targetIcon[i], screenX - kCarBaseW / 2, screenY - kCarBaseH / 2);
-        lv_obj_set_style_image_recolor(targetIcon[i], color, 0);
-        lv_obj_clear_flag(targetIcon[i], LV_OBJ_FLAG_HIDDEN);
-
-        // Spatial-referencing lock ring around the primary target only.
-        if (i == radar.primaryIdx) {
-            int ringD = (apparentW > apparentH ? apparentW : apparentH) + 18;
-            lv_obj_set_size(primaryRing, ringD, ringD);
-            lv_obj_set_pos(primaryRing, screenX - ringD / 2, screenY - ringD / 2);
-            lv_obj_clear_flag(primaryRing, LV_OBJ_FLAG_HIDDEN);
-            primaryRingPlaced = true;
-        }
-
-        // Per-target label content follows the Display settings toggles.
-        char buf[48];
-        size_t used = 0;
-        if (cfg.showId) {
-            used += snprintf(buf + used, sizeof(buf) - used, "#%d%s", i + 1, i == radar.primaryIdx ? "P" : "");
-        }
-        if (cfg.showSpeed) {
-            used += snprintf(buf + used, sizeof(buf) - used, "%s%.0fkm/h", used ? " " : "",
-                              (double)(t.closingSpeedMps * 3.6f));
-        }
-        if (cfg.showTtc) {
-            if (isinf(t.ttcS)) used += snprintf(buf + used, sizeof(buf) - used, "%sTTC-", used ? " " : "");
-            else used += snprintf(buf + used, sizeof(buf) - used, "%sTTC%.1f", used ? " " : "", (double)t.ttcS);
-        }
-        if (cfg.showAngle) {
-            used += snprintf(buf + used, sizeof(buf) - used, "%s%.0fdeg", used ? " " : "", (double)t.angleDeg);
-        }
-        if (used == 0) buf[0] = '\0';
-
-        if (buf[0]) {
-            lv_label_set_text(targetLabels[i], buf);
-            lv_obj_set_pos(targetLabels[i], screenX + apparentW / 2 + 3, screenY - 6);
-            lv_obj_clear_flag(targetLabels[i], LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_add_flag(targetLabels[i], LV_OBJ_FLAG_HIDDEN);
-        }
-    }
-    if (!primaryRingPlaced) lv_obj_add_flag(primaryRing, LV_OBJ_FLAG_HIDDEN);
-
-    // Distance-to-primary-target readout at the top of the middle column.
-    // Tailgating (tooClose) turns it red on top of its normal themed color —
-    // same theme-independent-override pattern as speedLabel's own speeding
-    // check above (see applyTheme()'s comment on currentPrimaryTextColor);
-    // deliberately not folded into riskColor()/the TTC flash overlay, since
-    // tooClose can be true while ttcS itself is still INFINITY (stop-and-go
-    // traffic, not closing) — a fundamentally different risk than TTC's.
-    bool primaryTooCloseNow = radar.primaryIdx >= 0 && radar.targets[radar.primaryIdx].tooClose;
-    // Legal minimum following distance (see legalMinFollowDistanceM()'s own
-    // comment) — uses the same real-or-demo ego speed the demo-mode
-    // overlay above already computed, so this preview works in demo mode
-    // too instead of needing a real >=60km/h GNSS fix to ever see it.
-    float effectiveEgoSpeedKmh = demoNoFix ? demoSpeedKmh : gnss.egoSpeedKmh;
-    float legalM = legalMinFollowDistanceM(effectiveEgoSpeedKmh);
-    // AN TOAN / KHONG DAT verdict (feature-requested 2026-09-21, requirement
-    // #4) — purely a DISPLAY comparison of the real radar distance against
-    // the legal figure above; deliberately NOT fed into radar.audioAllowed
-    // or the TTC flash overlay (requirement: "khong dung khoang cach phap
-    // ly de thay the TTC" — this and the collision-risk engine stay two
-    // separate signals). Only meaningful when the law actually fixes a
-    // number for the current speed (legalM >= 0) and a real target exists.
-    bool legalDistanceKnown = legalM >= 0 && radar.primaryIdx >= 0;
-    bool legalDistanceFail = legalDistanceKnown && radar.targets[radar.primaryIdx].distanceM < legalM;
-    if (radar.primaryIdx >= 0) {
-        char buf[32];
-        if (cfg.simpleUiMode || legalM < 0) {
-            // Simple layout shows the legal figure (and verdict) in its own
-            // separate caption below instead (see legalDistCaption) — keep
-            // this label a single clean number there. Also plain when no
-            // legal figure applies at all (speed < 60 km/h — the law
-            // itself doesn't fix one, nothing to append).
-            snprintf(buf, sizeof(buf), "%.0f m", (double)radar.targets[radar.primaryIdx].distanceM);
-        } else {
-            // No room for the full "OK"/"FAIL" word here too (this string
-            // is already close to this column's real width at font 24) —
-            // the color below (shared with tooClose's own red) is Full
-            // layout's verdict signal; Simple layout's roomier caption
-            // spells the word out.
-            snprintf(buf, sizeof(buf), "%.0f m (law >=%.0fm)", (double)radar.targets[radar.primaryIdx].distanceM,
-                      (double)legalM);
-        }
-        lv_label_set_text(primaryDistLabel, buf);
-    } else {
-        lv_label_set_text(primaryDistLabel, "-- m");
-    }
-    lv_obj_set_style_text_color(primaryDistLabel,
-                                  (primaryTooCloseNow || legalDistanceFail) ? lv_color_hex(0xFF3B30) : currentPrimaryTextColor,
-                                  0);
-
-    if (cfg.simpleUiMode) {
-        if (legalM >= 0) {
-            char lbuf[32];
-            snprintf(lbuf, sizeof(lbuf), "Law min: %.0f m (%s)", (double)legalM,
-                      legalDistanceKnown ? (legalDistanceFail ? "KHONG DAT" : "AN TOAN") : "--");
-            lv_label_set_text(legalDistCaption, lbuf);
-            lv_obj_set_style_text_color(legalDistCaption, legalDistanceFail ? lv_color_hex(0xFF3B30) : currentPrimaryTextColor, 0);
-            lv_obj_clear_flag(legalDistCaption, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_add_flag(legalDistCaption, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
-
-    // --- Right column: warning panel ---
-    lv_color_t rc = (radar.primaryIdx >= 0) ? riskColor(radar.targets[radar.primaryIdx].ttcS) : lv_color_hex(0x33CC66);
-    // SAFE is deliberately not shown at all (user-requested 2026-09-21, "bo
-    // luon phan ky hieu canh bao Safe tren man hinh") — the whole point of
-    // a warning icon/word is to draw the eye to an actual risk; showing it
-    // for "nothing's wrong" every single tick (the common case) is exactly
-    // the clutter Simple layout's own "tang tap trung" reasoning already
-    // argues against. CAUTION/WARNING/CRITICAL still show as before.
-    bool showWarning = radar.primaryIdx >= 0 && radar.targets[radar.primaryIdx].ttcS <= 5.0f;
-    if (showWarning) {
-        lv_label_set_text(riskWordLabel, riskLabel(radar.targets[radar.primaryIdx].ttcS));
-        lv_obj_set_style_text_color(riskWordLabel, rc, 0);
-        lv_obj_clear_flag(warningIconObj, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(riskWordLabel, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(warningIconObj, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(riskWordLabel, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    if (radar.primaryIdx >= 0) {
-        SimTarget &p = radar.targets[radar.primaryIdx];
-        char buf[16];
-        if (isinf(p.ttcS)) snprintf(buf, sizeof(buf), "--");
-        else snprintf(buf, sizeof(buf), "%.1fs", (double)p.ttcS);
-        lv_label_set_text(ttcValueLabel, buf);
-    } else {
-        lv_label_set_text(ttcValueLabel, "--");
-    }
-    lv_obj_set_style_text_color(ttcValueLabel, rc, 0);
 
     // --- Bottom info bar ---
-    // Lane count and mode are display-only placeholders: no lane-corridor
-    // model exists yet (Phase 5) and no Day/Night engine exists yet (Phase
-    // 9), so neither is a real, settable AppConfig field — see
-    // core/AppConfig.h's own note on the same trim rule. Plain ASCII " | "
-    // separators, not a middle-dot: the compiled Montserrat font is missing
-    // that glyph and LVGL logs (blocking Serial.printf, with
-    // LV_LOG_PRINTF=1) every time it tries to draw one — confirmed on real
-    // hardware 2026-09-14 in the previous layout's bottom bar.
+    // Used to show live target count ("3 lanes | %d targets | AUTO") from
+    // the now-removed radar road panel — replaced with the two GPS-only
+    // facts worth a permanent glance: whether the offline speed-map
+    // database actually loaded, and how many satellites GNSS currently
+    // sees. Plain ASCII " | " separators, not a middle-dot: the compiled
+    // Montserrat font is missing that glyph and LVGL logs (blocking
+    // Serial.printf, with LV_LOG_PRINTF=1) every time it tries to draw one
+    // — confirmed on real hardware 2026-09-14.
     char infoBuf[48];
-    snprintf(infoBuf, sizeof(infoBuf), "3 lanes | %d targets | AUTO", activeCount);
+    snprintf(infoBuf, sizeof(infoBuf), "%s | %d sats | VietHUD", road.mapLoaded ? "MAP OK" : "NO MAP", gnss.satCount);
     lv_label_set_text(bottomInfoLabel, infoBuf);
 }
 
 // Only refresh while the Dashboard is the screen actually on-screen — this
 // used to run unconditionally every 150ms even while Settings was open,
-// burning CPU on a screen nobody could see (2 mutex reads, ~5 targets'
-// worth of trig + lv_image_set_scale/recolor/pos calls, ~20 more
-// lv_obj_set_style_*/label calls for the top/left/right columns — all for
-// nothing). User-reported 2026-09-15 as Settings feeling laggy; this was
-// competing with Settings' own touch handling for the same Core 1 loop().
+// burning CPU on a screen nobody could see. User-reported 2026-09-15 as
+// Settings feeling laggy; this was competing with Settings' own touch
+// handling for the same Core 1 loop().
 void simTimerCb(lv_timer_t *) {
     if (lv_screen_active() == dashboardScreen) refreshDashboard();
 }

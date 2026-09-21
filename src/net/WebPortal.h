@@ -5,15 +5,15 @@
 // the device creates its own hotspot, no dependency on any external
 // network, since this rides in a vehicle). Three things, all served from
 // one small built-in WebServer instance on its own FreeRTOS task (Core 0,
-// same pattern as radar/GNSS/touch — see radar/LD2451.h):
+// same pattern as gnss/touch — see gnss/GNSS.h):
 //
 //   1. Live telemetry ("/") — a browser page polling /api/status (plain
 //      JSON, hand-rolled with snprintf, no ArduinoJson dependency) every
-//      500ms for the same radar/GNSS/heap numbers the serial [radar]/
-//      [gnss]/[mem] debug lines already carry. Lets someone watch the link
-//      health (frames/parseErrors/snr, fix/sats/speed) from a phone during
-//      a real drive without a USB cable tethered to a laptop the whole
-//      time, which every debugging session up to now has required.
+//      500ms for the same GNSS/speed-map/heap numbers the serial [gnss]/
+//      [sdmgr]/[mem] debug lines already carry. Lets someone watch the link
+//      health (fix/sats/speed, speed-map status) from a phone during a real
+//      drive without a USB cable tethered to a laptop the whole time, which
+//      every debugging session up to now has required.
 //   2. Remote config ("/config") — an HTML form over the same AppConfig
 //      fields Settings.cpp's sliders bind, for typing exact values instead
 //      of dragging a small touchscreen slider. Submitting it clamps +

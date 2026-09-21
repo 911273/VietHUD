@@ -7,7 +7,7 @@
 // C:\Users\phamq\.claude\plans\wobbly-swinging-chipmunk.md, and is the ONLY
 // thing that calls into SdCardManager.h (spec section 19). Publishes
 // results into core/SharedState.h's RoadInfoSnapshot, same publish/snapshot
-// pattern radar/LD2451.cpp and gnss/GNSS.cpp already use — ui/Dashboard.cpp,
+// pattern gnss/GNSS.cpp already uses — ui/Dashboard.cpp,
 // ui/Settings.cpp and net/WebPortal.cpp all just read roadInfoSnapshot(),
 // never touch this module or the SD card directly.
 //

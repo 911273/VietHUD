@@ -391,26 +391,30 @@ void sdMgrSummarizeTripLogs(uint32_t firstSessionId, uint32_t lastSessionId) {
         size_t sizeBytes = f.size();
         int lineCount = 0;
         float maxEgoKmh = 0;
-        bool anyActiveTarget = false, anyEvent = false;
+        bool anySpeeding = false, anyEvent = false;
         f.readStringUntil('\n'); // skip header
         while (f.available()) {
             String line = f.readStringUntil('\n');
             if (line.length() == 0) continue;
             lineCount++;
-            // tMs,egoKmh,activeTargets,primDistM,primTtcS,risk,tooClose,harshBrake,event
+            // tMs,egoKmh,limitValid,limitKmh,speeding,cameraAheadM,signType,signDistM,event
+            // (log/TripLogger.cpp's schema — updated 2026-09-21 when radar
+            // removal replaced its old activeTargets/primDistM/TTC columns
+            // with speed-limit/camera/sign fields)
             int c1 = line.indexOf(',');
             int c2 = line.indexOf(',', c1 + 1);
             int c3 = line.indexOf(',', c2 + 1);
-            if (c1 < 0 || c2 < 0 || c3 < 0) continue;
+            int c4 = line.indexOf(',', c3 + 1);
+            if (c1 < 0 || c2 < 0 || c3 < 0 || c4 < 0) continue;
             float egoKmh = line.substring(c1 + 1, c2).toFloat();
-            int activeTargets = line.substring(c2 + 1, c3).toInt();
+            int speeding = line.substring(c3 + 1, c4).toInt();
             if (egoKmh > maxEgoKmh) maxEgoKmh = egoKmh;
-            if (activeTargets > 0) anyActiveTarget = true;
+            if (speeding > 0) anySpeeding = true;
             if (line.endsWith("EVENT")) anyEvent = true;
         }
         f.close();
-        Serial.printf("[sdmgr] session_%04lu: %uB lines=%d maxEgoKmh=%.1f anyActiveTarget=%d anyEvent=%d\n",
-                      (unsigned long)id, (unsigned)sizeBytes, lineCount, (double)maxEgoKmh, (int)anyActiveTarget,
+        Serial.printf("[sdmgr] session_%04lu: %uB lines=%d maxEgoKmh=%.1f anySpeeding=%d anyEvent=%d\n",
+                      (unsigned long)id, (unsigned)sizeBytes, lineCount, (double)maxEgoKmh, (int)anySpeeding,
                       (int)anyEvent);
     }
 }

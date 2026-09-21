@@ -1,6 +1,5 @@
 #include "SpeedLimitManager.h"
 #include "SdCardManager.h"
-#include "core/AppConfig.h" // cfg.demoMode — see kMaxMatchDistanceM's own comment
 #include "core/SharedState.h"
 #include "gnss/GNSS.h" // kGnssMotionThresholdKmh — ahead-lookahead only runs while actually moving
 #include <Arduino.h>
@@ -18,20 +17,7 @@
 // tunable once real data exists to tune against" approach this project used
 // for the LD2451's own calibration before Settings > Radar existed.
 // ---------------------------------------------------------------------
-// Real driving value. cfg.demoMode (Settings > Radar) widens this at
-// runtime instead — see kDemoMaxMatchDistanceM below — so a real drive
-// never silently inherits a demo-only radius from a forgotten override.
 static const float kMaxMatchDistanceM = 30.0f;  // candidates farther than this from the fix aren't considered at all
-// Demo-mode-only radius (user-requested 2026-09-16, "them 1 nut bat tat thu
-// nghiem trong menu", building on the earlier one-off "hien thi demo cac
-// chuc nang de toi co the chinh sua truoc khi ra ngoai duong" ask): wide
-// enough that an indoor GNSS fix confirmed ~105m from the nearest mapped
-// road (Hoang Quoc Viet, id=21651, 60km/h) still clears kMinConfidence for
-// previewing the speed-limit sign — distance-only confidence is
-// 1-dist/radius (capped 0.6 with no heading), so 250 gives ~0.58 there vs.
-// kMinConfidence=0.5. Only used while cfg.demoMode is on; real driving
-// always uses kMaxMatchDistanceM above regardless of this value.
-static const float kDemoMaxMatchDistanceM = 250.0f;
 static const float kMinConfidence = 0.5f;       // below this, a match isn't trusted enough to switch to or report
 static const float kSwitchMargin = 0.15f;       // a competing road must beat the current one by this much (after the continuity bonus) to steal the match
 static const float kContinuityBonus = 0.1f;     // score bonus for staying on the road we were already matched to
@@ -155,9 +141,7 @@ struct MatchCandidate {
 
 static bool evaluateSegment(const RoadSegment &seg, float fixLat, float fixLon, bool headingValid, float headingDeg,
                              MatchCandidate &outCand) {
-    // See kDemoMaxMatchDistanceM's own comment — demo mode trades match
-    // precision for being able to preview the sign away from a real road.
-    float maxMatchDistanceM = cfg.demoMode ? kDemoMaxMatchDistanceM : kMaxMatchDistanceM;
+    float maxMatchDistanceM = kMaxMatchDistanceM;
 
     float startLat = seg.startLatE7 / 1e7f, startLon = seg.startLonE7 / 1e7f;
     float endLat = seg.endLatE7 / 1e7f, endLon = seg.endLonE7 / 1e7f;

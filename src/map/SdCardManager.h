@@ -6,7 +6,7 @@
 // / SpeedLimitManager tự ý mở/đóng file SD" — nothing else in the firmware
 // opens an SD file directly). SpeedLimitManager.cpp is the only caller.
 // Plain functions with an `sdMgr` prefix, not a class — same convention
-// every other module in this project uses (radarTaskStart(), gnssTaskStart(),
+// every other module in this project uses (gnssTaskStart(),
 // webPortalInit()...), kept consistent rather than introducing this
 // codebase's first namespace/singleton-object for what's really just one
 // more owned-resource module like the others.
