@@ -102,20 +102,27 @@ static lv_obj_t *dashRoot; // everything sits in here so it can be pixel-shifted
 // shape (a 3-column layout doesn't sensibly reflow into a tall narrow
 // screen; see the plan this was built from for why a second, purpose-built
 // layout was chosen over trying to make one layout adapt to both).
-static const int SCR_W = 480, SCR_H = 320;
-static const int TOP_H = 30, BOTTOM_H = 26;
+//
+// LS_-prefixed (2026-09-22, landscape-corruption investigation rewrite):
+// buildDashboardPortrait() has its OWN locals named scrW/scrH/etc — same
+// semantic role, different numbers. They were never actually mixed up
+// anywhere (checked), but the shared/unprefixed names were flagged as a
+// real hazard for a future edit, so this rewrite renames the landscape set
+// to make that class of mistake impossible rather than just improbable.
+static const int LS_SCR_W = 480, LS_SCR_H = 320;
+static const int LS_TOP_H = 30, LS_BOTTOM_H = 26;
 // Split 50/50 (user-requested 2026-09-16, "chia doi man hinh... phan hien
 // thi xe sang 1 ben, nua man hinh con lai la cac thong so") — replaces the
-// old 96|288|96 three-column split. PARAM_COL (left half) holds every
+// old 96|288|96 three-column split. LS_PARAM_COL (left half) holds every
 // number/status readout (speed, speed limit sign, warning, TTC) stacked in
 // ONE evenly-spaced column (retuned 2026-09-16, "bo tri hop ly, can bang va
 // deu nhau" — an earlier two-sub-column attempt left mismatched gaps, see
-// buildDashboardLandscape()'s own comment at that block); ROAD_COL (right
+// buildDashboardLandscape()'s own comment at that block); LS_ROAD_COL (right
 // half) is just the road/target view, now much bigger than the old 288px-
 // wide middle column.
-static const int PARAM_COL_W = 240, ROAD_COL_W = SCR_W - PARAM_COL_W;
-static const int ROAD_COL_X = PARAM_COL_W;
-static const int COL_TOP = TOP_H, COL_H = SCR_H - TOP_H - BOTTOM_H;
+static const int LS_PARAM_COL_W = 240, LS_ROAD_COL_W = LS_SCR_W - LS_PARAM_COL_W;
+static const int LS_ROAD_COL_X = LS_PARAM_COL_W;
+static const int LS_COL_TOP = LS_TOP_H, LS_COL_H = LS_SCR_H - LS_TOP_H - LS_BOTTOM_H;
 
 // --- Top bar ---
 static lv_obj_t *gnssIcon, *gnssCaption;
@@ -186,7 +193,13 @@ static void buildTrafficCard(lv_obj_t *parent, int w, int h) {
     lv_obj_clear_flag(trafficCard, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(trafficCard, LV_OBJ_FLAG_CLICKABLE);
 
-    // Badge pill at top
+    // Badge pill at top. Explicit width + clip (2026-09-22 — see this
+    // file's buildDashboardLandscape() comment on bottomInfoLabel for why
+    // every runtime-text label in this dashboard now gets one): the longest
+    // real value here is "DEN TIN HIEU GIAO THONG" (refreshDashboard()),
+    // which was already comfortably inside the card at content-hug size, so
+    // pinning the width to the card's own usable interior just forecloses
+    // ever going wider than the card instead of trusting that to stay true.
     alertBadgeLabel = lv_label_create(trafficCard);
     lv_obj_set_style_bg_color(alertBadgeLabel, lv_color_hex(0x202A36), 0);
     lv_obj_set_style_bg_opa(alertBadgeLabel, LV_OPA_COVER, 0);
@@ -195,6 +208,9 @@ static void buildTrafficCard(lv_obj_t *parent, int w, int h) {
     lv_obj_set_style_pad_hor(alertBadgeLabel, 10, 0);
     lv_obj_set_style_pad_ver(alertBadgeLabel, 3, 0);
     lv_obj_set_style_radius(alertBadgeLabel, 12, 0);
+    lv_obj_set_width(alertBadgeLabel, w - 16);
+    lv_label_set_long_mode(alertBadgeLabel, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(alertBadgeLabel, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(alertBadgeLabel, LV_ALIGN_TOP_MID, 0, 6);
     lv_label_set_text(alertBadgeLabel, "DUONG THONG THOANG");
 
@@ -211,10 +227,15 @@ static void buildTrafficCard(lv_obj_t *parent, int w, int h) {
     lv_obj_align_to(alertUnitLabel, alertDistLabel, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -8);
     lv_label_set_text(alertUnitLabel, "");
 
-    // Subtitle / limit speed
+    // Subtitle / limit speed. Explicit width + clip, same reasoning as
+    // alertBadgeLabel above — refreshDashboard() sets this to several
+    // different runtime-built strings (e.g. "GPS Tot (%d ve tinh)").
     alertSubLabel = lv_label_create(trafficCard);
     lv_obj_set_style_text_font(alertSubLabel, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(alertSubLabel, lv_color_hex(0xCCD4DC), 0);
+    lv_obj_set_width(alertSubLabel, w - 16);
+    lv_label_set_long_mode(alertSubLabel, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(alertSubLabel, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(alertSubLabel, LV_ALIGN_CENTER, 0, 30);
     lv_label_set_text(alertSubLabel, "Dang tim GPS...");
 
@@ -234,9 +255,15 @@ static void buildTrafficCard(lv_obj_t *parent, int w, int h) {
     // already shows this same speed-map info in the outer bottom bar; this
     // card-local line stays a static "Offline VietHUD" caption instead of
     // duplicating a value that changes every tick right above it).
+    // Static text (never rewritten after this), but given the same
+    // explicit width + clip as every other label in this card for
+    // consistency — cheap insurance, not because this one was suspected.
     alertFooterLabel = lv_label_create(trafficCard);
     lv_obj_set_style_text_font(alertFooterLabel, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(alertFooterLabel, lv_color_hex(0x607890), 0);
+    lv_obj_set_width(alertFooterLabel, w - 16);
+    lv_label_set_long_mode(alertFooterLabel, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(alertFooterLabel, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(alertFooterLabel, LV_ALIGN_BOTTOM_MID, 0, -6);
     lv_label_set_text(alertFooterLabel, "VietHUD - Offline GPS speed guide");
 }
@@ -371,27 +398,36 @@ static lv_obj_t *makeIcon(lv_obj_t *parent, const lv_image_dsc_t *src) {
 // ---------------------------------------------------------------------
 // Landscape content (rotation 1/3, 480x320) — everything between the shared
 // dashRoot setup and the shared full-screen overlays in buildDashboard()
-// below. This is the ORIGINAL layout, unmoved except for being pulled into
-// its own function so buildDashboard() can pick it or the portrait one.
+// below. Rewritten from scratch 2026-09-22 while chasing a real-hardware
+// landscape rendering-corruption report (bottom bar text appearing
+// vertically, a large isolated glyph) — the original arithmetic checked out
+// on paper and no root cause was confirmed via LVGL logs, so rather than
+// keep guessing this function was redone plain, with every dynamic-text
+// label given an explicit width + clipped long-mode (see bottomInfoLabel
+// below) so unconstrained content-hug sizing can't itself be a factor,
+// whatever the real cause turns out to be. Same visual result as before:
+// [ speed + speed-limit sign | sign/camera alert card ], top status bar,
+// one-line bottom info bar. Still plain lv_obj_create/lv_obj_set_pos/
+// lv_obj_set_size throughout (via makePane()) — no flex/grid anywhere in
+// this file, deliberately, so there's no auto-sizing container that could
+// ever collapse a child to near-zero.
 // ---------------------------------------------------------------------
 static void buildDashboardLandscape(lv_obj_t *scr) {
     // ---------------- Top status bar ----------------
     // Two zones, matching the 50/50 body split below: topLeft sits over
-    // PARAM_COL, topRight over ROAD_COL (sun/clock + settings gear — trip/
-    // time info alongside the alert card). topRight's internal arrangement
-    // (sun-left/clock-growing-right, gear pinned right, wifi left of gear)
-    // is copied unchanged from buildDashboardPortrait()'s own topRight,
-    // already proven there.
+    // LS_PARAM_COL, topRight over LS_ROAD_COL (sun/clock + settings gear —
+    // trip/time info alongside the alert card). topRight's internal
+    // arrangement (sun-left/clock-growing-right, gear pinned right, wifi
+    // left of gear) matches buildDashboardPortrait()'s own topRight.
     //
     // Status is color-only, no OK/FAULT/SEARCH words (direct request):
     // GREEN = normal, RED = fault (nothing received at all), blinking AMBER
     // = pending/searching (module alive, just no fix yet) — see
-    // refreshDashboard(). The radar status cluster that used to share this
-    // bar with GNSS was removed 2026-09-21 (radar removed entirely); GNSS
-    // now centers alone in topLeft's full 240px width instead of a 120px
-    // half-zone.
-    lv_obj_t *topLeft = makePane(scr, 0, 0, PARAM_COL_W, TOP_H);
-    lv_obj_t *topRight = makePane(scr, ROAD_COL_X, 0, ROAD_COL_W, TOP_H);
+    // refreshDashboard(). GNSS centers alone in topLeft's full 240px width
+    // (there's no second telltale sharing this bar anymore since radar was
+    // removed 2026-09-21).
+    lv_obj_t *topLeft = makePane(scr, 0, 0, LS_PARAM_COL_W, LS_TOP_H);
+    lv_obj_t *topRight = makePane(scr, LS_ROAD_COL_X, 0, LS_ROAD_COL_W, LS_TOP_H);
 
     // GNSS icon+"GNSS" caption is ~64px wide (20px GPS glyph + 4px gap +
     // ~40px text); centered in topLeft's full 240px width gives (240-64)/2
@@ -408,14 +444,18 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     // clock text chained off its RIGHT edge, growing away from it — the
     // other order (icon chained off the clock) would break the moment the
     // clock's digit count/width changes. Centered in topRight's LEFT 120px
-    // zone (was pinned to topRight's own left edge — user-requested
-    // 2026-09-16 rebalance, same centering reasoning gnssIcon above uses):
-    // block is ~71px wide (22px icon + 4px gap + ~45px "HH:MM" text), centered in
-    // 120px gives (120-71)/2 = ~25px left margin.
+    // zone: block is ~71px wide (22px icon + 4px gap + ~45px "HH:MM" text),
+    // centered in 120px gives (120-71)/2 = ~25px left margin.
     sunIcon = makeIcon(topRight, &sun_icon);
     lv_obj_align(sunIcon, LV_ALIGN_LEFT_MID, 25, 0);
 
+    // clockLabel shows a fixed-format "HH:MM" or "--:--" (see
+    // refreshDashboard()) — never more than 5 chars, but pinned to an
+    // explicit width + clip anyway (same blanket rule this rewrite applies
+    // to every runtime-text label) rather than trusting content-hug sizing.
     clockLabel = lv_label_create(topRight);
+    lv_obj_set_width(clockLabel, 46);
+    lv_label_set_long_mode(clockLabel, LV_LABEL_LONG_CLIP);
     lv_obj_align_to(clockLabel, sunIcon, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
 
     // Decorative only — the actual entry point is the long-press-anywhere
@@ -427,10 +467,10 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 
     // WiFi indicator (user-requested 2026-09-14) — chained off gearIcon's
     // actual left edge via align_to, same "no guessed pixel gaps" reasoning
-    // as gnssCaption above. Cyan accent, not red/amber/green:
-    // this is a system telltale ("WiFi radio is on"), not a target-risk
-    // color (spec section 14.2 — see ACCENT_COLOR's own comment). Hidden by
-    // default: WiFi itself defaults OFF at boot (net/WebPortal.h), and
+    // as gnssCaption above. Cyan accent, not red/amber/green: this is a
+    // system telltale ("WiFi radio is on"), not a target-risk color (spec
+    // section 14.2 — see ACCENT_COLOR's own comment). Hidden by default:
+    // WiFi itself defaults OFF at boot (net/WebPortal.h), and
     // refreshDashboard() only un-hides this once webPortalIsEnabled() is
     // actually true.
     wifiTopIcon = lv_label_create(topRight);
@@ -441,17 +481,16 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
 
     // ---------------- Column divider ----------------
-    // Just one now (was two, for the old 3-column split), at the PARAM_COL
-    // / ROAD_COL boundary. Slot 1 becomes a degenerate (zero-length,
-    // hidden) placeholder — applyTheme() unconditionally recolors
-    // colDividerLine[0]/[1], same reasoning buildDashboardPortrait() already
+    // At the LS_PARAM_COL / LS_ROAD_COL boundary. Slot 1 is a degenerate
+    // (zero-length, hidden) placeholder — applyTheme() unconditionally
+    // recolors colDividerLine[0]/[1], same reasoning buildDashboardPortrait()
     // uses for having no real divider at all.
     static lv_point_precise_t divPts[2][2];
     {
         lv_obj_t *line = lv_line_create(scr);
         lv_obj_set_style_line_width(line, 1, 0);
-        lv_point_precise_t local[2] = {{(lv_value_precise_t)PARAM_COL_W, (lv_value_precise_t)COL_TOP},
-                                        {(lv_value_precise_t)PARAM_COL_W, (lv_value_precise_t)(COL_TOP + COL_H)}};
+        lv_point_precise_t local[2] = {{(lv_value_precise_t)LS_PARAM_COL_W, (lv_value_precise_t)LS_COL_TOP},
+                                        {(lv_value_precise_t)LS_PARAM_COL_W, (lv_value_precise_t)(LS_COL_TOP + LS_COL_H)}};
         memcpy(divPts[0], local, sizeof(local));
         lv_line_set_points(line, divPts[0], 2);
         lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
@@ -468,31 +507,29 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     }
 
     // ---------------- Param column (left half): speed + speed limit ----------------
-    // A 2x1 stack (was a 2x2 grid — the bottom-left Warning and bottom-right
-    // TTC cells were radar-only and removed 2026-09-21 alongside radar
-    // itself; this reclaims that freed half of leftCol for the top two
-    // cells, now full-width instead of quarter-width). leftCol is still the
-    // outer 240x264 container; two equal 240x132 cells stack inside it —
-    // applyTheme() only themes specific widgets by name, never leftCol or
-    // these cells, so this restructuring is safe.
-    leftCol = makePane(scr, 0, COL_TOP, PARAM_COL_W, COL_H);
-    static const int kCellH = COL_H / 2; // 132
-    lv_obj_t *cellSpeed = makePane(leftCol, 0, 0, PARAM_COL_W, kCellH);       // top: actual speed
-    lv_obj_t *cellLimit = makePane(leftCol, 0, kCellH, PARAM_COL_W, kCellH);  // bottom: speed limit sign
+    // A 2x1 stack: leftCol is the outer 240x264 container, two equal
+    // 240x132 cells stack inside it — applyTheme() only themes specific
+    // widgets by name, never leftCol or these cells, so this structure is
+    // safe to change freely.
+    leftCol = makePane(scr, 0, LS_COL_TOP, LS_PARAM_COL_W, LS_COL_H);
+    static const int kCellH = LS_COL_H / 2; // 132
+    lv_obj_t *cellSpeed = makePane(leftCol, 0, 0, LS_PARAM_COL_W, kCellH);       // top: actual speed
+    lv_obj_t *cellLimit = makePane(leftCol, 0, kCellH, LS_PARAM_COL_W, kCellH);  // bottom: speed limit sign
 
-    // Top — ego speed. Bumped 28->36->48 (user-requested 2026-09-16 then
-    // 2026-09-21, "tang kich thuoc cac so hien thi len nua") —
-    // LV_FONT_MONTSERRAT_48 enabled in lv_conf.h (already needed for Simple
-    // layout's distance number). y positioned (not simply centered in the
-    // cell) so this number's own vertical center lands on the SAME line as
-    // speedLimitValueLabel's center in the cell beside it (user-requested
-    // 2026-09-16, "vi tri so nen can thang hang voi nhau") — the sign is
+    // Top — ego speed. y positioned (not simply centered in the cell) so
+    // this number's own vertical center lands on the SAME line as
+    // speedLimitValueLabel's center in the cell beside it — the sign is
     // centered in its 132px cell (top=(132-88)/2=22, center=22+44=66, per
     // its own diameter), so speedLabel's top is placed at 66 -
     // line_height/2 = 66-52/2 = 40 (font 48's line_height is 52, confirmed
     // from lv_font_montserrat_48.c) to match that same 66px center line.
+    // Explicit width + clip: "--" or a 1-3 digit speed, never more, but
+    // pinned rather than left to hug its content, per this rewrite's rule.
     speedLabel = lv_label_create(cellSpeed);
     lv_obj_set_style_text_font(speedLabel, &lv_font_montserrat_48, 0);
+    lv_obj_set_width(speedLabel, LS_PARAM_COL_W);
+    lv_label_set_long_mode(speedLabel, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(speedLabel, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(speedLabel, LV_ALIGN_TOP_MID, 0, 40);
 
     // Pushed 86->94 (number's own bottom edge moved from 46+40=86 to
@@ -506,20 +543,15 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     // border either way: (240-88)/2 = 76 horizontal, (132-88)/2 = 22
     // vertical).
     //
-    // Speed limit for the current road segment (user-requested 2026-09-15,
-    // "ngay dưới phần hiển thị tốc độ xe chạy" — right below ego speed,
-    // later refined to look like an actual Vietnamese speed-limit sign) —
-    // sourced from map/SpeedLimitManager.cpp's microSD map-matching via
+    // Speed limit for the current road segment — sourced from
+    // map/SpeedLimitManager.cpp's microSD map-matching via
     // RoadInfoSnapshot.
     //
     // A real QCVN 41:2019/BGTVT P.127 sign: white disc, thick red ring,
     // bold black number, nothing else printed on it — drawn as plain LVGL
     // vector primitives (a circular obj + a label), not a generated bitmap:
-    // there's no photographic detail here for a bitmap to earn its keep on
-    // (contrast the car/warning/sun/moon icons in icons/Icons.h, which
-    // exist BECAUSE their shapes aren't expressible as flat vector
-    // primitives), and a plain lv_obj circle stays trivially resizable and
-    // needs no Python/Pillow regeneration step.
+    // there's no photographic detail here for a bitmap to earn its keep on,
+    // and a plain lv_obj circle stays trivially resizable.
     static const int kSignDiam = 88;
     speedLimitSign = lv_obj_create(cellLimit);
     lv_obj_set_size(speedLimitSign, kSignDiam, kSignDiam);
@@ -534,37 +566,39 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     lv_obj_clear_flag(speedLimitSign, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(speedLimitSign, LV_OBJ_FLAG_HIDDEN); // shown only once a real limit is matched — see refreshDashboard()
 
-    // Sibling, not a child of speedLimitSign — see this pair's declaration
-    // comment for why (needs to keep showing "--" while the sign itself is
-    // hidden). align_to centers it on the sign's actual geometry rather
-    // than a second guessed offset, same reasoning every other icon+label
-    // pairing on this dashboard already follows.
-    // Bumped 24->28->32 (user-requested 2026-09-16 then 2026-09-21, "tang
-    // kich thuoc cac so hien thi len nua") — kept short of matching
-    // speedLabel's 48: this number sits inside a FIXED 88px sign graphic
-    // (unlike speedLabel's open cell), and a 3-digit limit like "100"/"120"
-    // at 36+ risks visually crowding the sign's own 9px red ring. 32 is the
-    // largest size that stays clearly inside the ~70px usable interior (88
-    // diameter - 2x9 border) for a 3-digit number — re-check by eye on real
-    // hardware if a wider font ever gets substituted.
+    // Sibling, not a child of speedLimitSign — needs to keep showing "--"
+    // while the sign itself is hidden. align_to centers it on the sign's
+    // actual geometry rather than a guessed offset. Explicit width + clip:
+    // at most a 3-digit limit ("120") ever renders here.
     speedLimitValueLabel = lv_label_create(cellLimit);
     lv_obj_set_style_text_font(speedLimitValueLabel, &lv_font_montserrat_32, 0);
+    lv_obj_set_width(speedLimitValueLabel, kSignDiam - 2 * 9); // clears the sign's own 9px red ring both sides
+    lv_label_set_long_mode(speedLimitValueLabel, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(speedLimitValueLabel, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align_to(speedLimitValueLabel, speedLimitSign, LV_ALIGN_CENTER, 0, 0);
 
     // ---------------- Road column (right half): sign/camera alert card ----------------
-    // Used to also hold a radar road/target view (primaryDistLabel, roadArea,
-    // per-target icons/labels) beneath the alert card — all removed
-    // 2026-09-21 alongside radar itself. buildTrafficCard() is now the
-    // column's only content; sized to use most of the freed vertical room
-    // (was a fixed 224x224 leaving roadArea below it; COL_H is 264 here and
-    // the card is positioned at a fixed y=8, so 250 leaves a clean 6px
-    // bottom margin instead of overflowing the column).
-    midCol = makePane(scr, ROAD_COL_X, COL_TOP, ROAD_COL_W, COL_H);
+    // buildTrafficCard() (shared with buildDashboardPortrait(), see its own
+    // definition above) is the column's only content; sized to use most of
+    // the vertical room (LS_COL_H is 264 here, the card sits at a fixed
+    // y=8, so 250 leaves a clean 6px bottom margin).
+    midCol = makePane(scr, LS_ROAD_COL_X, LS_COL_TOP, LS_ROAD_COL_W, LS_COL_H);
 
     buildTrafficCard(midCol, 224, 250);
 
     // ---------------- Bottom info bar ----------------
+    // Explicit width + LV_LABEL_LONG_CLIP (2026-09-22 rewrite) — this is the
+    // exact label a real-hardware report described rendering vertically
+    // down the screen edge, character by character. That can only happen if
+    // a label is left in LVGL's default content-hug/wrap sizing AND
+    // whatever it's measuring its available width against collapses to
+    // something tiny; pinning an explicit width and a non-wrapping long
+    // mode here makes that entire failure class structurally impossible for
+    // this label regardless of what upstream condition might ever cause it.
     bottomInfoLabel = lv_label_create(scr);
+    lv_obj_set_width(bottomInfoLabel, LS_SCR_W - 16); // comfortable margin, never touches screen edges
+    lv_label_set_long_mode(bottomInfoLabel, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(bottomInfoLabel, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(bottomInfoLabel, LV_ALIGN_BOTTOM_MID, 0, -6);
 }
 
@@ -694,7 +728,7 @@ void buildDashboard() {
     // Root container: holds the whole dashboard so the burn-in pixel shift
     // can nudge everything at once, and so a long press anywhere on it opens
     // Settings (spec section 17 suggests long-press for the settings entry).
-    int scrW = gfx->width(), scrH = gfx->height(); // dynamic — SCR_W/SCR_H below are landscape-only constants, wrong for portrait
+    int scrW = gfx->width(), scrH = gfx->height(); // dynamic — LS_SCR_W/LS_SCR_H below are landscape-only constants, wrong for portrait
     dashRoot = lv_obj_create(dashboardScreen);
     lv_obj_set_pos(dashRoot, 0, 0);
     lv_obj_set_size(dashRoot, scrW, scrH);
