@@ -168,6 +168,39 @@ DEFAULT_SPEED_BY_HIGHWAY = {
     "living_street": 50,
 }
 
+# RoadSegment.roadClass (SpeedMapFormat.h) — real values, not the placeholder
+# 0 every segment got before (user-requested 2026-09-22, alongside the live
+# background-map feature: "cao toc/quoc lo vang, noi do xam trang, ngo xam
+# toi"). This was previously hardcoded to 0 in build() below despite
+# `tags.get("highway")` already being read right here for the speed-default
+# table above — the firmware side (map/SpeedMapFormat.h's own comment,
+# "reserved for a future highway=* classification") was always ready for
+# this, only this script never populated it. No wire-format change: the
+# field already existed, this just stops writing 0 into it.
+#
+#   0 = unclassified/other (anything not in this table: footway, path,
+#       steps, pedestrian, an untagged/unknown highway=* value, ...) — kept
+#       as the SAME "unclassified" meaning SpeedMapFormat.h's comment always
+#       documented for 0, not a new meaning.
+#   1 = highway/major (motorway, trunk, primary + their _link variants)
+#   2 = main road (secondary, tertiary + their _link variants)
+#   3 = small/alley (residential, living_street, unclassified, service,
+#       track)
+ROAD_CLASS_UNCLASSIFIED = 0
+ROAD_CLASS_HIGHWAY = 1
+ROAD_CLASS_MAIN = 2
+ROAD_CLASS_SMALL = 3
+
+ROAD_CLASS_BY_HIGHWAY = {
+    "motorway": ROAD_CLASS_HIGHWAY, "motorway_link": ROAD_CLASS_HIGHWAY,
+    "trunk": ROAD_CLASS_HIGHWAY, "trunk_link": ROAD_CLASS_HIGHWAY,
+    "primary": ROAD_CLASS_HIGHWAY, "primary_link": ROAD_CLASS_HIGHWAY,
+    "secondary": ROAD_CLASS_MAIN, "secondary_link": ROAD_CLASS_MAIN,
+    "tertiary": ROAD_CLASS_MAIN, "tertiary_link": ROAD_CLASS_MAIN,
+    "residential": ROAD_CLASS_SMALL, "living_street": ROAD_CLASS_SMALL,
+    "unclassified": ROAD_CLASS_SMALL, "service": ROAD_CLASS_SMALL, "track": ROAD_CLASS_SMALL,
+}
+
 
 class Way:
     def __init__(self, way_id, node_ids, tags):
@@ -250,10 +283,11 @@ def build_segments(nodes, ways):
             lat2, lon2 = nodes[b]
             heading = bearing_deg(lat1, lon1, lat2, lon2)
             flags = SEGFLAG_HAS_CONDITIONAL if has_conditional else 0
+            road_class = ROAD_CLASS_BY_HIGHWAY.get(tags.get("highway"), ROAD_CLASS_UNCLASSIFIED)
 
             def make(direction, speed_kmh, source):
                 nonlocal next_id
-                seg = dict(id=next_id, start=(lat1, lon1), end=(lat2, lon2), heading=heading, road_class=0,
+                seg = dict(id=next_id, start=(lat1, lon1), end=(lat2, lon2), heading=heading, road_class=road_class,
                            direction=direction, speed_limit=speed_kmh if speed_kmh is not None else -1,
                            source=source, flags=flags | (SEGFLAG_ONEWAY if oneway else 0), way_id=way.id)
                 next_id += 1

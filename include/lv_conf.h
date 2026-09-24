@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file lv_conf.h
  * Configuration file for v9.2.2
  */
@@ -55,7 +55,7 @@
     /*Size of the memory available for `lv_malloc()` in bytes (>= 2kB)*/
     // History: bumped 64->128KB 2026-09-16 after a real-hardware crash
     // ("img_draw_core: Asserted at expression: tmp_buf != NULL (Out of
-    // memory) lv_draw_sw_img.c:322", then a task-watchdog panic-reboot) —
+    // memory) lv_draw_sw_img.c:322", then a task-watchdog panic-reboot) �
     // LVGL's OWN internal pool (this setting) is entirely separate from the
     // ESP32's general heap. 128KB was a safe-but-unmeasured guess at the
     // time; a same-day RAM audit then added lv_mem_monitor() telemetry
@@ -63,10 +63,10 @@
     // heaviest scenario available (demo mode, several simultaneously-moving
     // targets, both Dashboard and Settings screens' widgets built): max_used
     // never exceeded ~58.7KB out of the 128KB pool (46%, frag 2-3%). Sized
-    // down to 96KB here — still ~38KB (61%) of headroom above that measured
+    // down to 96KB here � still ~38KB (61%) of headroom above that measured
     // peak, while returning 32KB to internal RAM, the scarcer resource on
     // this board (see the same [mem] line's freeInternal, which this pool
-    // does NOT count against separately — it just eats into it once at
+    // does NOT count against separately � it just eats into it once at
     // lv_init()).
     #define LV_MEM_SIZE (96 * 1024U)          /*[bytes]*/
 
@@ -508,15 +508,15 @@
 #define LV_FONT_MONTSERRAT_26 0
 #define LV_FONT_MONTSERRAT_28 1
 #define LV_FONT_MONTSERRAT_30 0
-#define LV_FONT_MONTSERRAT_32 1 // enabled 2026-09-21 for Dashboard.cpp's speedLimitValueLabel — user-requested "tang kich thuoc cac so hien thi len nua"
+#define LV_FONT_MONTSERRAT_32 1 // enabled 2026-09-21 for Dashboard.cpp's speedLimitValueLabel � user-requested "tang kich thuoc cac so hien thi len nua"
 #define LV_FONT_MONTSERRAT_34 0
-#define LV_FONT_MONTSERRAT_36 1 // enabled 2026-09-16 for Dashboard.cpp's landscape speedLabel — user-requested bigger ego-speed number
+#define LV_FONT_MONTSERRAT_36 1 // enabled 2026-09-16 for Dashboard.cpp's landscape speedLabel � user-requested bigger ego-speed number
 #define LV_FONT_MONTSERRAT_38 0
 #define LV_FONT_MONTSERRAT_40 0
 #define LV_FONT_MONTSERRAT_42 0
 #define LV_FONT_MONTSERRAT_44 0
 #define LV_FONT_MONTSERRAT_46 0
-#define LV_FONT_MONTSERRAT_48 1 // enabled 2026-09-16 for Dashboard.cpp's Simple-layout primaryDistLabel — user-requested "con so khoang cach to hon nua"
+#define LV_FONT_MONTSERRAT_48 1 // enabled 2026-09-16 for Dashboard.cpp's Simple-layout primaryDistLabel � user-requested "con so khoang cach to hon nua"
 
 /*Demonstrate special features*/
 #define LV_FONT_MONTSERRAT_28_COMPRESSED 0  /*bpp = 3*/
@@ -531,10 +531,14 @@
 /*Optionally declare custom fonts here.
  *You can use these fonts as default font too and they will be available globally.
  *E.g. #define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(my_font_1) LV_FONT_DECLARE(my_font_2)*/
-#define LV_FONT_CUSTOM_DECLARE
+#define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(lv_font_vn_14)
 
-/*Always set a default font*/
-#define LV_FONT_DEFAULT &lv_font_montserrat_14
+/*Always set a default font. lv_font_vn_14 (2026-09-24) = Arial 14px with the
+ *full Vietnamese repertoire + ASCII, a metric drop-in for montserrat_14
+ *(same line_height 16). Making it the DEFAULT gives every label that doesn't
+ *set an explicit font (sign banners, Settings rows, ahead-limit) Vietnamese
+ *diacritics for free. See tools/fonts/gen_vn_font.py.*/
+#define LV_FONT_DEFAULT &lv_font_vn_14
 
 /*Enable handling large font and/or fonts with a lot of characters.
  *The limit depends on the font size, font face and bpp.
@@ -762,9 +766,9 @@
 #endif
 
 /*API for memory-mapped file access. */
-#define LV_USE_FS_MEMFS 0
+#define LV_USE_FS_MEMFS 1
 #if LV_USE_FS_MEMFS
-    #define LV_FS_MEMFS_LETTER '\0'     /*Set an upper cased letter on which the drive will accessible (e.g. 'A')*/
+    #define LV_FS_MEMFS_LETTER 'M'     /*Set an upper cased letter on which the drive will accessible (e.g. 'A')*/
 #endif
 
 /*API for LittleFs. */
@@ -796,7 +800,7 @@
 
 /* JPG + split JPG decoder library.
  * Split JPG is a custom format optimized for embedded systems. */
-#define LV_USE_TJPGD 0
+#define LV_USE_TJPGD 1
 
 /* libjpeg-turbo decoder library.
  * Supports complete JPEG specifications and high-performance JPEG decoding. */

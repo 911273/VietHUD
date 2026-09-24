@@ -11,6 +11,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 #define I2S_PORT        I2S_NUM_0
 #define I2S_SAMPLE_RATE 16000
@@ -20,6 +21,32 @@
 
 static uint8_t s_volume = 80;
 static bool s_initialized = false;
+// Serializes access to the single I2S_NUM_0 port between the tone generator
+// (audioPlayTone, called from the UI task) and the voice task's teardown/
+// reinstall of the port (voiceTaskFn, Core 0). Added 2026-09-24: without it,
+// a tone that passed the `s_initialized` check could still i2s_write into a
+// port the voice task had just uninstalled (a real data race the original
+// code's own comment admitted was never tested). audioPlayTone takes it with
+// a 0 timeout (skips the chime if voice currently owns the port — the voice
+// line IS the alert then), so the UI thread never blocks on audio.
+static SemaphoreHandle_t s_i2sMutex = NULL;
+
+// Unified audio command queue (2026-09-24): ALL audio — tone chimes AND voice
+// clips — now plays on ONE background task (Core 0), not the UI/render thread.
+// Before, audioPlayCameraAlert()/SignNotice()/OverspeedAlert() ran the tone
+// i2s_write(portMAX_DELAY) + delay() sequences inline from refreshDashboard()
+// on loopTask, stalling the UI ~250-340ms per alert (visible jank, WDT
+// pressure). Now the UI just enqueues a command and returns immediately.
+#define VOICE_DIR "/speedmap/sounds/vi/"
+#define VOICE_FILENAME_MAX 48
+#define AUDIO_QUEUE_LEN 12
+enum : uint8_t { CMD_VOICE = 0, CMD_TONE_CAMERA, CMD_TONE_OVERSPEED, CMD_TONE_SIGN, CMD_TONE_BEEP };
+struct AudioCmd {
+    uint8_t kind;
+    char file[VOICE_FILENAME_MAX]; // CMD_VOICE: mp3 name; CMD_TONE_BEEP: file[0]=count
+};
+static QueueHandle_t s_audioQueue = NULL;
+static void audioTaskFn(void *); // defined below
 
 // Installs the legacy driver/i2s.h tone driver on I2S_NUM_0. Split out of
 // audioInit() (2026-09-21, Task E) so voiceTaskFn() below can call it again
@@ -64,6 +91,16 @@ static bool installToneI2S() {
 
 void audioInit() {
     if (s_initialized) return;
+    if (!s_i2sMutex) s_i2sMutex = xSemaphoreCreateMutex();
+    if (!s_audioQueue) {
+        s_audioQueue = xQueueCreate(AUDIO_QUEUE_LEN, sizeof(AudioCmd));
+        if (s_audioQueue) {
+            // Core 0, priority 1 — spends nearly all its time blocked on the
+            // queue or inside blocking I2S writes, so it doesn't compete with
+            // GNSS/map/web. 6144-byte stack covers the ESP8266Audio MP3 decoder.
+            xTaskCreatePinnedToCore(audioTaskFn, "audioTask", 6144, NULL, 1, NULL, 0);
+        }
+    }
     if (installToneI2S()) {
         s_initialized = true;
         Serial.println("[audio] NS4168 I2S audio driver initialized on BCLK=42, LRCK=2, DOUT=41");
@@ -81,6 +118,14 @@ uint8_t audioGetVolume() {
 
 void audioPlayTone(uint16_t freqHz, uint16_t durationMs) {
     if (!s_initialized || s_volume == 0 || freqHz == 0) return;
+    // Skip (don't block) if the voice task currently owns the I2S port — the
+    // voice line is the alert in that case. Also closes the race where the
+    // port gets uninstalled between the check above and i2s_write below.
+    if (s_i2sMutex && xSemaphoreTake(s_i2sMutex, 0) != pdTRUE) return;
+    if (!s_initialized) { // re-check under the lock: voice may have just torn it down
+        if (s_i2sMutex) xSemaphoreGive(s_i2sMutex);
+        return;
+    }
 
     int totalSamples = (I2S_SAMPLE_RATE * durationMs) / 1000;
     int16_t buffer[128];
@@ -113,89 +158,65 @@ void audioPlayTone(uint16_t freqHz, uint16_t durationMs) {
     memset(buffer, 0, sizeof(buffer));
     size_t bw = 0;
     i2s_write(I2S_PORT, buffer, 64 * sizeof(int16_t), &bw, portMAX_DELAY);
+    if (s_i2sMutex) xSemaphoreGive(s_i2sMutex);
 }
 
-void audioPlayCameraAlert() {
-    if (!cfg.audioEnabled) return;
-    // Distinct double chime for camera ahead: High -> Higher
-    audioPlayTone(880, 120);  // A5
-    delay(40);
-    audioPlayTone(1320, 180); // E6
+// --- Tone sequences: run ON THE AUDIO TASK (the vTaskDelay gaps here never
+// touch the UI thread). audioPlayTone() itself is the blocking primitive. ---
+static void toneCamera() { audioPlayTone(880, 120); vTaskDelay(pdMS_TO_TICKS(40)); audioPlayTone(1320, 180); }
+static void toneOverspeed() {
+    for (int i = 0; i < 3; i++) { audioPlayTone(1760, 80); if (i < 2) vTaskDelay(pdMS_TO_TICKS(40)); }
+}
+static void toneSign() { audioPlayTone(660, 100); vTaskDelay(pdMS_TO_TICKS(30)); audioPlayTone(880, 150); }
+static void toneBeep(int n) {
+    for (int i = 0; i < n; i++) { audioPlayTone(1000, 80); if (i + 1 < n) vTaskDelay(pdMS_TO_TICKS(50)); }
 }
 
-void audioPlayOverspeedAlert() {
-    if (!cfg.audioEnabled) return;
-    // Rapid urgent alarm: 3 short high-pitch beeps
-    for (int i = 0; i < 3; i++) {
-        audioPlayTone(1760, 80); // A6
-        if (i < 2) delay(40);
-    }
+static void enqueueCmd(uint8_t kind, const char *file) {
+    if (!cfg.audioEnabled || !s_audioQueue) return;
+    AudioCmd c;
+    c.kind = kind;
+    c.file[0] = '\0';
+    if (file) { strncpy(c.file, file, sizeof(c.file) - 1); c.file[sizeof(c.file) - 1] = '\0'; }
+    xQueueSend(s_audioQueue, &c, 0); // non-blocking; drop if full — UI must never stall on audio
 }
 
-void audioPlaySignNotice() {
-    if (!cfg.audioEnabled) return;
-    // Gentle informative notification chime: Medium -> High
-    audioPlayTone(660, 100);  // E5
-    delay(30);
-    audioPlayTone(880, 150);  // A5
-}
-
-void audioPlayBeep(uint8_t count) {
-    for (uint8_t i = 0; i < count; i++) {
-        audioPlayTone(1000, 80);
-        if (i + 1 < count) delay(50);
-    }
-}
+// Public alert API — now NON-BLOCKING: just enqueue, the audio task plays it.
+void audioPlayCameraAlert() { enqueueCmd(CMD_TONE_CAMERA, nullptr); }
+void audioPlayOverspeedAlert() { enqueueCmd(CMD_TONE_OVERSPEED, nullptr); }
+void audioPlaySignNotice() { enqueueCmd(CMD_TONE_SIGN, nullptr); }
+void audioPlayBeep(uint8_t count) { char b[2] = {(char)(count ? count : 1), 0}; enqueueCmd(CMD_TONE_BEEP, b); }
 
 void audioUpdate() {
     // Optional periodic hook for streaming audio
 }
 
 // ---------------------------------------------------------------------
-// Queued Vietnamese voice playback (added 2026-09-21, Task E — replaces
-// tone-only alerts with real speech for the sign/camera/speed-limit
-// warnings that used to be radar's territory). Real MP3 decode via
-// ESP8266Audio (AudioGeneratorMP3 + AudioFileSourceFS + AudioOutputI2S),
-// reading straight off the microSD card this project already mounts via
-// SD_MMC (map/SdCardManager.cpp's sdMgrMount() / TripLogger's
-// sdMgrAppendLine() bring the peripheral up at boot — this code never
-// calls SD_MMC.begin() itself, same "don't remount separately" rule every
-// other SD consumer here follows... except this one CAN'T go through
-// SdCardManager.h's sole-SD-owner functions, since those only expose the
-// speedmap/triplog-shaped operations it already needed, not raw streamed
-// file reads for an audio decoder — AudioFileSourceFS needs the fs::FS
-// object directly. This is a deliberate, narrow exception to that rule:
-// SD_MMC's own File API is safe to call from multiple tasks as long as
-// they don't step on each other's open handles, and voice playback and
-// the speedmap/triplog readers never run inside the same call at once in
-// practice (this task blocks for the whole length of a clip, and nothing
-// else here holds a file open across a yield).
+// Audio task (Core 0) — drains the command queue and plays tones + Vietnamese
+// voice MP3s sequentially, so nothing audio ever runs on the UI thread. Voice
+// decode is ESP8266Audio (AudioGeneratorMP3 + AudioFileSourceFS +
+// AudioOutputI2S) reading straight off the SD card this project already mounts.
+// The I2S port is shared: the ESP8266Audio output installs its OWN i2s_std
+// channel on I2S_NUM_0, so a voice clip tears down the legacy tone driver for
+// its duration and reinstalls it after (guarded by s_i2sMutex). Because tones
+// and voice now run on this ONE task, they're naturally serialized.
 // ---------------------------------------------------------------------
-#define VOICE_DIR "/speedmap/sounds/vi/"
-#define VOICE_FILENAME_MAX 48
-#define VOICE_QUEUE_LEN 8
-
-static QueueHandle_t s_voiceQueue = NULL;
-
-static void voiceTaskFn(void *) {
+static void audioTaskFn(void *) {
     for (;;) {
-        char filename[VOICE_FILENAME_MAX];
-        if (xQueueReceive(s_voiceQueue, filename, portMAX_DELAY) != pdTRUE) continue;
-        if (!cfg.audioEnabled || s_volume == 0) continue; // dropped, not queued-and-silent — avoids a stale backlog playing late after audio gets re-enabled
+        AudioCmd c;
+        if (xQueueReceive(s_audioQueue, &c, portMAX_DELAY) != pdTRUE) continue;
+        if (!cfg.audioEnabled || s_volume == 0) continue; // dropped, not queued-silent
 
+        if (c.kind == CMD_TONE_CAMERA) { toneCamera(); continue; }
+        if (c.kind == CMD_TONE_OVERSPEED) { toneOverspeed(); continue; }
+        if (c.kind == CMD_TONE_SIGN) { toneSign(); continue; }
+        if (c.kind == CMD_TONE_BEEP) { toneBeep(c.file[0] ? (uint8_t)c.file[0] : 1); continue; }
+
+        // CMD_VOICE
         char path[VOICE_FILENAME_MAX + sizeof(VOICE_DIR)];
-        snprintf(path, sizeof(path), VOICE_DIR "%s", filename);
+        snprintf(path, sizeof(path), VOICE_DIR "%s", c.file);
 
-        // ESP8266Audio's AudioOutputI2S installs ITS OWN i2s_std (new IDF
-        // driver) channel on I2S_NUM_0 — audioPlayTone()'s legacy
-        // driver/i2s.h API already owns that same port, and the two can't
-        // both be installed at once. Voice cues are short, discrete events
-        // (a couple seconds every so often), not a continuous stream, so
-        // tearing the tone driver down for the duration of one clip and
-        // reinstalling it after is a fine trade — never verified on real
-        // hardware yet (no SD card mounted on the dev machine this was
-        // built on), see the project's own final report for what that
-        // means for confidence here.
+        if (s_i2sMutex) xSemaphoreTake(s_i2sMutex, portMAX_DELAY);
         i2s_driver_uninstall(I2S_PORT);
         s_initialized = false;
 
@@ -217,35 +238,9 @@ static void voiceTaskFn(void *) {
             Serial.printf("[audio] voice: file not found: %s\n", path);
         }
 
-        // Hand I2S back to the tone generator so the next audioPlayTone()
-        // call (or the next voice clip's own teardown/reinstall) works.
         if (installToneI2S()) s_initialized = true;
+        if (s_i2sMutex) xSemaphoreGive(s_i2sMutex);
     }
 }
 
-void audioQueueVoice(const char *filename) {
-    if (!cfg.audioEnabled) return;
-    if (!s_voiceQueue) {
-        s_voiceQueue = xQueueCreate(VOICE_QUEUE_LEN, VOICE_FILENAME_MAX);
-        if (!s_voiceQueue) return;
-        // Core 0, alongside every other sensor/IO task here — this task
-        // spends almost all its time blocked (either on the queue, or
-        // inside mp3.loop()'s own blocking I2S writes), so it doesn't
-        // compete meaningfully with GNSS/map/web for CPU. Stack sized
-        // generously (ESP8266Audio's MP3 decoder + its own internal
-        // buffers are heavier than this project's other small tasks) —
-        // not yet measured against real playback on real hardware; revisit
-        // with uxTaskGetStackHighWaterMark() once a card + speakers are
-        // actually available to test with.
-        xTaskCreatePinnedToCore(voiceTaskFn, "audioVoice", 6144, NULL, 1, NULL, 0);
-    }
-    char buf[VOICE_FILENAME_MAX];
-    strncpy(buf, filename, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-    // Non-blocking (timeout=0) — if the queue's already full, drop the
-    // newest request rather than block the caller (ui/Dashboard.cpp's
-    // refreshDashboard(), which must never stall on audio). A backlog of
-    // stale voice cues playing out minutes late would be worse than
-    // skipping one.
-    xQueueSend(s_voiceQueue, buf, 0);
-}
+void audioQueueVoice(const char *filename) { enqueueCmd(CMD_VOICE, filename); }

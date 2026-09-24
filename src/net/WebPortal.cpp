@@ -81,10 +81,10 @@ async function tick() {
     const d = await r.json();
     let html = '';
     // Speed-camera-ahead — full-width amber card, same warning color/meaning
-    // as the on-device Dashboard's own banner (ui/Dashboard.cpp's
-    // cameraAheadLabel: a known, upcoming hazard). Only rendered while a
+    // as the on-device Dashboard's own alert card (ui/Dashboard.cpp's
+    // updateAlertCard(): a known, upcoming hazard). Only rendered while a
     // camera is actually ahead, not as an always-present "no camera" card
-    // — matches the on-device banner's own hide/show logic.
+    // — matches the on-device card's own idle/active logic.
     if (d.cameraAhead) {
       const c = d.cameraAhead;
       const limitTxt = (c.speedLimitKmh !== null) ? ' (' + c.speedLimitKmh.toFixed(0) + ' km/h)' : '';
@@ -128,8 +128,8 @@ static void handleApiStatus() {
 
     // Speed-camera-ahead (user-requested 2026-09-21, "them the hien phia
     // truoc co camera") — same map/SpeedLimitManager.cpp's matchCameraAhead()
-    // result the Dashboard's own amber banner already shows on-device (see
-    // ui/Dashboard.cpp's cameraAheadLabel); this is the same data, just
+    // result the Dashboard's own alert card already shows on-device (see
+    // ui/Dashboard.cpp's updateAlertCard()); this is the same data, just
     // exposed to the web Live page too, which polls /api/status but never
     // had any RoadInfoSnapshot field in it before this.
     char cameraBuf[96] = "null";
@@ -347,6 +347,14 @@ static void handleConfigGet() {
                        cfg.gnssSpeedFilterAlpha, 0.01f, 0.05f, 0.90f);
     len = appendField(configBuf, sizeof(configBuf), len, "gnssFixTimeoutS", "Fix timeout (s)", cfg.gnssFixTimeoutS,
                        0.1f, 1, 10);
+    len = appendField(configBuf, sizeof(configBuf), len, "gnssSpeedCalibrationPct", "Speed calibration (%)",
+                       cfg.gnssSpeedCalibrationPct, 0.1f, -15, 15);
+    len = appendField(configBuf, sizeof(configBuf), len, "overspeedOffsetKmh", "Overspeed warning offset (km/h)",
+                       cfg.overspeedOffsetKmh, 1, 0, 10);
+    len = appendField(configBuf, sizeof(configBuf), len, "defaultLimitKmh", "Default limit when unknown (km/h, 0=off)",
+                       cfg.defaultLimitKmh, 1, 0, 90);
+    // (aheadLimitWarnDistM / cameraWarnDistM removed 2026-09-24 — never used;
+    // the lookahead uses a dynamic speed-based warn distance.)
     len = appendCheckbox(configBuf, sizeof(configBuf), len, "tripLoggingEnabled", "Trip logging (SD card)",
                           cfg.tripLoggingEnabled);
     len += snprintf(configBuf + len, sizeof(configBuf) - len, "</fieldset><fieldset><legend>WiFi</legend>");
@@ -372,6 +380,9 @@ static void handleConfigPost() {
     cfg.autoDimMin = argFloat("autoDimMin", cfg.autoDimMin);
     cfg.gnssSpeedFilterAlpha = argFloat("gnssSpeedFilterAlpha", cfg.gnssSpeedFilterAlpha);
     cfg.gnssFixTimeoutS = argFloat("gnssFixTimeoutS", cfg.gnssFixTimeoutS);
+    cfg.gnssSpeedCalibrationPct = argFloat("gnssSpeedCalibrationPct", cfg.gnssSpeedCalibrationPct);
+    cfg.overspeedOffsetKmh = argFloat("overspeedOffsetKmh", cfg.overspeedOffsetKmh);
+    cfg.defaultLimitKmh = argFloat("defaultLimitKmh", cfg.defaultLimitKmh);
     if (server.hasArg("wifiSsid")) {
         strncpy(cfg.wifiSsid, server.arg("wifiSsid").c_str(), sizeof(cfg.wifiSsid) - 1);
         cfg.wifiSsid[sizeof(cfg.wifiSsid) - 1] = '\0';

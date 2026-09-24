@@ -5,6 +5,7 @@
 static SemaphoreHandle_t stateMutex;
 static GnssSnapshot gnssState;
 static RoadInfoSnapshot roadInfoState;
+static MapViewSnapshot mapViewState;
 
 void sharedStateInit() { stateMutex = xSemaphoreCreateMutex(); }
 
@@ -30,6 +31,19 @@ void roadInfoPublish(const RoadInfoSnapshot &s) {
 RoadInfoSnapshot roadInfoSnapshot() {
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     RoadInfoSnapshot copy = roadInfoState;
+    xSemaphoreGive(stateMutex);
+    return copy;
+}
+
+void mapViewPublish(const MapViewSnapshot &s) {
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    mapViewState = s;
+    xSemaphoreGive(stateMutex);
+}
+
+MapViewSnapshot mapViewSnapshot() {
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    MapViewSnapshot copy = mapViewState;
     xSemaphoreGive(stateMutex);
     return copy;
 }

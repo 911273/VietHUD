@@ -4,6 +4,8 @@
 #include "core/AppConfig.h"
 #include "core/NvsStore.h"
 #include "core/SharedState.h" // gnssSnapshot()/roadInfoSnapshot() for the Sensors diagnostics panel
+#include "demo/DemoMode.h"    // scripted UI demo — Settings > Display switch
+#include "map/RasterMapManager.h"
 #include "map/SpeedLimitManager.h" // speedSourceStr() — Speed Map group in the Sensors tab
 #include "net/WebPortal.h"    // webPortalIsEnabled()/webPortalRequestEnable() — WiFi tab
 #include <string.h>
@@ -18,12 +20,14 @@ struct SliderBinding {
     float divisor;
     const char *unit;
 };
-// 4 in use (Brightness, Dim-after-stopped, GNSS speed-filter smoothing, GNSS
-// fix timeout) after radar removal 2026-09-21 dropped the ~19 radar-only
-// slider rows this array used to size against (was 32 wide for that reason
-// — see git history). Sized with real headroom again, checked by counting
-// addSliderRow() call sites directly rather than trusting an old comment.
-static SliderBinding sliderBindings[8];
+// 7 in use (Brightness, Dim-after-stopped, GNSS speed-filter smoothing, GNSS
+// fix timeout, GPS speed calibration, speed-limit-ahead warn distance,
+// camera warn distance — the last 3 added 2026-09-22) after radar removal
+// 2026-09-21 dropped the ~19 radar-only slider rows this array used to size
+// against (was 32 wide for that reason — see git history). Checked by
+// counting addSliderRow() call sites directly rather than trusting an old
+// comment.
+static SliderBinding sliderBindings[12]; // bumped from 8 (2026-09-24): 9 slider rows now (added Overspeed offset + Default limit)
 static int sliderCount = 0;
 
 struct SwitchBinding {
@@ -33,10 +37,11 @@ struct SwitchBinding {
 // 2 in use (Alert audio enabled, Trip logging) after radar removal
 // 2026-09-21 dropped the radar-only demo-mode/mount-flip switches this
 // array used to size against (was 12 wide for that reason).
-static SwitchBinding switchBindings[6];
+static SwitchBinding switchBindings[10];
 static int switchCount = 0;
 
 static lv_obj_t *settingsStatusLabel;
+static lv_obj_t *restartConfirmOverlay = nullptr;
 
 // WiFi tab widgets — declared up top since onWifiSwitchChanged()/
 // onWifiKbReadyOrCancel() below (both fairly early in the file) reference
@@ -44,13 +49,26 @@ static lv_obj_t *settingsStatusLabel;
 // declare-early/build-late split refreshSensorsPanel()'s own widget
 // pointers already use.
 static lv_obj_t *wifiEnableSwitch, *wifiSsidTa, *wifiPasswordTa;
+// Demo mode (Settings > Display) — like WiFi's switch above, deliberately not
+// an AppConfig/NVS field, so it can never survive a reboot into real driving.
+// See demo/DemoMode.h.
+static lv_obj_t *demoEnableSwitch, *demoSceneVal;
+
+// Formats a settings value: no decimal for whole numbers ("100 m", "3 min"),
+// one decimal otherwise ("0.3", "1.5"). Cleaner than the old always-"%.1f"
+// which showed "100.0 m" / "3.0 min" (2026-09-24 UI polish for glanceability).
+static void fmtSettingVal(char *buf, size_t n, float v, const char *unit) {
+    if (v == (float)(long)v) snprintf(buf, n, "%ld%s", (long)v, unit ? unit : "");
+    else snprintf(buf, n, "%.1f%s", (double)v, unit ? unit : "");
+}
+
 
 static void onSliderChanged(lv_event_t *e) {
     SliderBinding *b = (SliderBinding *)lv_event_get_user_data(e);
     int32_t raw = lv_slider_get_value(b->slider);
     *(b->target) = raw / b->divisor;
     char buf[24];
-    snprintf(buf, sizeof(buf), "%.1f%s", (double)(*(b->target)), b->unit);
+    fmtSettingVal(buf, sizeof(buf), *(b->target), b->unit);
     lv_label_set_text(b->valLabel, buf);
     lv_label_set_text(settingsStatusLabel, "");
     clampConfig(cfg);
@@ -66,15 +84,24 @@ static void onSliderChanged(lv_event_t *e) {
     // active then) — say so immediately rather than let the slider silently
     // do nothing, which is what every OTHER slider here does instead.
     if (b->target == &cfg.screenRotation) {
-        lv_label_set_text(settingsStatusLabel, "Restart to apply rotation");
+        saveConfigToNVS(cfg);
+        lv_label_set_text(settingsStatusLabel, "Da luu xoay man hinh! Khoi dong lai de ap dung...");
+        if (restartConfirmOverlay) {
+            lv_obj_clear_flag(restartConfirmOverlay, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
 static void onSwitchChanged(lv_event_t *e) {
     SwitchBinding *b = (SwitchBinding *)lv_event_get_user_data(e);
     *(b->target) = lv_obj_has_state(b->sw, LV_STATE_CHECKED);
-    lv_label_set_text(settingsStatusLabel, "");
     clampConfig(cfg); // no switch affects brightness, so no applyConfig() call needed here
+    // Persist immediately so toggles (esp. the map mode: JPEG/vector/heading-up)
+    // survive a reboot without needing the footer Save — user-requested
+    // 2026-09-24 ("ghi nhớ lưu chọn bản đồ ... sau khi khởi động"). Switches are
+    // discrete/infrequent, so a NVS write per toggle is fine (unlike sliders).
+    saveConfigToNVS(cfg);
+    lv_label_set_text(settingsStatusLabel, "Da luu");
 }
 
 // Not wired through the generic SwitchBinding/onSwitchChanged above:
@@ -87,6 +114,19 @@ static void onWifiSwitchChanged(lv_event_t *e) {
     bool on = lv_obj_has_state(wifiEnableSwitch, LV_STATE_CHECKED);
     webPortalRequestEnable(on);
     Serial.printf("[uidemo] WiFi %s via Settings switch\n", on ? "ON" : "OFF");
+}
+
+// Same non-AppConfig treatment as WiFi's switch above — see its comment and
+// demo/DemoMode.h for why this state must not persist.
+static void onDemoSwitchChanged(lv_event_t *) {
+    // Diagnostic print (user-reported 2026-09-22: "gat Demo mode khong an,
+    // Settings tu thoat" — a switch tap seemingly doing nothing followed by
+    // the 5s idle-return firing, which only happens if NO touch registered
+    // at all in that window, not even a miss elsewhere on screen). This
+    // confirms whether the tap is reaching this handler at all, before
+    // assuming the ext_click_area enlargement just below is the real fix.
+    Serial.println("[settings] Demo mode switch event fired");
+    demoModeSetEnabled(lv_obj_has_state(demoEnableSwitch, LV_STATE_CHECKED));
 }
 
 // On-screen keyboard for wifiSsidTa/wifiPasswordTa — this screen's first use
@@ -182,7 +222,7 @@ static void addSliderRow(lv_obj_t *parent, int &y, const char *name, float *targ
     lv_obj_add_event_cb(slider, onSliderChanged, LV_EVENT_VALUE_CHANGED, b);
 
     char buf[24];
-    snprintf(buf, sizeof(buf), "%.1f%s", (double)(*target), unit);
+    fmtSettingVal(buf, sizeof(buf), *target, unit);
     lv_label_set_text(valLbl, buf);
 
     y += rowH;
@@ -199,7 +239,7 @@ struct ChoiceBinding {
     int count;
     float *target;
 };
-static ChoiceBinding choiceBindings[4]; // 3 in use as of Direction (2026-09-21) — 1 slot free
+static ChoiceBinding choiceBindings[8]; // 3 in use as of Direction (2026-09-21) — 1 slot free
 static int choiceCount = 0;
 
 static void onChoiceBtnClicked(lv_event_t *e) {
@@ -220,7 +260,20 @@ static void onChoiceBtnClicked(lv_event_t *e) {
     // active then) — say so immediately rather than let the button silently
     // do nothing until the next restart.
     if (b->target == &cfg.screenRotation) {
-        lv_label_set_text(settingsStatusLabel, "Restart to apply rotation");
+        saveConfigToNVS(cfg);
+        lv_label_set_text(settingsStatusLabel, "Da luu xoay man hinh! Khoi dong lai de ap dung...");
+        if (restartConfirmOverlay) {
+            lv_obj_clear_flag(restartConfirmOverlay, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    // Map source IS a choice row (addChoiceRow at the Map tab), so its apply
+    // logic must live HERE, not in onSliderChanged — it used to be only in the
+    // slider handler, which this choice row never dispatches to, so picking a
+    // map source silently did nothing (found in the 2026-09-24 UI audit).
+    if (b->target == &cfg.mapSource) {
+        RasterMapManager::instance().setMapSource((uint8_t)(int)cfg.mapSource);
+        saveConfigToNVS(cfg);
+        lv_label_set_text(settingsStatusLabel, "Da doi nguon ban do!");
     }
 }
 
@@ -332,6 +385,7 @@ static lv_obj_t *wifiStatusVal; // Settings > WiFi tab — see refreshSensorsPan
 // Settings > Sensors > "Speed Map" group — see refreshSensorsPanel(). Region/
 // version come from speedLimitManagerGetInfo() (static once loaded at boot);
 // the rest come from roadInfoSnapshot() (updates every ~500ms).
+static lv_obj_t *mapFileVal = nullptr, *mapTilesCountVal = nullptr, *mapZoomVal = nullptr, *mapStatusVal = nullptr;
 static lv_obj_t *speedMapStatusVal, *speedMapRegionVal, *speedMapVersionVal;
 static lv_obj_t *speedMapLimitVal, *speedMapSourceVal, *speedMapMatchVal, *speedMapRoadIdVal;
 
@@ -371,6 +425,13 @@ static void refreshSensorsPanel(lv_timer_t *) {
     snprintf(buf, sizeof(buf), "%.1f km/h", (double)gnss.egoSpeedKmh);
     lv_label_set_text(gnssSpeedFilteredVal, buf);
 
+    // Which demo scene is on screen right now, so the tour can be described
+    // while watching it (and so it's obvious at a glance that the numbers on
+    // the Dashboard are synthetic, not a real fix).
+    lv_label_set_text(demoSceneVal, demoModeSceneName());
+    lv_obj_set_style_text_color(demoSceneVal, demoModeIsEnabled() ? lv_color_hex(0xE0C020) : lv_color_hex(0x7C8A9A),
+                                 0);
+
     char wifiBuf[48];
     bool wifiOn = webPortalIsEnabled();
     webPortalStatusText(wifiBuf, sizeof(wifiBuf));
@@ -388,6 +449,18 @@ static void refreshSensorsPanel(lv_timer_t *) {
     // card is swapped and the device rebooted, so a single mapLoaded check
     // gates all the "static" fields; the rest (limit/source/match/road)
     // come from the live 500ms RoadInfoSnapshot regardless.
+    // Map tab diagnostic fields
+    if (mapFileVal) {
+        lv_label_set_text(mapFileVal, RasterMapManager::instance().getCurrentSourcePath());
+        char mBuf[32];
+        snprintf(mBuf, sizeof(mBuf), "%u tiles", (unsigned int)RasterMapManager::instance().getTileCount());
+        lv_label_set_text(mapTilesCountVal, mBuf);
+        snprintf(mBuf, sizeof(mBuf), "z%u .. z%u", (unsigned int)RasterMapManager::instance().getMinZoom(),
+                 (unsigned int)RasterMapManager::instance().getMaxZoom());
+        lv_label_set_text(mapZoomVal, mBuf);
+        lv_label_set_text(mapStatusVal, RasterMapManager::instance().isLoaded() ? "Active (OK)" : "File missing");
+    }
+
     SpeedMapMetadata mapInfo;
     bool mapLoaded = speedLimitManagerGetInfo(mapInfo);
     if (mapLoaded) {
@@ -455,6 +528,69 @@ static void onConfirmSaveYes(lv_event_t *) {
 
 static void onSaveConfig(lv_event_t *) { lv_obj_clear_flag(confirmOverlay, LV_OBJ_FLAG_HIDDEN); }
 
+// Second, separate overlay for the footer's "Restart" button (added
+// 2026-09-22) — a real device reboot is more disruptive than anything else
+// on this screen, including Save above, yet used to fire on a single tap
+// with NO confirmation at all, and with a deliberately ENLARGED touch
+// hit-area on top of that (see restartBtn's own comment — a touch-accuracy
+// accommodation). Confirmed on real hardware: the pre-existing touch
+// controller glitch (TouchTask.cpp's "stuck" bus-reset recovery) was
+// spuriously landing in that enlarged zone and silently triggering a real
+// ESP.restart() — which looks exactly like a random crash from the
+// driver's seat, not an accidental button press. A second stray touch
+// hitting this modal's own Restart button too (normal-sized, not enlarged)
+// is far less likely than one hitting the original button's 20px-padded
+// zone, so this closes the actual gap rather than just relocating it.
+// restartConfirmOverlay declared at file top
+static void closeRestartConfirm(lv_event_t *) { lv_obj_add_flag(restartConfirmOverlay, LV_OBJ_FLAG_HIDDEN); }
+static void onConfirmRestartYes(lv_event_t *) { ESP.restart(); }
+static void onRestartBtnClicked(lv_event_t *) { lv_obj_clear_flag(restartConfirmOverlay, LV_OBJ_FLAG_HIDDEN); }
+
+static void buildRestartConfirmOverlay(lv_obj_t *parent) {
+    restartConfirmOverlay = lv_obj_create(parent);
+    lv_obj_set_pos(restartConfirmOverlay, 0, 0);
+    lv_obj_set_size(restartConfirmOverlay, gfx->width(), gfx->height());
+    lv_obj_set_style_bg_color(restartConfirmOverlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(restartConfirmOverlay, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(restartConfirmOverlay, 0, 0);
+    lv_obj_set_style_radius(restartConfirmOverlay, 0, 0);
+    lv_obj_clear_flag(restartConfirmOverlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(restartConfirmOverlay, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *box = lv_obj_create(restartConfirmOverlay);
+    lv_obj_set_size(box, 300, 130);
+    lv_obj_center(box);
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x1B222A), 0);
+    lv_obj_set_style_border_color(box, lv_color_hex(0x3A4A5C), 0);
+    lv_obj_set_style_radius(box, 8, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *msg = lv_label_create(box);
+    lv_label_set_text(msg, "Restart the device now?");
+    lv_obj_set_style_text_color(msg, lv_color_white(), 0);
+    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 6);
+
+    lv_obj_t *noBtn = lv_button_create(box);
+    lv_obj_set_size(noBtn, 110, 36);
+    lv_obj_align(noBtn, LV_ALIGN_BOTTOM_LEFT, 0, -4);
+    lv_obj_set_style_bg_color(noBtn, lv_color_hex(0x44505C), 0);
+    lv_obj_set_ext_click_area(noBtn, 10);
+    lv_obj_add_event_cb(noBtn, closeRestartConfirm, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *noLbl = lv_label_create(noBtn);
+    lv_label_set_text(noLbl, "Cancel");
+    lv_obj_center(noLbl);
+
+    lv_obj_t *yesBtn = lv_button_create(box);
+    lv_obj_set_size(yesBtn, 110, 36);
+    lv_obj_align(yesBtn, LV_ALIGN_BOTTOM_RIGHT, 0, -4);
+    lv_obj_set_style_bg_color(yesBtn, lv_color_hex(0x8A3A3A), 0);
+    lv_obj_set_ext_click_area(yesBtn, 10);
+    lv_obj_add_event_cb(yesBtn, onConfirmRestartYes, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *yesLbl = lv_label_create(yesBtn);
+    lv_label_set_text(yesLbl, "Restart");
+    lv_obj_center(yesLbl);
+}
+
 static void buildConfirmOverlay(lv_obj_t *parent) {
     confirmOverlay = lv_obj_create(parent);
     lv_obj_set_pos(confirmOverlay, 0, 0);
@@ -508,7 +644,7 @@ static void onRestoreDefaults(lv_event_t *) {
         SliderBinding &b = sliderBindings[i];
         lv_slider_set_value(b.slider, (int32_t)((*b.target) * b.divisor), LV_ANIM_OFF);
         char buf[24];
-        snprintf(buf, sizeof(buf), "%.1f%s", (double)(*b.target), b.unit);
+        fmtSettingVal(buf, sizeof(buf), *b.target, b.unit);
         lv_label_set_text(b.valLabel, buf);
     }
     for (int i = 0; i < switchCount; i++) {
@@ -531,7 +667,7 @@ static void onRestoreDefaults(lv_event_t *) {
 // pre-built and toggled via LV_OBJ_FLAG_HIDDEN (no rebuild/flicker on
 // switching). Whole screen fits with no scrolling; Save/Defaults stay in a
 // fixed footer visible from every category.
-static const int kCategoryCount = 3;
+static const int kCategoryCount = 4;
 static lv_obj_t *categoryPanels[kCategoryCount];
 static lv_obj_t *navButtons[kCategoryCount];
 
@@ -609,11 +745,11 @@ void buildSettingsScreen() {
     lv_obj_set_style_pad_all(navRail, 4, 0);
     lv_obj_clear_flag(navRail, LV_OBJ_FLAG_SCROLLABLE);
 
-    static const char *kCategoryNames[kCategoryCount] = {"Display", "Sensors", "WiFi"};
+    static const char *kCategoryNames[kCategoryCount] = {"Display", "Map", "Sensors", "WiFi"};
     for (int i = 0; i < kCategoryCount; i++) {
         lv_obj_t *btn = lv_button_create(navRail);
-        lv_obj_set_size(btn, NAV_W - 8, 46);
-        lv_obj_set_pos(btn, 0, i * 52);
+        lv_obj_set_size(btn, NAV_W - 8, 42);
+        lv_obj_set_pos(btn, 0, i * 48);
         lv_obj_set_style_radius(btn, 4, 0);
         lv_obj_set_ext_click_area(btn, 5); // small — buttons are stacked with only a 6px gap
         lv_obj_add_event_cb(btn, onNavCategory, LV_EVENT_CLICKED, (void *)(intptr_t)i);
@@ -651,7 +787,7 @@ void buildSettingsScreen() {
         // tra/cấu hình," not the driving screen) rather than needing rows
         // trimmed to squeeze in. The old Radar/Safety tabs that used to also
         // need scrolling here are gone entirely (radar removed 2026-09-21).
-        if (i == 1) {
+        if (i == 2) { // Sensors tab is now i == 2
             lv_obj_set_scroll_dir(panel, LV_DIR_VER);
             lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
         } else {
@@ -695,65 +831,140 @@ void buildSettingsScreen() {
     static const char *kRotationLabels[4] = {"0", "90", "180", "270"};
     addChoiceRow(categoryPanels[0], y, "Rotation", &cfg.screenRotation, kRotationLabels, 4);
 
-    // Sensors tab (categoryPanels[1]) — real-hardware check/configure
+    // Demo mode (user-requested 2026-09-22, "demo hien thi truoc de toi chinh
+    // sua") — plays a scripted tour of every Dashboard state so the UI can be
+    // reviewed without a GNSS fix or a speed-map database on the card. Built
+    // by hand rather than via addSwitchRow() for the same reason as the WiFi
+    // tab's own switch: there's no bool in cfg for the generic binding to
+    // point at, and there must not be (demo/DemoMode.h).
+    {
+        lv_obj_t *nameLbl = lv_label_create(categoryPanels[0]);
+        lv_label_set_text(nameLbl, "Demo mode (xem UI)");
+        lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
+        lv_obj_set_pos(nameLbl, 4, y + 3);
+        demoEnableSwitch = lv_switch_create(categoryPanels[0]);
+        lv_obj_set_pos(demoEnableSwitch, lv_obj_get_width(categoryPanels[0]) - 46, y);
+        // A stock lv_switch's default hit area is small (~40x20px) — same
+        // "enlarge the touch target, not just the visual size" fix this
+        // file already applies to backBtn/restoreBtn/restartBtn/saveBtn
+        // after real user reports of unresponsiveness (those all sit at a
+        // panel edge, a specifically worse region for capacitive touch;
+        // this one doesn't, but user-reported 2026-09-22 unresponsiveness
+        // here too — "gat Demo mode khong an, Settings tu thoat" — a small
+        // control is still a small control wherever it sits).
+        lv_obj_set_ext_click_area(demoEnableSwitch, 20);
+        lv_obj_add_event_cb(demoEnableSwitch, onDemoSwitchChanged, LV_EVENT_VALUE_CHANGED, NULL);
+        y += 26;
+    }
+    demoSceneVal = addReadonlyRow(categoryPanels[0], y, "Demo scene");
+
+    // -----------------------------------------------------------------
+    // Map tab (categoryPanels[1]) - Map Source (Carto / OSM) & Layers
+    // -----------------------------------------------------------------
+    y = 4;
+    // Carto is the only source with street-level detail (z14/z15); OSM &
+    // Voyager top out at coarse z13 everywhere incl. Hanoi (measured
+    // 2026-09-24), so Carto is the default and marked "HD" here to steer the
+    // user away from the low-detail ones.
+    static const char *kMapSourceLabels[3] = {"Carto HD", "OSM (co ban)", "OSM Dark"};
+    addChoiceRow(categoryPanels[1], y, "Map Source", &cfg.mapSource, kMapSourceLabels, 3);
+    addSwitchRow(categoryPanels[1], y, "Ban do JPEG (nen anh)", &cfg.showRasterMap);
+    addSwitchRow(categoryPanels[1], y, "Vector Roads overlay", &cfg.showVectorRoads);
+    addSwitchRow(categoryPanels[1], y, "Huong xe len tren (xoay)", &cfg.mapHeadingUp);
+    addSwitchRow(categoryPanels[1], y, "Vehicle Trail (track)", &cfg.showVehicleTrail);
+
+    y += 8;
+    lv_obj_t *mapHeader = lv_label_create(categoryPanels[1]);
+    lv_label_set_text(mapHeader, "SD Card Map File");
+    lv_obj_set_style_text_color(mapHeader, lv_color_hex(0x7C8A9A), 0);
+    lv_obj_set_pos(mapHeader, 4, y);
+    y += 20;
+
+    mapFileVal = addReadonlyRow(categoryPanels[1], y, "Active file");
+    mapTilesCountVal = addReadonlyRow(categoryPanels[1], y, "Tile count");
+    mapZoomVal = addReadonlyRow(categoryPanels[1], y, "Zoom range");
+    mapStatusVal = addReadonlyRow(categoryPanels[1], y, "Status");
+
+    // Sensors tab (categoryPanels[2]) — real-hardware check/configure
     // (spec 16.6/16.7). GNSS (u-blox M10N, UART2) went real 2026-09-15;
     // radar (HLK-LD2451) went real 2026-09-16 and was removed entirely
     // 2026-09-21 (GPS-only VietHUD product) — the old Radar-status/
     // Radar-tracking rows that used to live here are gone with it.
     y = 4;
     // Trip logging (added 2026-09-16, see log/TripLogger.h).
-    addSwitchRow(categoryPanels[1], y, "Trip logging (SD card)", &cfg.tripLoggingEnabled);
+    addSwitchRow(categoryPanels[2], y, "Trip logging (SD card)", &cfg.tripLoggingEnabled);
     y += 6; // extra breathing room before the real live-status rows below
 
-    lv_obj_t *sensorsHeader1 = lv_label_create(categoryPanels[1]);
+    lv_obj_t *sensorsHeader1 = lv_label_create(categoryPanels[2]);
     lv_label_set_text(sensorsHeader1, "Live status");
     lv_obj_set_style_text_color(sensorsHeader1, lv_color_hex(0x7C8A9A), 0);
     lv_obj_set_pos(sensorsHeader1, 4, y);
     y += 20;
-    gnssFixVal = addReadonlyRow(categoryPanels[1], y, "GNSS fix");
-    gnssSatsVal = addReadonlyRow(categoryPanels[1], y, "Satellites");
-    gnssSpeedRawVal = addReadonlyRow(categoryPanels[1], y, "Speed (raw)");
-    gnssSpeedFilteredVal = addReadonlyRow(categoryPanels[1], y, "Speed (filtered)");
+    gnssFixVal = addReadonlyRow(categoryPanels[2], y, "GNSS fix");
+    gnssSatsVal = addReadonlyRow(categoryPanels[2], y, "Satellites");
+    gnssSpeedRawVal = addReadonlyRow(categoryPanels[2], y, "Speed (raw)");
+    gnssSpeedFilteredVal = addReadonlyRow(categoryPanels[2], y, "Speed (filtered)");
 
     y += 6;
-    lv_obj_t *sensorsHeader2 = lv_label_create(categoryPanels[1]);
+    lv_obj_t *sensorsHeader2 = lv_label_create(categoryPanels[2]);
     lv_label_set_text(sensorsHeader2, "GNSS calibration");
     lv_obj_set_style_text_color(sensorsHeader2, lv_color_hex(0x7C8A9A), 0);
     lv_obj_set_pos(sensorsHeader2, 4, y);
     y += 20;
-    addSliderRow(categoryPanels[1], y, "Speed filter smoothing", &cfg.gnssSpeedFilterAlpha, 5, 90, 100.0f, "");
-    addSliderRow(categoryPanels[1], y, "Fix timeout", &cfg.gnssFixTimeoutS, 10, 100, 10.0f, " s");
+    addSliderRow(categoryPanels[2], y, "Speed filter smoothing", &cfg.gnssSpeedFilterAlpha, 5, 90, 100.0f, "");
+    addSliderRow(categoryPanels[2], y, "Fix timeout", &cfg.gnssFixTimeoutS, 10, 100, 10.0f, " s");
+    // GPS speed calibration + ahead-warning distances (user-requested
+    // 2026-09-22, "hieu chinh toc do GPS, khoang cach canh bao toc do/
+    // camera phia truoc") — see AppConfig.h's own comment on each field for
+    // why calibration is a percentage and why only these two distances (not
+    // every alert type) are exposed here. Both distance ranges capped at
+    // 100m max/default 2026-09-22 ("khoang cach toi da de canh bao la 100m,
+    // mac dinh la 100m") — see AppConfig.h's clampConfig() for the matching
+    // clamp.
+    addSliderRow(categoryPanels[2], y, "Speed calibration", &cfg.gnssSpeedCalibrationPct, -150, 150, 10.0f, " %");
+    // Overspeed warning threshold (was un-tunable — the field existed in
+    // AppConfig but no control reached it; exposed 2026-09-24). Warning fires
+    // when egoSpeed > limit + this offset. 0..10 km/h.
+    addSliderRow(categoryPanels[2], y, "Overspeed offset", &cfg.overspeedOffsetKmh, 0, 10, 1.0f, " km/h");
+    // Fallback speed limit shown where the map can't resolve one (0 = off/"--").
+    // Default 50 = VN urban baseline (user-requested 2026-09-24).
+    addSliderRow(categoryPanels[2], y, "Default limit (unknown)", &cfg.defaultLimitKmh, 0, 90, 1.0f, " km/h");
+    // NOTE: the old "Speed-limit-ahead dist" / "Camera warn dist" sliders were
+    // removed 2026-09-24 — they did nothing. The lookahead uses a DYNAMIC,
+    // speed-based warn distance (computeDynamicWarnDistance: ~100-600m scaling
+    // with speed) in SpeedLimitManager.cpp, not cfg.aheadLimitWarnDistM/
+    // cameraWarnDistM. Those cfg fields are now legacy/unused.
 
     // Speed Map diagnostics (spec section 25) — offline microSD map-matching
-    // status, see map/SpeedLimitManager.h. This group is why categoryPanels[1]
+    // status, see map/SpeedLimitManager.h. This group is why categoryPanels[2]
     // needs to be scrollable above: it doesn't fit in 260px alongside
     // everything already in this tab.
     y += 6;
-    lv_obj_t *sensorsHeader3 = lv_label_create(categoryPanels[1]);
+    lv_obj_t *sensorsHeader3 = lv_label_create(categoryPanels[2]);
     lv_label_set_text(sensorsHeader3, "Speed Map");
     lv_obj_set_style_text_color(sensorsHeader3, lv_color_hex(0x7C8A9A), 0);
     lv_obj_set_pos(sensorsHeader3, 4, y);
     y += 20;
-    speedMapStatusVal = addReadonlyRow(categoryPanels[1], y, "Status");
-    speedMapRegionVal = addReadonlyRow(categoryPanels[1], y, "Region");
-    speedMapVersionVal = addReadonlyRow(categoryPanels[1], y, "Version");
-    speedMapLimitVal = addReadonlyRow(categoryPanels[1], y, "Current limit");
-    speedMapSourceVal = addReadonlyRow(categoryPanels[1], y, "Source");
-    speedMapMatchVal = addReadonlyRow(categoryPanels[1], y, "Match");
-    speedMapRoadIdVal = addReadonlyRow(categoryPanels[1], y, "Road ID");
+    speedMapStatusVal = addReadonlyRow(categoryPanels[2], y, "Status");
+    speedMapRegionVal = addReadonlyRow(categoryPanels[2], y, "Region");
+    speedMapVersionVal = addReadonlyRow(categoryPanels[2], y, "Version");
+    speedMapLimitVal = addReadonlyRow(categoryPanels[2], y, "Current limit");
+    speedMapSourceVal = addReadonlyRow(categoryPanels[2], y, "Source");
+    speedMapMatchVal = addReadonlyRow(categoryPanels[2], y, "Match");
+    speedMapRoadIdVal = addReadonlyRow(categoryPanels[2], y, "Road ID");
 
     // WiFi tab (user-requested 2026-09-14 alongside the Dashboard's 4s hold
     // gesture — see net/WebPortal.h). Defaults OFF every boot; this switch
     // and the gesture both funnel through the same webPortalRequestEnable().
-    bool wifiTabNarrow = lv_obj_get_width(categoryPanels[2]) < kNarrowPanelThreshold;
+    bool wifiTabNarrow = lv_obj_get_width(categoryPanels[3]) < kNarrowPanelThreshold;
     y = 4;
     {
-        lv_obj_t *nameLbl = lv_label_create(categoryPanels[2]);
+        lv_obj_t *nameLbl = lv_label_create(categoryPanels[3]);
         lv_label_set_text(nameLbl, "WiFi enabled");
         lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
         lv_obj_set_pos(nameLbl, 4, y + 3);
-        wifiEnableSwitch = lv_switch_create(categoryPanels[2]);
-        lv_obj_set_pos(wifiEnableSwitch, lv_obj_get_width(categoryPanels[2]) - 46, y);
+        wifiEnableSwitch = lv_switch_create(categoryPanels[3]);
+        lv_obj_set_pos(wifiEnableSwitch, lv_obj_get_width(categoryPanels[3]) - 46, y);
         lv_obj_add_event_cb(wifiEnableSwitch, onWifiSwitchChanged, LV_EVENT_VALUE_CHANGED, NULL);
         y += 26;
     }
@@ -762,17 +973,17 @@ void buildSettingsScreen() {
     // threshold/reasoning as addSliderRow()'s own narrow case — the fixed
     // x=140/width=220 landscape layout below would run off the edge of a
     // ~220px-wide portrait content column otherwise.
-    lv_obj_t *ssidLbl = lv_label_create(categoryPanels[2]);
+    lv_obj_t *ssidLbl = lv_label_create(categoryPanels[3]);
     lv_label_set_text(ssidLbl, "SSID");
     lv_obj_set_style_text_color(ssidLbl, lv_color_hex(0xCCD6E0), 0);
-    wifiSsidTa = lv_textarea_create(categoryPanels[2]);
+    wifiSsidTa = lv_textarea_create(categoryPanels[3]);
     lv_textarea_set_one_line(wifiSsidTa, true);
     lv_textarea_set_max_length(wifiSsidTa, sizeof(cfg.wifiSsid) - 1);
     lv_textarea_set_text(wifiSsidTa, cfg.wifiSsid);
     if (wifiTabNarrow) {
         lv_obj_set_pos(ssidLbl, 4, y);
         lv_obj_set_pos(wifiSsidTa, 4, y + 18);
-        lv_obj_set_size(wifiSsidTa, lv_obj_get_width(categoryPanels[2]) - 8, 28);
+        lv_obj_set_size(wifiSsidTa, lv_obj_get_width(categoryPanels[3]) - 8, 28);
         y += 50;
     } else {
         lv_obj_set_pos(ssidLbl, 4, y + 6);
@@ -788,10 +999,10 @@ void buildSettingsScreen() {
     // blank and tapping elsewhere keeps the existing password unchanged —
     // onWifiKbReadyOrCancel() only overwrites cfg.wifiPassword with
     // whatever's actually typed.
-    lv_obj_t *passLbl = lv_label_create(categoryPanels[2]);
+    lv_obj_t *passLbl = lv_label_create(categoryPanels[3]);
     lv_label_set_text(passLbl, "Password");
     lv_obj_set_style_text_color(passLbl, lv_color_hex(0xCCD6E0), 0);
-    wifiPasswordTa = lv_textarea_create(categoryPanels[2]);
+    wifiPasswordTa = lv_textarea_create(categoryPanels[3]);
     lv_textarea_set_one_line(wifiPasswordTa, true);
     lv_textarea_set_password_mode(wifiPasswordTa, true);
     lv_textarea_set_max_length(wifiPasswordTa, sizeof(cfg.wifiPassword) - 1);
@@ -799,7 +1010,7 @@ void buildSettingsScreen() {
     if (wifiTabNarrow) {
         lv_obj_set_pos(passLbl, 4, y);
         lv_obj_set_pos(wifiPasswordTa, 4, y + 18);
-        lv_obj_set_size(wifiPasswordTa, lv_obj_get_width(categoryPanels[2]) - 8, 28);
+        lv_obj_set_size(wifiPasswordTa, lv_obj_get_width(categoryPanels[3]) - 8, 28);
         y += 50;
     } else {
         lv_obj_set_pos(passLbl, 4, y + 6);
@@ -809,7 +1020,7 @@ void buildSettingsScreen() {
     }
     lv_obj_add_event_cb(wifiPasswordTa, onWifiTaClicked, LV_EVENT_CLICKED, NULL);
 
-    wifiStatusVal = addWideReadonlyRow(categoryPanels[2], y, "Status");
+    wifiStatusVal = addWideReadonlyRow(categoryPanels[3], y, "Status");
 
     // NOT called eagerly here: buildSettingsScreen() runs before
     // sharedStateInit() in main_ui_demo.cpp's setup(), so
@@ -858,8 +1069,7 @@ void buildSettingsScreen() {
     lv_obj_align(restartBtn, LV_ALIGN_RIGHT_MID, -208, 0);
     lv_obj_set_style_bg_color(restartBtn, lv_color_hex(0x44505C), 0);
     lv_obj_set_ext_click_area(restartBtn, 20);
-    lv_obj_add_event_cb(
-        restartBtn, [](lv_event_t *) { ESP.restart(); }, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(restartBtn, onRestartBtnClicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t *restartLbl = lv_label_create(restartBtn);
     lv_label_set_text(restartLbl, "Restart");
     lv_obj_center(restartLbl);
@@ -886,4 +1096,5 @@ void buildSettingsScreen() {
     lv_obj_add_event_cb(wifiKeyboard, onWifiKbReadyOrCancel, LV_EVENT_CANCEL, NULL);
 
     buildConfirmOverlay(settingsScreen); // created last so it covers everything (and now the keyboard too)
+    buildRestartConfirmOverlay(settingsScreen);
 }

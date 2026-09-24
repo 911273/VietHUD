@@ -66,7 +66,7 @@ static void tripLoggerTaskFn(void *) {
             // yet at boot) rather than giving up — cheap, and losing the
             // header line forever would make the CSV harder to parse later.
             if (sdMgrAppendLine(logPath,
-                                 "tMs,egoKmh,limitValid,limitKmh,speeding,cameraAheadM,signType,signDistM,event")) {
+                                 "tMs,egoKmh,latDeg,lonDeg,headingDeg,limitValid,limitKmh,speeding,cameraAheadM,signType,signDistM,event")) {
                 headerWritten = true;
                 // Why the PREVIOUS run ended, written into this run's file
                 // — esp_reset_reason() is already read and printed at boot
@@ -109,9 +109,11 @@ static void tripLoggerTaskFn(void *) {
         bool isSample = (now - lastSampleMs) >= 1000;
 
         if (isEvent || isSample) {
-            char line[128];
-            snprintf(line, sizeof(line), "%lu,%.1f,%d,%.0f,%d,%.0f,%d,%.0f,%s", (unsigned long)now,
-                      (double)gnss.egoSpeedKmh, road.valid ? 1 : 0, road.valid ? (double)road.speedLimitKmh : -1.0,
+            char line[160];
+            snprintf(line, sizeof(line), "%lu,%.1f,%.6f,%.6f,%.1f,%d,%.0f,%d,%.0f,%d,%.0f,%s", (unsigned long)now,
+                      (double)gnss.egoSpeedKmh, (double)gnss.latDeg, (double)gnss.lonDeg,
+                      gnss.headingValid ? (double)gnss.headingDeg : -1.0,
+                      road.valid ? 1 : 0, road.valid ? (double)road.speedLimitKmh : -1.0,
                       speedingNow ? 1 : 0, cameraAheadNow ? (double)road.cameraAheadDistanceM : -1.0, signType,
                       (double)signDistM, isEvent ? "EVENT" : "");
             if (sdMgrAppendLine(logPath, line)) lastSampleMs = now;

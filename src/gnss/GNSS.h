@@ -22,6 +22,18 @@ void gnssTaskStart();
 // what's really the same underlying idea.
 static const float kGnssMotionThresholdKmh = 3.0f;
 
+// How long gnss/GNSS.cpp will keep reporting a HELD (dead-reckoned) heading
+// after the module's own live course last went invalid — added 2026-09-22
+// ("dự đoán hướng di chuyển của xe") to bridge the brief GPS-course gaps
+// that happen exactly while slowing through an intersection or crossing an
+// overpass (speed dips below kGnssMotionThresholdKmh above, or the module's
+// own course fix briefly glitches), which were costing
+// map/SpeedLimitManager.cpp its only way to tell the road ahead from a
+// crossing street right at the moment it needed to. ~6s comfortably covers
+// a slow-and-go through a junction without holding a stale heading long
+// enough to matter if the car has genuinely stopped or turned in place.
+static const uint32_t kHeadingHoldMs = 6000;
+
 // How long the vehicle has been continuously stationary, in milliseconds —
 // ui/Dashboard.cpp's auto-dim gate (user-requested 2026-09-16, "che do tu
 // giam do sang man hinh chi duoc thuc hien khi xe khong chuyen dong sau 3
