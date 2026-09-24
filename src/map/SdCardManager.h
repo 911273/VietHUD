@@ -39,6 +39,9 @@ bool sdMgrGetMetadata(SpeedMapMetadata &out);
 // Returns false if !sdMgrIsAvailable().
 bool sdMgrGetIndex(const TileIndexEntry **out, int *outCount);
 
+// Finds a TileIndexEntry by tileId, supporting both PSRAM array and on-demand file index.
+bool sdMgrFindTileEntry(uint32_t tileId, TileIndexEntry *outEntry);
+
 // Points `*out` at the in-RAM CameraPoint array loaded once at
 // sdMgrMount() time and sets *outCount — 0 (not a failure) when the card's
 // /speedmap/cameras.bin is missing or empty, since camera data is OPTIONAL
@@ -54,6 +57,13 @@ bool sdMgrGetCameras(const CameraPoint **out, int *outCount);
 // Points `*out` at the in-RAM TrafficSignPoint array loaded at boot from /speedmap/signs.bin
 bool sdMgrGetSigns(const TrafficSignPoint **out, int *outCount);
 
+// Returns the street name for a given segment id (e.g. "Đ. Nguyễn Trãi", "QL 1A")
+// or empty string if not available.
+const char *sdMgrGetSegmentRoadName(uint32_t segId);
+
+// Returns the street name for a given nameId (1-based index)
+const char *sdMgrGetRoadName(uint16_t nameId);
+
 // Reads one tile's segments out of the single packed /speedmap/tiles.bin
 // blob (format V2, 2026-09-16 — see SpeedMapFormat.h's own history note on
 // why V1's one-file-per-tile layout was abandoned) at `entry.fileOffset`,
@@ -63,6 +73,10 @@ bool sdMgrGetSigns(const TrafficSignPoint **out, int *outCount);
 // has `entry` from its own index lookup, so this never re-searches the
 // index. Returns false if the seek/read fails — SpeedLimitManager.cpp
 // treats that tile as empty (no candidates), not as a fatal error.
+
+// Reads raw bytes from any file on SD with mutex protection
+bool sdMgrReadBytes(const char *path, uint32_t offset, uint8_t *outBuf, size_t len);
+
 bool sdMgrReadTile(const TileIndexEntry &entry, RoadSegment *outBuf, int maxSegments, int *outCount);
 
 // Appends one line (a trailing '\n' is added) to a text file, creating the

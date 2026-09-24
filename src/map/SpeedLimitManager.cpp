@@ -1,7 +1,11 @@
 #include "SpeedLimitManager.h"
 #include "SdCardManager.h"
+#include "RoutePredictor.h" // Route — the forward-route engine (SD-free, unit-testable); see that header for why it's separate
+#include "core/AppConfig.h" // cfg.aheadLimitWarnDistM / cfg.cameraWarnDistM — user-tunable, see that file's own comment
 #include "core/SharedState.h"
+#include "demo/DemoMode.h" // demoModeIsEnabled() — the demo publishes instead of this task while on
 #include "gnss/GNSS.h" // kGnssMotionThresholdKmh — ahead-lookahead only runs while actually moving
+#include "MapRenderer.h" // mapRendererUpdate() — live background map, driven from this same task loop
 #include <Arduino.h>
 #include <esp_heap_caps.h>
 #include <esp_task_wdt.h>
@@ -17,7 +21,7 @@
 // tunable once real data exists to tune against" approach this project used
 // for the LD2451's own calibration before Settings > Radar existed.
 // ---------------------------------------------------------------------
-static const float kMaxMatchDistanceM = 30.0f;  // candidates farther than this from the fix aren't considered at all
+static const float kMaxMatchDistanceM = 55.0f;  // candidates farther than this from the fix aren't considered at all
 static const float kMinConfidence = 0.5f;       // below this, a match isn't trusted enough to switch to or report
 static const float kSwitchMargin = 0.15f;       // a competing road must beat the current one by this much (after the continuity bonus) to steal the match
 static const float kContinuityBonus = 0.1f;     // score bonus for staying on the road we were already matched to
@@ -30,18 +34,33 @@ static const uint32_t kMatchTimeoutMs = 8000;   // how long a low/no-confidence 
 // have silently TRUNCATED that tile's data (SdCardManager.cpp's readTile()
 // caps at the buffer size it's given, with no error) rather than failing
 // loudly, which is worse than just sizing for real data from the start.
-static const int kMaxSegmentsPerTile = 1024;
-static const int kCacheSize = 5; // current + N/S/E/W, per spec section 6
+static const int kMaxSegmentsPerTile = 2048;
+// 12, not the original 5 (current + N/S/E/W only) — bumped 2026-09-22
+// alongside speedLimitManagerGetNearbySegments() (the live background-map
+// feature): that function queries a full square grid of tiles around the
+// car (up to 3x3=9 for the map's largest ~1000m zoom, since tiles are
+// ~1113m wide at TILE_SIZE_DEG=0.01 — see tools/map_builder/
+// build_speedmap.py), including the diagonal tiles runMatch()'s own
+// "plus"-shaped 5-tile neighbor set never needed at its much smaller 30m
+// match radius. Sharing ONE cache between both consumers (rather than
+// giving the map its own second cache/loader) only works without constant
+// eviction thrashing if it's sized to hold BOTH working sets at once — 12
+// comfortably covers the live matcher's 5 (which mostly overlap the map's
+// own 9, being centered on the same car position) plus headroom for the
+// non-overlapping corners.
+static const int kCacheSize = 12;
 
-// At 512 segments x 28 bytes x 5 cached tiles = 70KB, this is PSRAM-backed
-// (heap_caps_malloc, MALLOC_CAP_SPIRAM), not a plain static array in
-// internal RAM — same reasoning main_ui_demo.cpp's LVGL draw buffers
-// deliberately do the OPPOSITE (forced into internal RAM, PSRAM too slow
-// for a per-frame render path), inverted: this cache is only touched once
-// every ~500ms (see speedLimitTaskFn()'s loop), so PSRAM's higher latency
-// is irrelevant, and freeing 70KB of the much scarcer internal RAM matters
-// more here — especially once WiFi (net/WebPortal.cpp) is toggled on,
-// which alone costs tens of KB of internal RAM.
+// At 2048 segments x 28 bytes x 12 cached tiles = ~672KB, this is
+// PSRAM-backed (heap_caps_malloc, MALLOC_CAP_SPIRAM), not a plain static
+// array in internal RAM — same reasoning main_ui_demo.cpp's LVGL draw
+// buffers deliberately do the OPPOSITE (forced into internal RAM, PSRAM too
+// slow for a per-frame render path), inverted: this cache is only touched
+// once every ~500ms (see speedLimitTaskFn()'s loop), so PSRAM's higher
+// latency is irrelevant, and freeing internal RAM matters more here —
+// especially once WiFi (net/WebPortal.cpp) is toggled on, which alone costs
+// tens of KB of internal RAM. ~672KB is still under 12% of the 5.7MB PSRAM
+// left free after the tile index (up to ~1.66MB for a real regional
+// extract) and everything else this project already keeps in PSRAM.
 struct CachedTile {
     bool valid = false;
     uint32_t tileId = 0;
@@ -140,7 +159,7 @@ struct MatchCandidate {
 };
 
 static bool evaluateSegment(const RoadSegment &seg, float fixLat, float fixLon, bool headingValid, float headingDeg,
-                             MatchCandidate &outCand) {
+                             bool headingPredicted, MatchCandidate &outCand) {
     float maxMatchDistanceM = kMaxMatchDistanceM;
 
     float startLat = seg.startLatE7 / 1e7f, startLon = seg.startLonE7 / 1e7f;
@@ -172,14 +191,14 @@ static bool evaluateSegment(const RoadSegment &seg, float fixLat, float fixLon, 
 
     float confidence;
     if (headingValid) {
-        confidence = 1.0f - dist / maxMatchDistanceM - headingErr / 90.0f;
+        float rad = headingErr * (float)M_PI / 180.0f;
+        float cosH = cosf(rad);
+        if (cosH < 0.0f) cosH = 0.0f;
+        // Strong heading alignment keeps confidence high even on wide multi-lane roads
+        confidence = (1.0f - dist / (maxMatchDistanceM * 1.25f)) * (0.30f + 0.70f * cosH);
+        if (headingPredicted && confidence > 0.85f) confidence = 0.85f;
     } else {
-        // No heading corroboration available (GNSS.cpp only reports one
-        // once moving above its own minimum-speed gate) — distance-only
-        // score, capped below kMinConfidence's usual "clearly a good match"
-        // territory so a low-speed/stationary reading can't alone promote
-        // a road to HIGH confidence.
-        confidence = 1.0f - dist / maxMatchDistanceM;
+        confidence = (1.0f - dist / maxMatchDistanceM) * 0.6f;
         if (confidence > 0.6f) confidence = 0.6f;
     }
     if (confidence < 0.0f) confidence = 0.0f;
@@ -228,25 +247,9 @@ static const CachedTile *getOrLoadTile(uint32_t tileId) {
     // sorted by tileId ascending specifically so this is valid — confirmed
     // against build_speedmap.py's build_database(), which writes entries via
     // `for tid, segs in sorted(tiles.items())`.
-    const TileIndexEntry *index;
-    int indexCount;
-    if (!sdMgrGetIndex(&index, &indexCount)) return NULL;
-    int foundIdx = -1;
-    int lo = 0, hi = indexCount - 1;
-    while (lo <= hi) {
-        int mid = lo + (hi - lo) / 2;
-        if (index[mid].tileId == tileId) {
-            foundIdx = mid;
-            break;
-        } else if (index[mid].tileId < tileId) {
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    if (foundIdx < 0) return NULL;
-
-    // Guard the extremely-unlikely case where allocateTileCache() couldn't
+    TileIndexEntry entry;
+    if (!sdMgrFindTileEntry(tileId, &entry)) return NULL;
+// Guard the extremely-unlikely case where allocateTileCache() couldn't
     // get memory for this slot at all (PSRAM AND internal RAM both
     // exhausted) — treat it the same as "tile not cached", rather than
     // writing through a null pointer.
@@ -260,7 +263,7 @@ static const CachedTile *getOrLoadTile(uint32_t tileId) {
     }
     if (!cache[victim].segments) return NULL;
     int n = 0;
-    sdMgrReadTile(index[foundIdx], cache[victim].segments, kMaxSegmentsPerTile, &n);
+    sdMgrReadTile(entry, cache[victim].segments, kMaxSegmentsPerTile, &n);
     cache[victim].valid = true;
     cache[victim].tileId = tileId;
     cache[victim].segCount = n;
@@ -269,19 +272,268 @@ static const CachedTile *getOrLoadTile(uint32_t tileId) {
 }
 
 // ---------------------------------------------------------------------
+// Nearby-segments query for map/MapRenderer.cpp's live background map (see
+// SpeedLimitManager.h's own declaration comment for why this lives here
+// rather than MapRenderer.cpp reimplementing its own tile cache). Scans a
+// full square grid of tiles (NOT the plus-shaped 5-neighbor set runMatch()
+// uses — that's sized for a 30m match radius; this needs the diagonal tiles
+// too at up to ~1000m) around (lat,lon), pre-filtering by real point-to-
+// SEGMENT distance (pointSegmentDistanceM, the same helper evaluateSegment()
+// uses for the live matcher) rather than distance from just the segment's
+// start point. The start-point-only version (until 2026-09-22) silently
+// dropped any segment whose start was >radiusM away even when the query
+// point sat right on its middle or far end — real on long segments
+// (highways especially) — which meant MapRenderer.cpp's matchedSeg lookup
+// could fail to find the very road SpeedLimitManager's own live matcher was
+// confidently on, breaking snap-to-road and the current-road highlight for
+// no GPS/heading-related reason at all. Found reviewing the whole matching
+// pipeline for the junction/overpass bug.
+bool speedLimitManagerGetNearbySegments(float lat, float lon, float radiusM, RoadSegment *out, int maxOut,
+                                         int *outCount) {
+    *outCount = 0;
+    if (!gMapLoaded) return false;
+
+    // How many tile-widths the radius spans, rounded up, so a car sitting
+    // right at a tile's edge/corner still gets every tile that could hold a
+    // segment within radiusM. tileWidthM uses the same 111320 m/deg constant
+    // toLocalMeters() already uses elsewhere in this file. In practice this
+    // is always span=1 (a 3x3=9-tile grid) for every zoom tier this project
+    // defines (max 1000m, vs. ~1113m tiles at the real TILE_SIZE_DEG=0.01 —
+    // see tools/map_builder/build_speedmap.py); the span>3 clamp is purely a
+    // defensive ceiling against a hypothetical future database built with a
+    // much smaller tileSizeDeg, not something normal operation ever hits —
+    // (2*3+1)^2=49 tiles would thrash even this enlarged cache if it ever
+    // did.
+    float tileWidthM = gMetadata.tileSizeDeg * 111320.0f;
+    int span = (int)ceilf(radiusM / tileWidthM);
+    if (span < 1) span = 1;
+    if (span > 3) span = 3;
+
+    int32_t latCell = (int32_t)((lat + 90.0f) / gMetadata.tileSizeDeg);
+    int32_t lonCell = (int32_t)((lon + 180.0f) / gMetadata.tileSizeDeg);
+
+    int n = 0;
+    for (int dLat = -span; dLat <= span && n < maxOut; dLat++) {
+        for (int dLon = -span; dLon <= span && n < maxOut; dLon++) {
+            const CachedTile *tile = getOrLoadTile(packTile(latCell + dLat, lonCell + dLon));
+            if (!tile) continue; // most candidate tiles legitimately don't exist in the database — not an error
+            for (int s = 0; s < tile->segCount && n < maxOut; s++) {
+                const RoadSegment &seg = tile->segments[s];
+                float startLat = seg.startLatE7 / 1e7f, startLon = seg.startLonE7 / 1e7f;
+                float endLat = seg.endLatE7 / 1e7f, endLon = seg.endLonE7 / 1e7f;
+                if (pointSegmentDistanceM(lat, lon, startLat, startLon, endLat, endLon) > radiusM) continue;
+                out[n++] = seg;
+            }
+        }
+    }
+    *outCount = n;
+    return true;
+}
+
+// =====================================================================
+// FORWARD-ROUTE ENGINE — adapter over map/RoutePredictor.h (added 2026-09-23)
+// ---------------------------------------------------------------------
+// The route-building / projection / arc-length-walking LOGIC now lives in the
+// standalone, SD-free, unit-testable Route class (map/RoutePredictor.h) — see
+// that header for the full rationale (it replaces the old point-based +
+// heading-cone matching that mis-picked the next sign on curves/junctions and
+// blanked the limit through a GPS gap). This adapter is the ONLY place that
+// bridges that pure Route to this module's tile cache and holds the car's live
+// position on the route, so SpeedLimitManager stays the sole SD owner
+// (RoutePredictor never touches SD; it sees road data only through the
+// SegmentProviderFn below). Call sites keep their original names
+// (routeProject / routeLimitAtDist / buildForwardRoute / ...) so the rest of
+// this file is unchanged by the extraction.
+// =====================================================================
+static const float kRouteBuildAheadM = 700.0f; // stop extending the route once it's this far ahead (covers the 600m max dynamic warn distance + margin)
+static const float kRouteLateralTolM = 35.0f;  // a camera/sign within this perpendicular distance of the route counts as "on the route"
+
+static Route gRoute;                  // the one forward-route instance this module owns
+static int gRouteCount = 0;           // mirror of gRoute.count(), kept in sync by buildForwardRoute()/resetRouteState() so call sites read a plain int
+static uint32_t gRouteHeadRoadId = 0; // road id the route was built from (its first segment)
+static float gCarDistM = 0;           // car's arc-length position along gRoute (from the route origin)
+static bool gCarOnRoute = false;      // false if the latest fix didn't project onto the route within tolerance
+
+// SegmentProvider backed by THIS module's tile cache — RoutePredictor's only
+// view of road data. Scans the 3x3 tiles around the node and returns every
+// segment incident to it in EITHER orientation, raw/unoriented (Route::build
+// does the orienting and the one-way/direction checks). Each segment is stored
+// in the tile of its START node (confirmed in build_speedmap.py's
+// build_database()), so a segment ENDING at this node starts <=~31m away —
+// always inside the 3x3 neighborhood, never missed. Dedupes by id as cheap
+// insurance against any future overlapping-tile duplication.
+static int routeSegmentProvider(int32_t nodeLatE7, int32_t nodeLonE7, RoadSegment *out, int maxOut, void *ctx) {
+    (void)ctx;
+    int32_t latCell = (int32_t)((nodeLatE7 / 1e7f + 90.0f) / gMetadata.tileSizeDeg);
+    int32_t lonCell = (int32_t)((nodeLonE7 / 1e7f + 180.0f) / gMetadata.tileSizeDeg);
+    int n = 0;
+    for (int dLat = -1; dLat <= 1; dLat++) {
+        for (int dLon = -1; dLon <= 1; dLon++) {
+            const CachedTile *tile = getOrLoadTile(packTile(latCell + dLat, lonCell + dLon));
+            if (!tile) continue;
+            for (int s = 0; s < tile->segCount && n < maxOut; s++) {
+                const RoadSegment &c = tile->segments[s];
+                bool startsHere = (c.startLatE7 == nodeLatE7 && c.startLonE7 == nodeLonE7);
+                bool endsHere = (c.endLatE7 == nodeLatE7 && c.endLonE7 == nodeLonE7);
+                if (!startsHere && !endsHere) continue;
+                bool dup = false;
+                for (int k = 0; k < n; k++) {
+                    if (out[k].id == c.id) { dup = true; break; }
+                }
+                if (dup) continue;
+                out[n++] = c;
+            }
+        }
+    }
+    return n;
+}
+
+static float routeTotalLenM() { return gRoute.totalLenM(); }
+
+static bool routeProject(float lat, float lon, float lateralTolM, float *outDistM, float *outLat, float *outLon,
+                         float *outHeadingDeg = NULL) {
+    return gRoute.project(lat, lon, lateralTolM, outDistM, outLat, outLon, outHeadingDeg);
+}
+
+static bool routeFindAheadLimitChange(float fromDistM, float currentLimitKmh, float maxM, float &outDistM,
+                                      float &outLimitKmh) {
+    return gRoute.limitChangeAhead(fromDistM, currentLimitKmh, maxM, outDistM, outLimitKmh);
+}
+
+static bool routeLimitAtDist(float distM, float &outLimitKmh) { return gRoute.limitAt(distM, outLimitKmh); }
+
+// Build (or rebuild) the forward route from the matched segment. Cheap enough
+// to run on demand; the caller decides when (head-road change, or running low
+// on built-ahead route) — see runMatch().
+static void buildForwardRoute(const RoadSegment &startSeg, float startHeading) {
+    gRouteHeadRoadId = startSeg.id;
+    gRouteCount = gRoute.build(startSeg, startHeading, kRouteBuildAheadM, routeSegmentProvider, NULL);
+}
+
+// Update the car's arc-length position on the current route from a fresh fix.
+// Returns true if the fix projected onto the route (so gCarDistM/gCarOnRoute
+// are meaningful this tick); on success routeLimitAtDist(gCarDistM) is a
+// reliable current-limit source even if runMatch()'s per-segment scoring
+// wobbled or matched an untagged segment.
+static bool routeUpdateCarPosition(float lat, float lon) {
+    float dist, snapLat, snapLon;
+    if (gRoute.project(lat, lon, kRouteLateralTolM * 1.5f, &dist, &snapLat, &snapLon)) {
+        gCarDistM = dist;
+        gCarOnRoute = true;
+        return true;
+    }
+    gCarOnRoute = false;
+    return false;
+}
+
+// Clears all route state — used after the synthetic self-test so it doesn't
+// seed the first real match with a route anchored where the car isn't.
+static void resetRouteState() {
+    gRoute.reset();
+    gRouteCount = 0;
+    gRouteHeadRoadId = 0;
+    gCarDistM = 0;
+    gCarOnRoute = false;
+}
+
+
+// ---------------------------------------------------------------------
 // Top-level match — reads lastPublished (previous tick's result) for the
 // hold-on-low-confidence behavior but never writes it; the caller (the task
 // loop, or runSelfTest()) owns updating lastPublished after each call. See
 // SpeedLimitManager.h's file comment and the plan for the overall flow.
 // ---------------------------------------------------------------------
+// Hold the last known-good match for up to kMatchTimeoutMs — shared by
+// "still have a fix but nothing scored well enough this tick" and "fix
+// dropped out entirely" (see runMatch()'s two call sites below). Originally
+// only the first case held anything (spec section 17/32); fix loss used to
+// return UNKNOWN immediately (spec section 30's original reasoning: don't
+// show a possibly-wrong value without a real position). Extended
+// 2026-09-22 to also cover a brief total fix loss — user-reported: real
+// underpasses (hầm chui) often lose GPS fix completely for a few seconds,
+// which used to blank the speed-limit display exactly there even though the
+// road (and its limit) obviously hasn't changed underground. Same
+// kMatchTimeoutMs cap as before bounds how long a stale value can survive —
+// this is a display convenience for a SHORT gap, not a claim of continued
+// certainty.
+static void holdLastKnownMatch(RoadInfoSnapshot &out) {
+    if (currentRoadId != 0 && millis() - lastValidMs < kMatchTimeoutMs) {
+        out.valid = lastPublished.valid;
+        out.speedLimitKmh = lastPublished.speedLimitKmh;
+        out.source = lastPublished.source;
+        out.confidence = lastPublished.confidence;
+        out.roadId = currentRoadId;
+        out.matchDistanceM = -1;
+        strncpy(out.roadName, lastPublished.roadName, sizeof(out.roadName) - 1);
+        out.roadName[sizeof(out.roadName) - 1] = '\0';
+    }
+}
+
+// --- GPS-gap dead-reckoning along the route (issue #3, 2026-09-23) ---
+// While the fix is lost, the old code held the last value for kMatchTimeoutMs
+// then blanked. But the car is still driving the SAME route — so instead of
+// freezing, advance the car's arc-length position along the persisted forward
+// route using its last known speed. The limit (and ahead warnings) then follow
+// the ROUTE, not the last point: through a tunnel the displayed limit stays
+// correct and even updates if the route's limit changes ahead, and the moment
+// GPS returns the fresh fix simply re-snaps onto (or rebuilds) that route.
+// Bounded by kDeadReckonMaxMs so a long/ambiguous outage can't carry the car
+// arbitrarily far on a guess — past that we honestly fall back to hold/blank.
+static const uint32_t kDeadReckonMaxMs = 20000; // dead-reckon at most ~20s into a GPS gap
+static float gLastKnownSpeedKmh = 0;            // last filtered speed while we had a fix
+static uint32_t gFixLostMs = 0;                 // millis() when the current fix gap began (0 = have fix)
+static uint32_t gLastDeadReckonMs = 0;          // last dead-reckon step's timestamp (0 = none yet this gap)
+
+// Advance gCarDistM along the route by the distance covered since the last
+// tick, using the last known speed. Returns true if the car is still on the
+// built route (so routeLimitAtDist(gCarDistM) is meaningful).
+static bool deadReckonAlongRoute(uint32_t nowMs) {
+    if (gRouteCount == 0 || !gCarOnRoute) return false;
+    if (nowMs - gFixLostMs > kDeadReckonMaxMs) return false;
+    float dtSec = gLastDeadReckonMs ? (float)(nowMs - gLastDeadReckonMs) / 1000.0f : 0.0f;
+    gLastDeadReckonMs = nowMs;
+    if (dtSec <= 0 || dtSec > 2.0f) return gCarOnRoute; // skip a suspiciously large first/stalled step
+    gCarDistM += (gLastKnownSpeedKmh / 3.6f) * dtSec;
+    if (gCarDistM > gRoute.totalLenM()) {
+        // Ran off the far end of the built route — stop advancing; the limit at
+        // the end is the best honest guess (routeLimitAtDist clamps to last).
+        gCarDistM = gRoute.totalLenM();
+    }
+    return true;
+}
+
 static void runMatch(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
     out.mapLoaded = true;
 
-    // Spec section 30: no fix means UNKNOWN immediately, no holding a
-    // stale value — a fundamentally different situation from "still have a
-    // fix but the map match briefly got noisy" (the timeout/hold logic
-    // below), so this returns early rather than flowing into it.
-    if (!gnss.fix) return;
+    if (!gnss.fix) {
+        uint32_t nowMs = millis();
+        if (gFixLostMs == 0) gFixLostMs = nowMs; // mark the start of this gap
+        // Try to keep the limit alive from the route (dead-reckoned forward);
+        // fall back to the short hold only if there's no usable route.
+        bool drOk = deadReckonAlongRoute(nowMs);
+        if (drOk) {
+            float rl;
+            if (routeLimitAtDist(gCarDistM, rl)) {
+                out.valid = true;
+                out.speedLimitKmh = rl;
+                out.source = SPEED_SOURCE_OSM_MAXSPEED;
+                out.roadId = currentRoadId;
+                out.confidence = lastPublished.confidence;
+                out.matchDistanceM = -1;
+                strncpy(out.roadName, lastPublished.roadName, sizeof(out.roadName) - 1);
+                out.roadName[sizeof(out.roadName) - 1] = '\0';
+                return;
+            }
+        }
+        holdLastKnownMatch(out);
+        return;
+    }
+    // We have a fix: end any gap, record the live speed for future
+    // dead-reckoning, and clear the dead-reckon step clock so the first step of
+    // the NEXT gap measures from that gap's start, not a stale timestamp.
+    gFixLostMs = 0;
+    gLastDeadReckonMs = 0;
+    gLastKnownSpeedKmh = gnss.egoSpeedKmh;
 
     int32_t latCell = (int32_t)((gnss.latDeg + 90.0f) / gMetadata.tileSizeDeg);
     int32_t lonCell = (int32_t)((gnss.lonDeg + 180.0f) / gMetadata.tileSizeDeg);
@@ -293,6 +545,12 @@ static void runMatch(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
     bool haveBest = false;
     MatchCandidate bestForCurrentRoad = {};
     bool haveCurrentRoad = false;
+    // Capture the full RoadSegment behind whichever candidate wins, so the
+    // forward-route engine below can chain ahead from it (MatchCandidate only
+    // keeps the id/limit, not the geometry). These are copies out of the tile
+    // cache, which stays valid for the whole tick.
+    RoadSegment bestSeg = {};
+    RoadSegment bestForCurrentRoadSeg = {};
 
     for (int i = 0; i < 5; i++) {
         const CachedTile *tile = getOrLoadTile(tileIds[i]);
@@ -300,44 +558,65 @@ static void runMatch(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
         for (int s = 0; s < tile->segCount; s++) {
             MatchCandidate cand;
             if (!evaluateSegment(tile->segments[s], gnss.latDeg, gnss.lonDeg, gnss.headingValid, gnss.headingDeg,
-                                  cand))
+                                  gnss.headingPredicted, cand))
                 continue;
             if (cand.roadId == currentRoadId) {
                 bestForCurrentRoad = cand;
+                bestForCurrentRoadSeg = tile->segments[s];
                 haveCurrentRoad = true;
             }
             if (!haveBest || cand.confidence > best.confidence) {
                 best = cand;
+                bestSeg = tile->segments[s];
                 haveBest = true;
             }
         }
     }
 
     MatchCandidate chosen;
+    RoadSegment chosenSeg = {};
     bool haveChosen = false;
     if (haveBest) {
-        // Hysteresis + continuity (spec section 15, test 3): stay on the
-        // road we're already matched to unless a competitor clearly beats
-        // it even after this road gets its continuity bonus.
-        if (haveCurrentRoad && (bestForCurrentRoad.confidence + kContinuityBonus) >= (best.confidence - kSwitchMargin)) {
+        // Check if vehicle is actively turning onto a different road
+        bool turningOntoNewRoad = false;
+        if (haveCurrentRoad && best.roadId != currentRoadId) {
+            // If competitor road has much better heading alignment or current road confidence is failing
+            if (best.confidence > bestForCurrentRoad.confidence + 0.08f || bestForCurrentRoad.confidence < 0.40f) {
+                turningOntoNewRoad = true;
+            }
+        }
+
+        if (haveCurrentRoad && !turningOntoNewRoad && (bestForCurrentRoad.confidence + kContinuityBonus) >= (best.confidence - kSwitchMargin)) {
             chosen = bestForCurrentRoad;
+            chosenSeg = bestForCurrentRoadSeg;
         } else {
             chosen = best;
+            chosenSeg = bestSeg;
         }
         haveChosen = true;
     }
 
-    if (!haveChosen || chosen.confidence < kMinConfidence) {
-        // Nothing usable this tick — hold the previous valid result briefly
-        // (spec section 17) rather than flapping to UNKNOWN on one noisy
-        // sample, but only up to kMatchTimeoutMs (spec section 32).
-        if (currentRoadId != 0 && millis() - lastValidMs < kMatchTimeoutMs) {
-            out.valid = lastPublished.valid;
-            out.speedLimitKmh = lastPublished.speedLimitKmh;
-            out.source = lastPublished.source;
-            out.confidence = lastPublished.confidence;
-            out.roadId = currentRoadId;
-            out.matchDistanceM = -1;
+    if (!haveChosen || (chosen.confidence < kMinConfidence && (!haveBest || best.confidence < 0.38f))) {
+        // Even though the per-fix segment match failed this tick, try to keep
+        // the limit alive from the forward route built on a recent good match —
+        // the car is still (almost certainly) on that route, this is just a
+        // transient positioning wobble (or the first fix back after a GPS gap,
+        // which often lands slightly off before it settles). Project THIS fresh
+        // fix onto the route and read the limit at the car's new arc position.
+        // This is the route-based half of the GPS-gap fix: the limit comes back
+        // the instant a position does, without waiting to drive over a fresh
+        // segment or sign.
+        holdLastKnownMatch(out);
+        float d, sl, sn;
+        if (gRouteCount > 0 && routeProject(gnss.latDeg, gnss.lonDeg, kRouteLateralTolM * 2.0f, &d, &sl, &sn)) {
+            gCarDistM = d;
+            gCarOnRoute = true;
+            float rl;
+            if (routeLimitAtDist(d, rl)) {
+                out.valid = true;
+                out.speedLimitKmh = rl;
+                out.source = SPEED_SOURCE_OSM_MAXSPEED;
+            }
         }
         return;
     }
@@ -346,39 +625,82 @@ static void runMatch(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
     currentConfidence = chosen.confidence;
     lastValidMs = millis();
 
+    // --- Forward route: build it from the chosen segment, then snap the car.
+    // Rebuild when the head segment changes (we turned onto a new road) or the
+    // car has drifted kRouteRebuildDistM along/off the existing route;
+    // otherwise just refresh the car's arc-length position (cheap projection).
+    bool needRebuild = (gRouteCount == 0) || (gRouteHeadRoadId != chosen.roadId);
+    if (!needRebuild) {
+        // If the car projects onto the existing route and hasn't run off its
+        // far end, reuse it. Otherwise rebuild.
+        float d, sl, sn;
+        if (routeProject(gnss.latDeg, gnss.lonDeg, kRouteLateralTolM * 1.5f, &d, &sl, &sn)) {
+            // Moved far enough along that we'd want fresh segments ahead?
+            needRebuild = (routeTotalLenM() - d) < (kRouteBuildAheadM * 0.4f);
+        } else {
+            needRebuild = true; // off the route entirely
+        }
+    }
+    if (needRebuild) {
+        float hd = gnss.headingValid ? gnss.headingDeg : (float)chosenSeg.headingDeg;
+        buildForwardRoute(chosenSeg, hd);
+    }
+    routeUpdateCarPosition(gnss.latDeg, gnss.lonDeg);
+
     out.roadId = chosen.roadId;
     out.confidence = chosen.confidence;
     out.matchDistanceM = chosen.distanceM;
     out.source = chosen.source;
+    const char *stName = sdMgrGetSegmentRoadName(chosen.roadId);
+    if (stName && stName[0]) {
+        strncpy(out.roadName, stName, sizeof(out.roadName) - 1);
+        out.roadName[sizeof(out.roadName) - 1] = '\0';
+    } else {
+        out.roadName[0] = '\0';
+    }
     if (chosen.speedLimitKmh >= 0) {
         out.valid = true;
         out.speedLimitKmh = (float)chosen.speedLimitKmh;
     } else {
-        // Matched a real road, just one with no known speed limit tag —
-        // still an honest UNKNOWN for display, not a fabricated number.
-        out.valid = false;
-        out.speedLimitKmh = -1;
+        // Matched a real road, just one with no known speed limit tag on this
+        // exact segment — but the route around it is fully tagged (every
+        // segment in this dataset carries a limit), so recover the limit from
+        // the car's arc-length position on the route rather than showing a
+        // blank. Falls back to an honest UNKNOWN only if the route can't say
+        // either.
+        float rl;
+        if (gCarOnRoute && routeLimitAtDist(gCarDistM, rl)) {
+            out.valid = true;
+            out.speedLimitKmh = rl;
+            out.source = SPEED_SOURCE_OSM_MAXSPEED;
+        } else {
+            out.valid = false;
+            out.speedLimitKmh = -1;
+        }
     }
 }
 
 // ---------------------------------------------------------------------
 // Upcoming speed-limit-change lookahead (user-requested 2026-09-21, "bo
 // sung chuc nang canh bao gioi han toc do doan duong tiep theo, bao truoc
-// khoang 100m"). Projects a point kAheadLookaheadM ahead along the current
-// heading (same flat-earth approximation as toLocalMeters above, inverted —
-// fine at this short a range) and runs the SAME segment-matching scoring
-// the live position match uses (evaluateSegment/getOrLoadTile), just
+// khoang 100m"). Projects a point cfg.aheadLimitWarnDistM ahead along the
+// current heading (same flat-earth approximation as toLocalMeters above,
+// inverted — fine at this short a range) and runs the SAME segment-matching
+// scoring the live position match uses (evaluateSegment/getOrLoadTile), just
 // anchored at that projected point instead of the real fix. Deliberately
 // no hysteresis/continuity/hold-timeout the way runMatch()'s live tracking
 // has: this is a one-shot snapshot query, recomputed fresh every tick, not
 // a continuously-tracked state — a transient bad read here just means one
 // tick without an ahead-warning, not a wrong CURRENT-road decision.
-static const float kAheadLookaheadM = 100.0f;
-
-static bool matchAheadPoint(const GnssSnapshot &gnss, MatchCandidate &outBest) {
+// User-tunable (2026-09-22, "hieu chinh khoang cach canh bao toc do phia
+// truoc") — was a fixed 100m constant here, now AppConfig.h's
+// cfg.aheadLimitWarnDistM (Settings > Sensors), clamped 50-300m, which is
+// the FARTHEST this scans rather than the single distance it samples; see
+// findAheadLimitChange() below.
+static bool matchAheadPoint(const GnssSnapshot &gnss, float lookaheadM, MatchCandidate &outBest) {
     float rad = gnss.headingDeg * (float)M_PI / 180.0f;
-    float dx = kAheadLookaheadM * sinf(rad);  // east component
-    float dy = kAheadLookaheadM * cosf(rad);  // north component
+    float dx = lookaheadM * sinf(rad);  // east component
+    float dy = lookaheadM * cosf(rad);  // north component
     float aheadLat = gnss.latDeg + dy / 110540.0f;
     float aheadLon = gnss.lonDeg + dx / (111320.0f * cosf(gnss.latDeg * (float)M_PI / 180.0f));
 
@@ -394,7 +716,8 @@ static bool matchAheadPoint(const GnssSnapshot &gnss, MatchCandidate &outBest) {
         if (!tile) continue;
         for (int s = 0; s < tile->segCount; s++) {
             MatchCandidate cand;
-            if (!evaluateSegment(tile->segments[s], aheadLat, aheadLon, gnss.headingValid, gnss.headingDeg, cand))
+            if (!evaluateSegment(tile->segments[s], aheadLat, aheadLon, gnss.headingValid, gnss.headingDeg,
+                                  gnss.headingPredicted, cand))
                 continue;
             if (!haveBest || cand.confidence > outBest.confidence) {
                 outBest = cand;
@@ -403,6 +726,64 @@ static bool matchAheadPoint(const GnssSnapshot &gnss, MatchCandidate &outBest) {
         }
     }
     return haveBest && outBest.confidence >= kMinConfidence && outBest.speedLimitKmh >= 0;
+}
+
+// Straight-line fallback (the pre-2026-09-23 behavior), used ONLY when there's
+// no forward route to walk (route build failed / car off-network). Walks
+// OUTWARD from the vehicle in fixed steps and reports how far away the speed
+// limit first differs from the current one. Quantized to `step` (20m at the
+// default 100m range), so it ticks down 100 -> 80 -> 60 rather than sliding.
+static const int kMaxAheadSamples = 8;
+static const float kMinAheadStepM = 20.0f;
+
+// Dynamic warning distance based on vehicle speed:
+// Minimum 100m. Scales smoothly with vehicle speed (lead time ~14-15s: ~4.5m per km/h).
+// e.g.: <=22 km/h -> 100m, 50 km/h -> 225m, 60 km/h -> 270m, 80 km/h -> 360m, 100 km/h -> 450m, 120 km/h -> 540m (capped at 600m).
+float computeDynamicWarnDistance(float speedKmh) {
+    float d = speedKmh * 4.5f;
+    if (d < 100.0f) d = 100.0f; // Minimum 100m
+    if (d > 600.0f) d = 600.0f; // Maximum 600m
+    return d;
+}
+
+static bool findAheadLimitChangeStraight(const GnssSnapshot &gnss, float currentLimitKmh, float &outDistM,
+                                         float &outLimitKmh) {
+    float maxM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+    float step = maxM / (float)kMaxAheadSamples;
+    if (step < kMinAheadStepM) step = kMinAheadStepM;
+    for (float d = step; d <= maxM + 0.01f; d += step) {
+        MatchCandidate cand;
+        if (!matchAheadPoint(gnss, d, cand)) continue; // no confident match at this sample — not evidence of a change
+        if ((float)cand.speedLimitKmh != currentLimitKmh) {
+            outDistM = d;
+            outLimitKmh = (float)cand.speedLimitKmh;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ROUTE-BASED ahead-limit lookahead (2026-09-23). Walks the forward route from
+// the car's arc-length position and reports the first segment whose speed limit
+// differs from the current one, with its true remaining distance. Unlike the
+// straight-line version above, this follows the actual road through curves and
+// junctions, so the "limit ahead" is the one the car will really reach — not
+// one on a parallel road the straight projection happened to clip. Falls back
+// to the straight-line scan when there's no usable route.
+static bool findAheadLimitChange(const GnssSnapshot &gnss, float currentLimitKmh, float &outDistM,
+                                  float &outLimitKmh) {
+    float maxM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+    if (gRouteCount > 0 && gCarOnRoute) {
+        if (routeFindAheadLimitChange(gCarDistM, currentLimitKmh, maxM, outDistM, outLimitKmh)) {
+            return true;
+        }
+        // Route exists and we walked it fully — no change ahead within the
+        // built route. Don't fall through to the straight-line scan: it would
+        // project off-road past the route's end and invent a change on some
+        // crossing street. No change is the honest answer.
+        return false;
+    }
+    return findAheadLimitChangeStraight(gnss, currentLimitKmh, outDistM, outLimitKmh);
 }
 
 // ---------------------------------------------------------------------
@@ -416,23 +797,70 @@ static bool matchAheadPoint(const GnssSnapshot &gnss, MatchCandidate &outBest) {
 // Completely independent of runMatch()'s own road-segment result/
 // hysteresis state: a camera can be "ahead" whether or not the current
 // road segment itself matched.
-static const float kCameraWarnDistanceM = 300.0f; // start warning this far out — real turn-by-turn nav apps commonly warn 200-500m before a camera
-static const float kCameraBearingToleranceDeg = 60.0f; // how far off dead-ahead a camera can be and still count as "ahead" rather than off to the side/behind
+// User-tunable (2026-09-22, "hieu chinh khoang cach canh bao camera phia
+// truoc") — was a fixed 300m constant here, now AppConfig.h's
+// cfg.cameraWarnDistM (Settings > Sensors), clamped 100-800m; real
+// turn-by-turn nav apps commonly warn 200-500m before a camera, hence that
+// default and range.
+static const float kCameraBearingToleranceDeg = 60.0f; // how far off dead-ahead a camera can be and still count as "ahead" rather than off to the side/behind (straight-line fallback only)
 
-static void matchCameraAhead(const GnssSnapshot &gnss, const RoadInfoSnapshot &roadMatch, RoadInfoSnapshot &out) {
-    if (!gnss.fix || !gnss.headingValid) return; // same "don't guess direction without a trustworthy heading" gate the ahead-limit lookahead above uses
+// ROUTE-BASED camera lookahead (2026-09-23). Projects each camera onto the
+// forward route and keeps the NEAREST one AHEAD of the car by arc length, so
+// the reported distance is how far you actually drive to reach it (around
+// curves, through junctions), not a straight-line range that miscounts on a
+// bend. The lateral tolerance keeps a camera on a parallel/adjacent road from
+// being picked up. Falls back to the old bearing-cone scan when there's no
+// usable route.
+static void matchCameraAheadRoute(const GnssSnapshot &gnss, const RoadInfoSnapshot &roadMatch, RoadInfoSnapshot &out) {
     const CameraPoint *cams;
     int camCount;
     sdMgrGetCameras(&cams, &camCount);
     if (camCount == 0) return;
 
+    float warnDistM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+    float bestAheadDistM = 1e9f;
+    const CameraPoint *best = NULL;
+
+    // Bounding-box prefilter around the car, then project onto the route.
+    float dLatMax = (warnDistM + kRouteLateralTolM) / 110540.0f + 0.0005f;
+    for (int i = 0; i < camCount; i++) {
+        float camLat = cams[i].latE7 / 1e7f, camLon = cams[i].lonE7 / 1e7f;
+        if (fabsf(camLat - gnss.latDeg) > dLatMax) continue;
+        Vec2 p = toLocalMeters(camLat, camLon, gnss.latDeg, gnss.lonDeg);
+        if (sqrtf(p.x * p.x + p.y * p.y) > warnDistM + kRouteLateralTolM) continue;
+
+        float camArc, snapLat, snapLon;
+        if (!routeProject(camLat, camLon, kRouteLateralTolM, &camArc, &snapLat, &snapLon)) continue;
+        float aheadDist = camArc - gCarDistM;     // remaining route distance to the camera
+        if (aheadDist < 0) continue;             // behind the car
+        if (aheadDist > warnDistM) continue;     // beyond the warn horizon
+        if (aheadDist < bestAheadDistM) {
+            bestAheadDistM = aheadDist;
+            best = &cams[i];
+        }
+    }
+    if (!best) return;
+
+    out.cameraAheadValid = true;
+    out.cameraAheadDistanceM = bestAheadDistM;
+    out.cameraSpeedLimitKmh = (best->speedLimitKmh >= 0) ? (float)best->speedLimitKmh
+                               : (roadMatch.valid ? roadMatch.speedLimitKmh : -1.0f);
+}
+
+static void matchCameraAheadStraight(const GnssSnapshot &gnss, const RoadInfoSnapshot &roadMatch, RoadInfoSnapshot &out) {
+    const CameraPoint *cams;
+    int camCount;
+    sdMgrGetCameras(&cams, &camCount);
+    if (camCount == 0) return;
+
+    float warnDistM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
     float bestDistM = 1e9f;
     const CameraPoint *best = NULL;
     for (int i = 0; i < camCount; i++) {
         float camLat = cams[i].latE7 / 1e7f, camLon = cams[i].lonE7 / 1e7f;
         Vec2 p = toLocalMeters(camLat, camLon, gnss.latDeg, gnss.lonDeg); // camera's offset FROM the fix
         float distM = sqrtf(p.x * p.x + p.y * p.y);
-        if (distM > kCameraWarnDistanceM || distM >= bestDistM) continue; // already farther than the current best — skip the trig below for it
+        if (distM > warnDistM || distM >= bestDistM) continue; // already farther than the current best — skip the trig below for it
         float bearingToCameraDeg = atan2f(p.x, p.y) * (180.0f / (float)M_PI); // 0=north/clockwise, same convention as headingDeg
         if (bearingToCameraDeg < 0) bearingToCameraDeg += 360.0f;
         if (angularDiffDeg(gnss.headingDeg, bearingToCameraDeg) > kCameraBearingToleranceDeg) continue;
@@ -447,73 +875,45 @@ static void matchCameraAhead(const GnssSnapshot &gnss, const RoadInfoSnapshot &r
                                : (roadMatch.valid ? roadMatch.speedLimitKmh : -1.0f);
 }
 
-static const float kSignWarnDistanceM = 350.0f;
-static const float kSignBearingToleranceDeg = 50.0f;
+static void matchCameraAhead(const GnssSnapshot &gnss, const RoadInfoSnapshot &roadMatch, RoadInfoSnapshot &out) {
+    if (!gnss.fix) return;
+    // A usable route makes "ahead" mean along-the-road; without one we need a
+    // trustworthy heading for the straight-line bearing cone.
+    if (gRouteCount > 0 && gCarOnRoute) {
+        matchCameraAheadRoute(gnss, roadMatch, out);
+    } else if (gnss.headingValid) {
+        matchCameraAheadStraight(gnss, roadMatch, out);
+    }
+}
 
-static void matchSignsAhead(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
-    if (!gnss.fix || !gnss.headingValid) return;
-    const TrafficSignPoint *signs;
-    int signCount;
-    sdMgrGetSigns(&signs, &signCount);
-    if (signCount == 0) return;
+// kSignWarnDistanceM now lives in SpeedLimitManager.h — ui/Dashboard.cpp
+// needs the same number for its distance-reactive alert card; see the
+// header for why it's shared rather than duplicated.
+static const float kSignBearingToleranceDeg = 50.0f; // straight-line fallback only
 
-    float closestSignDistM = 1e9f;
-    const TrafficSignPoint *closestSign = NULL;
+// Shared tail for both sign-lookahead variants (route-based and straight-line
+// fallback): takes the nearest-ahead sign of each type that the scan found and
+// writes it into the snapshot, remembers the last speed-limit sign actually
+// passed (for the no-tag fallback below), and applies the fallback current-limit
+// logic. Factored out 2026-09-23 so the route rewrite and the old bearing-cone
+// path can't drift apart in how they populate the same fields.
+static void fillSignResults(RoadInfoSnapshot &out, const TrafficSignPoint *bestSpeedSign, float bestSpeedDistM,
+                            const TrafficSignPoint *bestResident, float bestResidentDistM,
+                            const TrafficSignPoint *bestNoOvertake, float bestNoOvertakeDistM,
+                            const TrafficSignPoint *bestToll, float bestTollDistM, const TrafficSignPoint *bestLight,
+                            float bestLightDistM, const TrafficSignPoint *bestDanger, float bestDangerDistM,
+                            const TrafficSignPoint *closestSign, float closestSignDistM) {
+    static float sLastPassedSpeedLimit = -1.0f;
+    static uint32_t sLastPassedSpeedLimitMs = 0;
 
-    float bestResidentDistM = 1e9f;
-    const TrafficSignPoint *bestResident = NULL;
+    if (bestSpeedSign) {
+        out.aheadLimitValid = true;
+        out.aheadSpeedLimitKmh = (float)bestSpeedSign->speedLimitKmh;
+        out.aheadDistanceM = bestSpeedDistM;
 
-    float bestNoOvertakeDistM = 1e9f;
-    const TrafficSignPoint *bestNoOvertake = NULL;
-
-    float bestTollDistM = 1e9f;
-    const TrafficSignPoint *bestToll = NULL;
-
-    float bestLightDistM = 1e9f;
-    const TrafficSignPoint *bestLight = NULL;
-
-    for (int i = 0; i < signCount; i++) {
-        float signLat = signs[i].latE7 / 1e7f;
-        float signLon = signs[i].lonE7 / 1e7f;
-
-        // Fast bounding box check (lat/lon)
-        float dLat = fabsf(signLat - gnss.latDeg);
-        if (dLat > 0.005f) continue; // ~550m
-
-        Vec2 p = toLocalMeters(signLat, signLon, gnss.latDeg, gnss.lonDeg);
-        float distM = sqrtf(p.x * p.x + p.y * p.y);
-        if (distM > kSignWarnDistanceM) continue;
-
-        // Check bearing to sign from car
-        float bearingToSignDeg = atan2f(p.x, p.y) * (180.0f / (float)M_PI);
-        if (bearingToSignDeg < 0) bearingToSignDeg += 360.0f;
-        if (angularDiffDeg(gnss.headingDeg, bearingToSignDeg) > kSignBearingToleranceDeg) continue;
-
-        // Also check sign's own orientation if tagged
-        if (signs[i].directionDeg != 0xFFFF) {
-            if (angularDiffDeg(gnss.headingDeg, signs[i].directionDeg) > 60.0f) {
-                continue; // Sign faces away or perpendicular to car's travel lane
-            }
-        }
-
-        if (distM < closestSignDistM) {
-            closestSignDistM = distM;
-            closestSign = &signs[i];
-        }
-
-        // Category sorting
-        if (signs[i].signType == SIGN_TYPE_RESIDENT_AREA && distM < bestResidentDistM) {
-            bestResidentDistM = distM;
-            bestResident = &signs[i];
-        } else if (signs[i].signType == SIGN_TYPE_NO_OVERTAKING && distM < bestNoOvertakeDistM) {
-            bestNoOvertakeDistM = distM;
-            bestNoOvertake = &signs[i];
-        } else if (signs[i].signType == SIGN_TYPE_TOLL_BOOTH && distM < bestTollDistM) {
-            bestTollDistM = distM;
-            bestToll = &signs[i];
-        } else if (signs[i].signType == SIGN_TYPE_TRAFFIC_LIGHT && distM < bestLightDistM) {
-            bestLightDistM = distM;
-            bestLight = &signs[i];
+        if (bestSpeedDistM < 35.0f) {
+            sLastPassedSpeedLimit = (float)bestSpeedSign->speedLimitKmh;
+            sLastPassedSpeedLimitMs = millis();
         }
     }
 
@@ -535,11 +935,249 @@ static void matchSignsAhead(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
         out.trafficLightAheadValid = true;
         out.trafficLightAheadDistM = bestLightDistM;
     }
+    if (bestDanger) {
+        out.dangerAheadValid = true;
+        out.dangerAheadDistM = bestDangerDistM;
+    }
     if (closestSign) {
         out.nextSignType = closestSign->signType;
         out.nextSignDistanceM = closestSignDistM;
         out.nextSignSpeedLimit = closestSign->speedLimitKmh;
     }
+
+    // Fallback speed limit when OSM segment has no maxspeed tag
+    if (!out.valid) {
+        if (sLastPassedSpeedLimit > 0 && (millis() - sLastPassedSpeedLimitMs < 300000)) {
+            // Use recently passed speed limit sign (active within last 5 minutes)
+            out.valid = true;
+            out.speedLimitKmh = sLastPassedSpeedLimit;
+            out.source = SPEED_SOURCE_OSM_MAXSPEED;
+        } else if (bestSpeedSign && bestSpeedDistM < 120.0f) {
+            // Speed limit sign right ahead
+            out.valid = true;
+            out.speedLimitKmh = (float)bestSpeedSign->speedLimitKmh;
+            out.source = SPEED_SOURCE_OSM_MAXSPEED;
+        } else if (out.residentAreaAheadValid && out.residentAreaIsStart) {
+            // In residential area (default 50 km/h in Vietnam)
+            out.valid = true;
+            out.speedLimitKmh = 50.0f;
+            out.source = SPEED_SOURCE_DEFAULT;
+        }
+    }
+}
+
+// ROUTE-BASED sign lookahead (2026-09-23) — the fix for "biểu tượng cảnh báo
+// tốc độ, cảnh báo giao thông tiếp theo chưa chính xác". Projects each sign
+// onto the forward route and measures its remaining ARC-LENGTH distance ahead
+// of the car, then keeps the NEAREST one of each type by that route distance.
+// Two things this gets right that the old bearing-cone scan did not:
+//   * The "next" sign is the next one you actually REACH along the road, even
+//     around a bend or past a junction — a straight-line cone either missed a
+//     sign just off-axis or picked one on a parallel road that happened to be
+//     within the cone.
+//   * A sign's own orientation tag (directionDeg) is compared against the
+//     ROUTE's local heading at that sign, not the car's raw heading, so a sign
+//     on a curve is judged by the road direction there.
+// Falls back to the bearing-cone scan when there's no usable route.
+static void matchSignsAheadRoute(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
+    const TrafficSignPoint *signs;
+    int signCount;
+    sdMgrGetSigns(&signs, &signCount);
+    if (signCount == 0) return;
+
+    float signWarnDistM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+    float dLatMax = (signWarnDistM + kRouteLateralTolM) / 110540.0f + 0.0005f;
+
+    float closestSignDistM = 1e9f;
+    const TrafficSignPoint *closestSign = NULL;
+    float bestSpeedDistM = 1e9f;  const TrafficSignPoint *bestSpeedSign = NULL;
+    float bestResidentDistM = 1e9f; const TrafficSignPoint *bestResident = NULL;
+    float bestNoOvertakeDistM = 1e9f; const TrafficSignPoint *bestNoOvertake = NULL;
+    float bestTollDistM = 1e9f;   const TrafficSignPoint *bestToll = NULL;
+    float bestLightDistM = 1e9f;  const TrafficSignPoint *bestLight = NULL;
+    float bestDangerDistM = 1e9f; const TrafficSignPoint *bestDanger = NULL;
+
+    for (int i = 0; i < signCount; i++) {
+        float signLat = signs[i].latE7 / 1e7f;
+        float signLon = signs[i].lonE7 / 1e7f;
+        if (fabsf(signLat - gnss.latDeg) > dLatMax) continue;
+        Vec2 p = toLocalMeters(signLat, signLon, gnss.latDeg, gnss.lonDeg);
+        if (sqrtf(p.x * p.x + p.y * p.y) > signWarnDistM + kRouteLateralTolM) continue;
+
+        float arc, snapLat, snapLon, routeHeading;
+        if (!routeProject(signLat, signLon, kRouteLateralTolM, &arc, &snapLat, &snapLon, &routeHeading)) continue;
+        float aheadDist = arc - gCarDistM;   // remaining route distance to the sign
+        if (aheadDist < 0 || aheadDist > signWarnDistM) continue; // behind, or beyond horizon
+
+        // Sign's own facing direction, judged against the ROAD heading at the
+        // sign (routeHeading), not the car's raw heading — correct around curves.
+        if (signs[i].directionDeg != 0xFFFF) {
+            if (angularDiffDeg(routeHeading, (float)signs[i].directionDeg) > 60.0f) continue;
+        }
+
+        if (aheadDist < closestSignDistM) { closestSignDistM = aheadDist; closestSign = &signs[i]; }
+
+        uint8_t t = signs[i].signType;
+        if (t == SIGN_TYPE_SPEED_LIMIT && signs[i].speedLimitKmh > 0 && aheadDist < bestSpeedDistM) {
+            bestSpeedDistM = aheadDist; bestSpeedSign = &signs[i];
+        } else if (t == SIGN_TYPE_RESIDENT_AREA && aheadDist < bestResidentDistM) {
+            bestResidentDistM = aheadDist; bestResident = &signs[i];
+        } else if (t == SIGN_TYPE_NO_OVERTAKING && aheadDist < bestNoOvertakeDistM) {
+            bestNoOvertakeDistM = aheadDist; bestNoOvertake = &signs[i];
+        } else if (t == SIGN_TYPE_TOLL_BOOTH && aheadDist < bestTollDistM) {
+            bestTollDistM = aheadDist; bestToll = &signs[i];
+        } else if (t == SIGN_TYPE_TRAFFIC_LIGHT && aheadDist < bestLightDistM) {
+            bestLightDistM = aheadDist; bestLight = &signs[i];
+        } else if (t == SIGN_TYPE_DANGER_OTHER && aheadDist < bestDangerDistM) {
+            bestDangerDistM = aheadDist; bestDanger = &signs[i];
+        }
+    }
+    fillSignResults(out, bestSpeedSign, bestSpeedDistM, bestResident, bestResidentDistM, bestNoOvertake,
+                    bestNoOvertakeDistM, bestToll, bestTollDistM, bestLight, bestLightDistM, bestDanger,
+                    bestDangerDistM, closestSign, closestSignDistM);
+}
+
+static void matchSignsAheadStraight(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
+    const TrafficSignPoint *signs;
+    int signCount;
+    sdMgrGetSigns(&signs, &signCount);
+    if (signCount == 0) return;
+
+    float closestSignDistM = 1e9f;
+    const TrafficSignPoint *closestSign = NULL;
+
+    float bestSpeedDistM = 1e9f;
+    const TrafficSignPoint *bestSpeedSign = NULL;
+
+    float bestResidentDistM = 1e9f;
+    const TrafficSignPoint *bestResident = NULL;
+
+    float bestNoOvertakeDistM = 1e9f;
+    const TrafficSignPoint *bestNoOvertake = NULL;
+
+    float bestTollDistM = 1e9f;
+    const TrafficSignPoint *bestToll = NULL;
+
+    float bestLightDistM = 1e9f;
+    const TrafficSignPoint *bestLight = NULL;
+
+    float bestDangerDistM = 1e9f;
+    const TrafficSignPoint *bestDanger = NULL;
+
+    for (int i = 0; i < signCount; i++) {
+        float signLat = signs[i].latE7 / 1e7f;
+        float signLon = signs[i].lonE7 / 1e7f;
+
+        // Fast bounding box check (lat/lon)
+        float dLat = fabsf(signLat - gnss.latDeg);
+        if (dLat > 0.005f) continue; // ~550m
+
+        Vec2 p = toLocalMeters(signLat, signLon, gnss.latDeg, gnss.lonDeg);
+        float distM = sqrtf(p.x * p.x + p.y * p.y);
+        float signWarnDistM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+        if (distM > signWarnDistM) continue;
+
+        // Check bearing to sign from car
+        float bearingToSignDeg = atan2f(p.x, p.y) * (180.0f / (float)M_PI);
+        if (bearingToSignDeg < 0) bearingToSignDeg += 360.0f;
+        if (angularDiffDeg(gnss.headingDeg, bearingToSignDeg) > kSignBearingToleranceDeg) continue;
+
+        // Also check sign's own orientation if tagged
+        if (signs[i].directionDeg != 0xFFFF) {
+            if (angularDiffDeg(gnss.headingDeg, signs[i].directionDeg) > 60.0f) {
+                continue; // Sign faces away or perpendicular to car's travel lane
+            }
+        }
+
+        if (distM < closestSignDistM) {
+            closestSignDistM = distM;
+            closestSign = &signs[i];
+        }
+
+        // Category sorting
+        if (signs[i].signType == SIGN_TYPE_SPEED_LIMIT && signs[i].speedLimitKmh > 0 && distM < bestSpeedDistM) {
+            bestSpeedDistM = distM;
+            bestSpeedSign = &signs[i];
+        } else if (signs[i].signType == SIGN_TYPE_RESIDENT_AREA && distM < bestResidentDistM) {
+            bestResidentDistM = distM;
+            bestResident = &signs[i];
+        } else if (signs[i].signType == SIGN_TYPE_NO_OVERTAKING && distM < bestNoOvertakeDistM) {
+            bestNoOvertakeDistM = distM;
+            bestNoOvertake = &signs[i];
+        } else if (signs[i].signType == SIGN_TYPE_TOLL_BOOTH && distM < bestTollDistM) {
+            bestTollDistM = distM;
+            bestToll = &signs[i];
+        } else if (signs[i].signType == SIGN_TYPE_TRAFFIC_LIGHT && distM < bestLightDistM) {
+            bestLightDistM = distM;
+            bestLight = &signs[i];
+        } else if (signs[i].signType == SIGN_TYPE_DANGER_OTHER && distM < bestDangerDistM) {
+            bestDangerDistM = distM;
+            bestDanger = &signs[i];
+        }
+    }
+    fillSignResults(out, bestSpeedSign, bestSpeedDistM, bestResident, bestResidentDistM, bestNoOvertake,
+                    bestNoOvertakeDistM, bestToll, bestTollDistM, bestLight, bestLightDistM, bestDanger,
+                    bestDangerDistM, closestSign, closestSignDistM);
+}
+
+static void matchSignsAhead(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
+    if (!gnss.fix) return;
+    if (gRouteCount > 0 && gCarOnRoute) {
+        matchSignsAheadRoute(gnss, out);
+    } else if (gnss.headingValid) {
+        matchSignsAheadStraight(gnss, out);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Nearby-markers query for map/MapRenderer.cpp's live background map — see
+// SpeedLimitManager.h's own declaration comment. Plain linear scan, not a
+// tile lookup: cameras.bin/signs.bin are already flat, untiled, whole-in-RAM
+// arrays (SdCardManager.h), same reasoning matchCameraAhead()/
+// matchSignsAhead() above already scan them directly rather than through
+// any tile cache. `out[].kind` is a raw TrafficSignType value
+// (SpeedMapFormat.h) — SIGN_TYPE_CAMERA for camera points, signs[i].signType
+// for sign points — left for MapRenderer.cpp to translate into its own
+// MapMarkerKind, so this header doesn't need to know that enum exists.
+bool speedLimitManagerGetNearbyMarkers(float lat, float lon, float radiusM, NearbyMarkerRaw *out, int maxOut,
+                                        int *outCount) {
+    *outCount = 0;
+    if (!gMapLoaded) return false;
+
+    float radiusSqM = radiusM * radiusM;
+    float cosLat = cosf(lat * (float)M_PI / 180.0f);
+    int n = 0;
+
+    const CameraPoint *cams;
+    int camCount;
+    sdMgrGetCameras(&cams, &camCount);
+    for (int i = 0; i < camCount && n < maxOut; i++) {
+        float camLat = cams[i].latE7 / 1e7f, camLon = cams[i].lonE7 / 1e7f;
+        float dxM = (camLon - lon) * 111320.0f * cosLat;
+        float dyM = (camLat - lat) * 110540.0f;
+        if (dxM * dxM + dyM * dyM > radiusSqM) continue;
+        out[n].lat = camLat;
+        out[n].lon = camLon;
+        out[n].kind = SIGN_TYPE_CAMERA;
+        n++;
+    }
+
+    const TrafficSignPoint *signs;
+    int signCount;
+    sdMgrGetSigns(&signs, &signCount);
+    for (int i = 0; i < signCount && n < maxOut; i++) {
+        float signLat = signs[i].latE7 / 1e7f, signLon = signs[i].lonE7 / 1e7f;
+        float dxM = (signLon - lon) * 111320.0f * cosLat;
+        float dyM = (signLat - lat) * 110540.0f;
+        if (dxM * dxM + dyM * dyM > radiusSqM) continue;
+        out[n].lat = signLat;
+        out[n].lon = signLon;
+        out[n].kind = signs[i].signType;
+        n++;
+    }
+
+    *outCount = n;
+    return true;
 }
 
 // ---------------------------------------------------------------------
@@ -568,6 +1206,13 @@ static void runSelfTest() {
     currentConfidence = 0;
     lastValidMs = 0;
     lastPublished = RoadInfoSnapshot();
+    // ...and the forward-route + dead-reckon state too — runMatch() built a
+    // route off the synthetic test point; leaving it would seed the first real
+    // match with a route anchored somewhere the car isn't.
+    resetRouteState();
+    gFixLostMs = 0;
+    gLastDeadReckonMs = 0;
+    gLastKnownSpeedKmh = 0;
 }
 
 static void speedLimitTaskFn(void *) {
@@ -587,42 +1232,87 @@ static void speedLimitTaskFn(void *) {
     esp_task_wdt_add(NULL);
     uint32_t lastDebugMs = 0;
     for (;;) {
+        if (!ri.mapLoaded) {
+            static uint32_t lastMountRetryMs = 0;
+            uint32_t nowMount = millis();
+            if (nowMount - lastMountRetryMs > 3000) {
+                lastMountRetryMs = nowMount;
+                if (sdMgrMount()) {
+                    sdMgrGetMetadata(gMetadata);
+                    ri.mapLoaded = true;
+                    gMapLoaded = true;
+                    runSelfTest();
+                    Serial.println("[map] SD card inserted and mounted successfully!");
+                }
+            }
+        }
         if (ri.mapLoaded) {
             GnssSnapshot gnss = gnssSnapshot();
             RoadInfoSnapshot out;
             runMatch(gnss, out);
 
-            // Ahead-lookahead (see matchAheadPoint's own comment) — only
-            // worth projecting forward while actually moving with a
-            // trustworthy heading (a stopped/slow vehicle's heading is
-            // noise, same gate GNSS.cpp itself already uses for
-            // headingValid's own reliability) and only once we KNOW the
-            // current limit (out.valid) so there's something real to
-            // compare the ahead-match against. Only surfaced when it's a
-            // genuinely DIFFERENT limit — re-confirming the same number
-            // ahead isn't a "change" worth a driver's attention.
-            if (gnss.headingValid && gnss.egoSpeedKmh > kGnssMotionThresholdKmh && out.valid) {
-                MatchCandidate ahead;
-                if (matchAheadPoint(gnss, ahead) && (float)ahead.speedLimitKmh != out.speedLimitKmh) {
+            // Ahead-lookahead (see findAheadLimitChange's own comment) —
+            // runs while actually moving and EITHER we have a trustworthy
+            // heading OR we're sitting on a built forward route. The route is
+            // the better source (it follows the road, not a straight line),
+            // and accepting it without a heading matters right after a GPS
+            // re-acquisition, when course-over-ground is still settling but the
+            // car's position already snaps back onto the persisted route — so
+            // the limit/warnings come back immediately instead of staying
+            // UNKNOWN until the heading stabilizes. Only surfaced when it's a
+            // genuinely DIFFERENT limit — re-confirming the same number ahead
+            // isn't a "change" worth a driver's attention.
+            bool routeUsable = (gRouteCount > 0 && gCarOnRoute);
+            bool moving = gnss.fix && gnss.egoSpeedKmh > kGnssMotionThresholdKmh;
+            if (moving && (gnss.headingValid || routeUsable) && out.valid) {
+                float aheadDistM, aheadLimitKmh;
+                if (findAheadLimitChange(gnss, out.speedLimitKmh, aheadDistM, aheadLimitKmh)) {
                     out.aheadLimitValid = true;
-                    out.aheadSpeedLimitKmh = (float)ahead.speedLimitKmh;
-                    out.aheadDistanceM = kAheadLookaheadM;
+                    out.aheadSpeedLimitKmh = aheadLimitKmh;
+                    out.aheadDistanceM = aheadDistM; // real remaining distance, counts down as we approach
                 }
             }
 
-            // Camera warning (see matchCameraAhead's own comment) — same
-            // "only worth it while actually moving with a trustworthy
-            // heading" gate as the ahead-limit lookahead above, but
-            // deliberately NOT gated on out.valid: a camera is worth
-            // knowing about even on a road segment whose own speed limit
-            // this firmware doesn't know.
-            if (gnss.headingValid && gnss.egoSpeedKmh > kGnssMotionThresholdKmh) {
+            // Camera + sign warnings (see matchCameraAhead's own comment) — same
+            // "moving with a heading OR on a route" gate as the ahead-limit
+            // lookahead above, but deliberately NOT gated on out.valid: a
+            // camera/sign is worth knowing about even on a road segment whose
+            // own speed limit this firmware doesn't know.
+            if (moving && (gnss.headingValid || routeUsable)) {
                 matchCameraAhead(gnss, out, out);
                 matchSignsAhead(gnss, out);
             }
 
+            // Fallback limit (user-requested 2026-09-24): when we have a real
+            // fix but genuinely couldn't resolve a limit (off the mapped
+            // network / no route), show cfg.defaultLimitKmh (default 50, VN's
+            // baseline urban limit) rather than a blank "--". 0 = off. Marked
+            // SPEED_SOURCE_DEFAULT so diagnostics/telemetry can tell it apart
+            // from a real matched limit; only applied with an actual fix, never
+            // as a fabricated value while GPS is absent.
+            if (!out.valid && gnss.fix && cfg.defaultLimitKmh > 0.0f) {
+                out.valid = true;
+                out.speedLimitKmh = cfg.defaultLimitKmh;
+                out.source = SPEED_SOURCE_DEFAULT;
+            }
+
             lastPublished = out;
-            roadInfoPublish(out);
+            // Suppressed while the UI demo owns the shared state — same gate
+            // and same reasoning as gnss/GNSS.cpp's own publish (demo/DemoMode.h).
+            // Matching itself keeps running so its tile cache and continuity
+            // state stay warm across a demo session.
+            if (!demoModeIsEnabled()) {
+                roadInfoPublish(out);
+                // Live background map (2026-09-22) — rides this same ~500ms
+                // loop rather than a new task; mapRendererUpdate() itself
+                // gates on real movement/heading delta (see MapRenderer.cpp's
+                // own comment) so a stationary or straight-driving car costs
+                // nothing extra here. Suppressed under demo the same way
+                // roadInfoPublish() is — demo/DemoMode.cpp drives the map
+                // directly via mapRendererComputeFromSegments() with its own
+                // synthetic road network instead.
+                mapRendererUpdate(gnss);
+            }
 
             // Same 3s periodic-debug pattern as gnss/GNSS.cpp and
             // radar/LD2451.cpp — lat/lon isn't shown anywhere in the UI, so
@@ -652,10 +1342,12 @@ static void speedLimitTaskFn(void *) {
     }
 }
 
-// Kept at 4096, NOT shrunk like radar/LD2451.cpp's and gnss/GNSS.cpp's own
-// tasks got in the same 2026-09-16 RAM audit: this one's measured stack
-// high-water mark was only ~920 bytes free (~22% margin, using ~3176 of
-// 4096) — already the tightest of every task in this project, and it does
-// real file I/O (SD_MMC File objects) unlike the others, so it's kept as
-// the one exception rather than trimmed on the same formula.
-void speedLimitManagerStart() { xTaskCreatePinnedToCore(speedLimitTaskFn, "speedLimitTask", 4096, NULL, 1, NULL, 0); }
+// Bumped 4096 -> 8192 on 2026-09-24: the forward-route engine
+// (RoutePredictor) added chunky stack locals to this task's call chain —
+// runMatch()'s RoadSegment copies, Route::build()'s cand[kMaxNodeCandidates]
+// (12*28B) + visited[kMaxSegments] (64*4B), and routeProject()'s loops — on
+// top of the SD_MMC File I/O this task already does. The old 4096 stack (only
+// ~920 B free even before this) overflowed and the FreeRTOS stack canary
+// panicked ("Stack canary watchpoint triggered (speedLimitTask)") in a boot
+// loop. 8192 restores a healthy margin.
+void speedLimitManagerStart() { xTaskCreatePinnedToCore(speedLimitTaskFn, "speedLimitTask", 8192, NULL, 1, NULL, 0); }

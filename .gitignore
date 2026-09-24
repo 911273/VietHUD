@@ -1,8 +1,31 @@
 .pio/
 compile_commands.json
+
+# --- Map / warning / voice DATA (frozen separately per release, NOT in git) ---
+# These are large binaries and regenerable source data; the SD payload is
+# archived under radar_car_releases/<ver>/ instead. See MANIFEST there.
 data/speedmap/*.bin
+data/speedmap/*.sqlite
+data/speedmap/*.mbtiles
+data/speedmap/*.csv
+data/speedmap/sounds/
+data/speedmap/tiles/
+*.sqlite
+*.mbtiles
+.roadfiles_backup/
+
+# ESP32 OTA partition images (build artifacts)
+app1_head.bin
+otadata.bin
+
+# --- Map-build tooling: binaries & caches (regenerable, huge) ---
 tools/map_builder/wyn_assets/
 tools/map_builder/__pycache__/
 tools/map_builder/*_output/
 tools/map_builder/output/
+tools/map_builder/cache/
+tools/tilemaker/
+tools/tilemaker_v24/
+tools/fonts/__pycache__/
 *.osm
+*.osm.pbf

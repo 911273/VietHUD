@@ -24,24 +24,45 @@ but no longer describe the current product end to end.
   no-overtaking / toll-booth / traffic-light signs — see
   `src/map/SpeedMapFormat.h` for the on-disk format and
   `src/map/SpeedLimitManager.cpp` for the matching algorithm.
-- Shows all of that on an LVGL Dashboard (`src/ui/Dashboard.cpp`) with a
-  sign/camera alert card, plays a tone chime immediately on a new warning
-  and queues a Vietnamese voice line for it (`src/audio/AudioPlayer.cpp`,
-  MP3s in `data/speedmap/sounds/vi/`).
+- Shows all of that on an LVGL Dashboard (`src/ui/Dashboard.cpp`): the
+  current speed and the speed-limit sign are the focal point in both
+  orientations (speed drawn as large 7-segment digits — `src/ui/SevenSeg.h`
+  explains why not a font), and one alert card carries whatever is coming up
+  next. That card is driven by the REMAINING distance — the countdown number
+  grows, its color escalates, the bar fills and the border starts blinking as
+  you close in. A tone chime plays immediately on a new warning and a
+  Vietnamese voice line queues behind it (`src/audio/AudioPlayer.cpp`, MP3s
+  in `data/speedmap/sounds/vi/`).
 - Logs GNSS speed + speed-limit/camera/sign state to the microSD card per
   drive (`src/log/TripLogger.cpp`), and serves live telemetry / config / OTA
   update over its own WiFi AP (`src/net/WebPortal.cpp`).
 
 ## Current status
 
-Builds clean (`pio run -e viethud`) and has been flashed to real hardware
-for a boot smoke test. The offline speed-map database on `data/speedmap/`
-(built from a real Northern-Vietnam OSM extract + the WYN CSV/network
-export) has NOT yet been physically copied onto the board's own microSD
-card — see "microSD card contents" below for what to copy and where. Until
-that's done, the device boots and runs fine (`SdCardManager.cpp` treats a
-missing/absent database as "zero signs/cameras/segments", not a load error)
-but the sign/camera/speed-limit/voice features have no live data to show.
+Builds clean (`pio run -e viethud`) and runs on real hardware. A database IS
+now on the board's microSD card, but it is **partial** — read from the boot
+log on 2026-09-22:
+
+```
+[sdmgr] mounted OK  region=XX version=2026.09 tiles=1
+[sdmgr] cameras.bin: 8075 speed camera(s) loaded
+[sdmgr] signs.bin: 38340 traffic sign(s) loaded
+[map] self-test PASS  expected road=1 got road=1 limit=50km/h confidence=1.00
+```
+
+`cameras.bin` and `signs.bin` are fully populated, so speed-camera and
+sign warnings (khu đông dân cư / cấm vượt / đèn tín hiệu / trạm thu phí) have
+real data — those are flat arrays, not tiled. But `tiles=1` means the road
+network is a single placeholder tile (`region=XX` is likewise a placeholder,
+not a real region code), so **current speed limit and upcoming-limit-change
+warnings will not match anything while driving.** Rebuild the database with a
+real extract (see "Rebuilding the speed-map database" below) and re-copy
+`data/speedmap/` to fix that; `tiles=` in the boot log is the number to check.
+
+To review the UI itself without a GNSS fix or a complete database, turn on
+**Settings > Display > Demo mode** — it plays a scripted tour of every
+Dashboard state (see `src/demo/DemoMode.h`). It never persists across a
+reboot, by design.
 
 ## Build & flash
 
@@ -141,7 +162,7 @@ radar_car/
 │   ├── core/                     AppConfig, NVS persistence, mutex-protected shared state
 │   ├── gnss/                     u-blox M10N UART driver + NMEA parsing
 │   ├── map/                      microSD speed-map loader + GNSS map-matching
-│   ├── ui/                       Dashboard + Settings (LVGL)
+│   ├── ui/                       Dashboard + Settings (LVGL), SevenSeg big-digit renderer
 │   ├── audio/                    tone chimes + queued Vietnamese voice playback
 │   ├── net/                      WiFi AP + live telemetry/config/OTA web portal
 │   ├── log/                      per-drive trip CSV logging

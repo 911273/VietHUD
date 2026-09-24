@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <SD_MMC.h>
 #include <esp_heap_caps.h>
+#include <esp_task_wdt.h> // esp_task_wdt_reset() — see ensureSdMmcBegun()'s own comment
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <stdio.h> // sscanf() — trip-log filename parsing in sdMgrListTripLogs()
@@ -86,6 +87,12 @@ static int cameraPointCount = 0;
 static TrafficSignPoint *trafficSigns = NULL;
 static int trafficSignCount = 0;
 
+// Road Names Database in PSRAM
+static uint16_t roadNameCount = 0;
+static uint32_t *roadNameOffsets = NULL;
+static char *roadNamePool = NULL;
+static size_t roadNamePoolSize = 0;
+
 bool sdMgrIsAvailable() { return mounted; }
 
 // Brings up the underlying SD_MMC peripheral exactly once, however many of
@@ -145,6 +152,7 @@ static bool ensureSdMmcBegun() {
     // it stays unless disproven" principle this project applies to its own
     // discoveries (e.g. the touch controller's 100kHz requirement).
     pinMode(SD_MMC_CMD_PIN, INPUT_PULLUP);
+    pinMode(SD_MMC_D0_PIN, INPUT_PULLUP);
     pinMode(SD_MMC_CLK_PIN, OUTPUT);
     digitalWrite(SD_MMC_CLK_PIN, LOW);
     delay(200);
@@ -155,19 +163,55 @@ static bool ensureSdMmcBegun() {
         Serial.println("[sdmgr] SD_MMC.setPins() failed");
         return false;
     }
-    // "/sdmmc" mountpoint, mode1bit=true (only D0 is wired — no D1/D2/D3),
-    // format_if_mount_failed=false (never auto-format a real data card),
-    // SDMMC_FREQ_DEFAULT (matches the vendor demo's own tested setting).
-    if (!SD_MMC.begin("/sdmmc", true, false, SDMMC_FREQ_DEFAULT)) {
-        Serial.println("[sdmgr] SD_MMC.begin() failed — no card detected");
-        return false;
+    // esp_task_wdt_reset() calls threaded through this function's 3-stage
+    // retry — added 2026-09-22 after a REAL, reproducible field crash:
+    // "Task watchdog got triggered ... speedLimitTask ... Aborting." A
+    // failing card makes each of the 3 SD_MMC.begin() attempts below block
+    // for real time (its own internal command retries at the hardware
+    // level, worse at the slower fallback frequencies), on top of the
+    // explicit delay()s already here — confirmed on hardware to add up to
+    // several seconds for one full failed call. speedLimitTaskFn's own
+    // retry-mount logic calls sdMgrMount() (which calls this) directly
+    // inline in its loop, before that loop's own esp_task_wdt_reset() — so
+    // a single slow call here could burn through the whole per-task
+    // watchdog budget before ever reaching it. A no-op (returns an error
+    // code, nothing worse) if the calling task was never registered via
+    // esp_task_wdt_add(), so this is safe from every caller of
+    // ensureSdMmcBegun() (map/SpeedLimitManager.cpp, log/TripLogger.cpp,
+    // etc.), not just the one that actually crashed.
+    esp_task_wdt_reset();
+    if (SD_MMC.begin("/sdmmc", true, false, SDMMC_FREQ_DEFAULT)) {
+        sdMmcBegun = true;
+        uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
+        Serial.printf("[sdmgr] SD Card mounted successfully! Size: %llu MB, Type: %d\n", cardSize, SD_MMC.cardType());
+        return true;
     }
-    sdMmcBegun = true;
-    return true;
+    SD_MMC.end();
+    delay(100);
+    esp_task_wdt_reset();
+    if (SD_MMC.begin("/sdmmc", true, false, 10000)) {
+        sdMmcBegun = true;
+        uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
+        Serial.printf("[sdmgr] SD Card mounted at 10MHz fallback! Size: %llu MB\n", cardSize);
+        return true;
+    }
+    SD_MMC.end();
+    delay(100);
+    esp_task_wdt_reset();
+    if (SD_MMC.begin("/sdmmc", true, false, SDMMC_FREQ_PROBING)) {
+        sdMmcBegun = true;
+        uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
+        Serial.printf("[sdmgr] SD Card mounted at 400kHz fallback! Size: %llu MB\n", cardSize);
+        return true;
+    }
+    esp_task_wdt_reset();
+    Serial.println("[sdmgr] SD_MMC.begin() failed — no card detected");
+    return false;
 }
 
 bool sdMgrMount() {
     SdLock lock;
+    if (mounted) return true;
     mounted = false;
     if (!ensureSdMmcBegun()) return false;
 
@@ -220,26 +264,27 @@ bool sdMgrMount() {
     }
     tileIndex = (TileIndexEntry *)heap_caps_malloc(idxSize, MALLOC_CAP_SPIRAM);
     if (!tileIndex) {
-        Serial.printf("[sdmgr] PSRAM allocation for %u tile index entries (%u bytes) failed — MAP ERROR\n",
+        Serial.printf("[sdmgr] PSRAM allocation for %u tile index entries (%u bytes) skipped - using on-demand file index (0 KB PSRAM)\n",
                       (unsigned)metadata.tileCount, (unsigned)idxSize);
         idxFile.close();
-        return false;
-    }
-    tileIndexCount = (int)metadata.tileCount;
-    size_t idxGot = idxFile.read((uint8_t *)tileIndex, idxSize);
-    idxFile.close();
-    if (idxGot != idxSize) {
-        Serial.println("[sdmgr] short read on index.bin — MAP ERROR");
-        tileIndexCount = 0;
-        return false;
-    }
-
-    uint32_t computedCrc = crc32((const uint8_t *)tileIndex, idxSize);
-    if (computedCrc != metadata.crc32) {
-        Serial.printf("[sdmgr] index.bin CRC mismatch (computed 0x%08lX, expected 0x%08lX) — MAP ERROR\n",
-                      (unsigned long)computedCrc, (unsigned long)metadata.crc32);
-        tileIndexCount = 0;
-        return false;
+        tileIndexCount = (int)metadata.tileCount;
+    } else {
+        tileIndexCount = (int)metadata.tileCount;
+        size_t idxGot = idxFile.read((uint8_t *)tileIndex, idxSize);
+        idxFile.close();
+        if (idxGot != idxSize) {
+            Serial.println("[sdmgr] short read on index.bin - falling back to file index");
+            heap_caps_free(tileIndex);
+            tileIndex = NULL;
+        } else {
+            uint32_t computedCrc = crc32((const uint8_t *)tileIndex, idxSize);
+            if (computedCrc != metadata.crc32) {
+                Serial.printf("[sdmgr] index.bin CRC mismatch (computed 0x%08lX, expected 0x%08lX) - falling back to file index\n",
+                              (unsigned long)computedCrc, (unsigned long)metadata.crc32);
+                heap_caps_free(tileIndex);
+                tileIndex = NULL;
+            }
+        }
     }
 
     Serial.printf("[sdmgr] mounted OK — region=%.16s version=%.16s tiles=%d\n", metadata.region, metadata.mapVersion,
@@ -297,6 +342,43 @@ bool sdMgrMount() {
     }
     Serial.printf("[sdmgr] signs.bin: %d traffic sign(s) loaded\n", trafficSignCount);
 
+    // names.bin - loaded into PSRAM for road name display
+    if (roadNameOffsets) { heap_caps_free(roadNameOffsets); roadNameOffsets = NULL; }
+    if (roadNamePool) { heap_caps_free(roadNamePool); roadNamePool = NULL; }
+    roadNameCount = 0;
+    roadNamePoolSize = 0;
+
+    File nameFile = SD_MMC.open("/speedmap/names.bin");
+    if (nameFile) {
+        char magic[4];
+        uint16_t version = 0, count = 0;
+        uint32_t totalBytes = 0, reserved = 0;
+        if (nameFile.read((uint8_t *)magic, 4) == 4 && memcmp(magic, "VNNM", 4) == 0) {
+            nameFile.read((uint8_t *)&version, 2);
+            nameFile.read((uint8_t *)&count, 2);
+            nameFile.read((uint8_t *)&totalBytes, 4);
+            nameFile.read((uint8_t *)&reserved, 4);
+
+            if (count > 0 && totalBytes > 0 && count < 65535 && totalBytes < 2000000) {
+                roadNameOffsets = (uint32_t *)heap_caps_malloc(count * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
+                roadNamePool = (char *)heap_caps_malloc(totalBytes, MALLOC_CAP_SPIRAM);
+                if (roadNameOffsets && roadNamePool) {
+                    nameFile.read((uint8_t *)roadNameOffsets, count * sizeof(uint32_t));
+                    nameFile.read((uint8_t *)roadNamePool, totalBytes);
+                    roadNameCount = count;
+                    roadNamePoolSize = totalBytes;
+                    Serial.printf("[sdmgr] names.bin: %d street names loaded (%u bytes string pool)\n",
+                                  roadNameCount, (unsigned int)roadNamePoolSize);
+                } else {
+                    if (roadNameOffsets) { heap_caps_free(roadNameOffsets); roadNameOffsets = NULL; }
+                    if (roadNamePool) { heap_caps_free(roadNamePool); roadNamePool = NULL; }
+                    Serial.println("[sdmgr] PSRAM allocation for road names failed");
+                }
+            }
+        }
+        nameFile.close();
+    }
+
     return true;
 }
 
@@ -327,6 +409,21 @@ bool sdMgrGetIndex(const TileIndexEntry **out, int *outCount) {
     *out = tileIndex;
     *outCount = tileIndexCount;
     return true;
+}
+
+
+bool sdMgrReadBytes(const char *path, uint32_t offset, uint8_t *outBuf, size_t len) {
+    SdLock lock;
+    if (!ensureSdMmcBegun() || !path || !outBuf || len == 0) return false;
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) return false;
+    if (offset > 0 && !f.seek(offset)) {
+        f.close();
+        return false;
+    }
+    size_t got = f.read(outBuf, len);
+    f.close();
+    return got == len;
 }
 
 bool sdMgrReadTile(const TileIndexEntry &entry, RoadSegment *outBuf, int maxSegments, int *outCount) {
@@ -510,4 +607,86 @@ bool sdMgrAppendLine(const char *path, const char *line) {
     f.println(line);
     f.close();
     return true;
+}
+
+bool sdMgrFindTileEntry(uint32_t tileId, TileIndexEntry *outEntry) {
+    if (!mounted || !outEntry) return false;
+    SdLock lock;
+
+    // Fast path: in-PSRAM array
+    if (tileIndex) {
+        int lo = 0, hi = tileIndexCount - 1;
+        while (lo <= hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (tileIndex[mid].tileId == tileId) {
+                *outEntry = tileIndex[mid];
+                return true;
+            } else if (tileIndex[mid].tileId < tileId) {
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return false;
+    }
+
+    // Direct file-based binary search on /speedmap/index.bin (0 KB PSRAM)
+    if (!ensureSdMmcBegun()) return false;
+    File f = SD_MMC.open("/speedmap/index.bin", FILE_READ);
+    if (!f) return false;
+
+    int lo = 0, hi = tileIndexCount - 1;
+    bool found = false;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (!f.seek((uint32_t)mid * sizeof(TileIndexEntry))) break;
+        TileIndexEntry ent;
+        if (f.read((uint8_t *)&ent, sizeof(ent)) != sizeof(ent)) break;
+        if (ent.tileId == tileId) {
+            *outEntry = ent;
+            found = true;
+            break;
+        } else if (ent.tileId < tileId) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    f.close();
+    return found;
+}
+
+const char *sdMgrGetRoadName(uint16_t nameId) {
+    if (nameId == 0 || nameId > roadNameCount || !roadNameOffsets || !roadNamePool) {
+        return "";
+    }
+    uint32_t offset = roadNameOffsets[nameId - 1];
+    if (offset < roadNamePoolSize) {
+        return roadNamePool + offset;
+    }
+    return "";
+}
+
+const char *sdMgrGetSegmentRoadName(uint32_t segId) {
+    static uint32_t sLastSegId = 0xFFFFFFFFu;
+    static char sLastRoadName[64] = {0};
+
+    if (segId == 0) return "";
+    if (segId == sLastSegId) return sLastRoadName;
+
+    uint16_t nameId = 0;
+    bool ok = sdMgrReadBytes("/speedmap/seg_names.bin", segId * sizeof(uint16_t), (uint8_t *)&nameId, sizeof(nameId));
+    if (ok && nameId > 0) {
+        const char *name = sdMgrGetRoadName(nameId);
+        if (name && name[0]) {
+            sLastSegId = segId;
+            strncpy(sLastRoadName, name, sizeof(sLastRoadName) - 1);
+            sLastRoadName[sizeof(sLastRoadName) - 1] = '\0';
+            return sLastRoadName;
+        }
+    }
+
+    sLastSegId = segId;
+    sLastRoadName[0] = '\0';
+    return "";
 }

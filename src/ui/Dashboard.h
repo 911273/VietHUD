@@ -23,3 +23,13 @@ void wakeScreen();
 // specifically (there's only one touch source app-wide, so this is the
 // same signal either way, just already tracked here for auto-dim).
 uint32_t lastTouchAtMs();
+
+// Running totals for main_viethud.cpp's own [perf] report — same pattern as
+// display/DisplayDriver.h's g_flushUs/g_flushCount/g_renderUs, so the live
+// background map's actual draw cost is measured on real hardware rather
+// than assumed against the spec's own "<=10ms" target (see the plan,
+// C:\Users\phamq\.claude\plans\proud-riding-flute.md). g_mapDrawCount only
+// increments on ticks that actually redrew the canvas (most ticks don't —
+// see updateMapCanvas()'s own generation check), so this reports the real
+// per-redraw cost, not diluted by all the no-op ticks in between.
+extern uint32_t g_mapDrawUs, g_mapDrawCount;

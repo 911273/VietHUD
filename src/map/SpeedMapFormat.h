@@ -128,7 +128,15 @@ struct RoadSegment {
     int32_t endLatE7;
     int32_t endLonE7;
     uint16_t headingDeg;   // bearing from start to end, 0=North/clockwise, degrees 0-359
-    uint8_t roadClass;     // reserved for a future highway=* classification; 0 = unclassified in V1
+    // highway=* classification (real values as of 2026-09-22, populated by
+    // tools/map_builder/build_speedmap.py's ROAD_CLASS_BY_HIGHWAY table —
+    // was written as a placeholder 0 for every segment before that; see its
+    // own comment for the exact highway=* mapping). Consumed by
+    // map/MapRenderer.cpp for the live background map's per-class line
+    // style/color. 0=unclassified/other, 1=highway/major (motorway/trunk/
+    // primary), 2=main road (secondary/tertiary), 3=small/alley
+    // (residential/service/track/...).
+    uint8_t roadClass;
     uint8_t direction;     // RoadDirection
     int16_t speedLimitKmh; // -1 = UNKNOWN (no maxspeed tag and no applicable default)
     uint8_t speedSource;   // SpeedSource

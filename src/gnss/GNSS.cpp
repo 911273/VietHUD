@@ -1,6 +1,7 @@
 #include "GNSS.h"
 #include "core/AppConfig.h"
 #include "core/SharedState.h"
+#include "demo/DemoMode.h" // demoModeIsEnabled() — the demo publishes instead of this task while on
 #include "pincfg.h"
 #include <Arduino.h>
 #include <TinyGPSPlus.h>
@@ -97,6 +98,10 @@ static void gnssTaskFn(void *) {
     esp_task_wdt_add(NULL);
     uint32_t lastFixMs = 0;
     uint32_t lastValidSentenceMs = 0;
+    // Heading hold state (GNSS.h's kHeadingHoldMs comment) — lastKnownHeadingMs
+    // == 0 means "nothing to hold yet", same sentinel style as lastFixMs.
+    float lastKnownHeadingDeg = 0;
+    uint32_t lastKnownHeadingMs = 0;
     uint32_t lastPassedChecksum = 0;
     uint32_t lastDebugMs = 0;
 
@@ -130,7 +135,12 @@ static void gnssTaskFn(void *) {
         snap.fix = haveRecentFix;
         snap.linkAlive = linkAlive;
         if (haveRecentFix && gps.speed.isValid()) {
-            snap.rawSpeedKmh = (float)gps.speed.kmph();
+            // Calibration applied here, before the filter, so both
+            // rawSpeedKmh and the filtered egoSpeedKmh reflect the corrected
+            // value (AppConfig.h's gnssSpeedCalibrationPct comment) — no
+            // separate "true" vs "displayed" speed anywhere downstream.
+            float measuredKmh = (float)gps.speed.kmph();
+            snap.rawSpeedKmh = measuredKmh * (1.0f + cfg.gnssSpeedCalibrationPct / 100.0f);
             snap.egoSpeedKmh = speedFilter.push(snap.rawSpeedKmh);
         } else {
             speedFilter.reset();
@@ -163,8 +173,34 @@ static void gnssTaskFn(void *) {
         // speed filter's own median+EMA above. kGnssMotionThresholdKmh (see
         // GNSS.h) is this project's one shared constant for "real motion vs.
         // GPS noise floor" — also reused just below for the auto-dim gate.
-        snap.headingValid = haveRecentFix && gps.course.isValid() && snap.rawSpeedKmh > kGnssMotionThresholdKmh;
-        if (snap.headingValid) snap.headingDeg = (float)gps.course.deg();
+        bool liveHeadingValid = haveRecentFix && gps.course.isValid() && snap.rawSpeedKmh > kGnssMotionThresholdKmh;
+        if (liveHeadingValid) {
+            snap.headingDeg = (float)gps.course.deg();
+            snap.headingValid = true;
+            snap.headingPredicted = false;
+            lastKnownHeadingDeg = snap.headingDeg;
+            lastKnownHeadingMs = millis();
+        } else if (haveRecentFix && lastKnownHeadingMs != 0 &&
+                   (millis() - lastKnownHeadingMs) < kHeadingHoldMs) {
+            // Bridge a brief GPS-course gap (car slowed below
+            // kGnssMotionThresholdKmh, or the module's own course briefly
+            // glitched) by holding the last known heading — GNSS.h's
+            // kHeadingHoldMs comment has the full "dự đoán hướng di chuyển
+            // của xe" reasoning. Requires a still-current FIX, not just a
+            // recent one: a real position jump (module re-acquiring after a
+            // gap) must never carry a stale direction forward.
+            snap.headingDeg = lastKnownHeadingDeg;
+            snap.headingValid = true;
+            snap.headingPredicted = true;
+        } else {
+            snap.headingValid = false;
+            snap.headingPredicted = false;
+        }
+        // A real fix loss invalidates any held heading immediately — once
+        // GPS comes back (e.g. after a tunnel), the car could easily be
+        // pointed a different way than before the gap, so the next fix must
+        // re-earn a live heading rather than resume holding the old one.
+        if (!haveRecentFix) lastKnownHeadingMs = 0;
 
         // Dashboard clock + day/night icon: only trust GPS time/date
         // alongside a real position fix, since both the local-time
@@ -184,7 +220,11 @@ static void gnssTaskFn(void *) {
         // parked just because the fix dropped.
         if (!haveRecentFix || snap.egoSpeedKmh > kGnssMotionThresholdKmh) lastMovingMs = millis();
 
-        gnssPublish(snap);
+        // Suppressed while the UI demo owns the shared state (demo/DemoMode.h)
+        // — this task keeps running and keeps its own filter/fix state warm,
+        // so switching the demo off hands back a live reading within one
+        // 50ms tick rather than a stale or re-converging one.
+        if (!demoModeIsEnabled()) gnssPublish(snap);
 
         uint32_t now = millis();
         if (now - lastDebugMs > 3000) {

@@ -15,12 +15,50 @@ Arduino_Canvas *gfx = nullptr;
 
 uint32_t g_flushUs = 0, g_flushCount = 0, g_renderUs = 0;
 
+// Cache-blocked replacement for Arduino_Canvas::draw16bitRGBBitmap on a
+// rotation-1 canvas. WHY (2026-09-24 perf P0): the library's rotate_1 path
+// writes each LVGL landscape row DOWN a framebuffer column (stride =
+// canvas height, 320 px = 640 B per step). The 307 KB canvas framebuffer
+// lives in PSRAM (only ~47 KB internal SRAM is free — it cannot fit there),
+// and a 640 B stride misses the PSRAM cache line on EVERY pixel: a full-
+// screen redraw (the heading-up map rotates every frame) measured 141 ms
+// just for this copy, capping the UI at ~5 FPS.
+//
+// This version keeps the transpose but flips which side scatters. For a
+// rotation-1 canvas, landscape pixel (X,Y) maps to framebuffer index
+// X*stride + (maxY - Y) with stride = gfx->height(), maxY = stride-1 (this
+// is exactly Arduino_Canvas::writePixelPreclipped case 1). Iterating Y
+// DOWNWARD for a fixed X hits CONSECUTIVE framebuffer addresses, so the
+// PSRAM writes become long contiguous bursts instead of per-pixel misses.
+// The compensating strided access lands on px_map instead — and px_map is
+// LVGL's draw buffer in INTERNAL SRAM, where a stride costs nothing. Net:
+// the 141 ms scatter dropped to a bandwidth-bound copy. Byte layout is
+// identical to the library path (raw uint16 store), so colour is unchanged.
+static inline void blitRot1ToCanvas(uint16_t *fb, const uint16_t *src, int x1, int y1, int w, int h,
+                                    int stride) {
+    const int maxY = stride - 1;            // canvas _max_y (portrait height - 1)
+    const int yTop = y1 + h - 1;            // largest Y → smallest (maxY - Y) → run start
+    for (int xi = 0; xi < w; ++xi) {
+        uint16_t *d = fb + (int32_t)(x1 + xi) * stride + (maxY - yTop); // contiguous PSRAM run
+        const uint16_t *s = src + (int32_t)(h - 1) * w + xi;            // strided internal-SRAM read
+        for (int k = 0; k < h; ++k) {
+            *d++ = *s;
+            s -= w;
+        }
+    }
+}
+
 void dispFlushCb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     uint32_t w = area->x2 - area->x1 + 1;
     uint32_t h = area->y2 - area->y1 + 1;
 
     uint32_t t0 = micros();
-    gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)px_map, w, h); // into canvas RAM
+    if (gfx->getRotation() == 1) {
+        blitRot1ToCanvas(gfx->getFramebuffer(), (const uint16_t *)px_map, area->x1, area->y1, (int)w, (int)h,
+                         gfx->height()); // fast path: cache-friendly transpose
+    } else {
+        gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)px_map, w, h); // into canvas RAM
+    }
     g_renderUs += micros() - t0;
 
     if (lv_display_flush_is_last(disp)) {

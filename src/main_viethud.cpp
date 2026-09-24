@@ -42,9 +42,11 @@
 #include "core/AppConfig.h"
 #include "core/NvsStore.h"
 #include "core/SharedState.h"
+#include "demo/DemoMode.h"
 #include "display/DisplayDriver.h"
 #include "gnss/GNSS.h"
 #include "map/SpeedLimitManager.h"
+#include "map/SdCardManager.h"
 #include "log/TripLogger.h"
 #include "net/WebPortal.h"
 #include "touch/TouchTask.h"
@@ -53,6 +55,31 @@
 #include "audio/AudioPlayer.h"
 
 AppConfig cfg; // extern-declared in core/AppConfig.h — see the comment there
+
+// VRE boot-logo splash image (src/ui/logo_vre.c, RGB565A8, white keyed to
+// transparent) — user-requested 2026-09-24 boot screen.
+LV_IMAGE_DECLARE(logo_vre);
+
+// Arduino-ESP32's cores/esp32/main.cpp declares this as a WEAK function
+// (default 8192 bytes, see ARDUINO_LOOP_STACK_SIZE there) specifically so a
+// sketch can override it — this is that override. Raised to 16384
+// 2026-09-22 after a REAL, reproducible crash on hardware: "Guru Meditation
+// Error: Core 1 panic'ed (Unhandled debug exception) — Stack canary
+// watchpoint triggered (loopTask)" while map/RasterMapManager.cpp's
+// renderBackground() retried a failed SD read every 2s directly from
+// updateMapCanvas() (ui/Dashboard.cpp), itself called every ~150ms tick from
+// this file's own loop() — i.e. loopTask, the Arduino default/UI task this
+// whole file's setup()/loop() runs as (see this file's own header comment).
+// uxTaskGetStackHighWaterMark() had already been observed at a mere 278
+// bytes free right before the crash (this file's own [mem] block), so this
+// isn't a guess at a hypothetical risk — it's a confirmed near-miss that
+// then became a real one. Doubling to 16384 is the standard, minimal-risk
+// fix for genuine stack pressure (loopTask is UI-only work, not a
+// tightly-budgeted small task like the sensor tasks elsewhere in this
+// project) — it does not touch or explain away whatever in
+// RasterMapManager.cpp/SD_MMC's own call depth is actually consuming that
+// much stack, which is a separate thing worth understanding on its own.
+size_t getArduinoLoopTaskStackSize(void) { return 16384; }
 
 static lv_display_t *lvDisplay;
 static lv_indev_t *lvTouchIndev;
@@ -78,6 +105,74 @@ static void touch_read_cb(lv_indev_t *, lv_indev_data_t *data) {
 }
 
 // ---------------------------------------------------------------------
+// Boot splash (user-requested 2026-09-24): show the VRE logo for ~2s with a
+// modern motion — scale-in with a slight overshoot + fade-in, a brief hold,
+// then a fade-out that hands over to the Dashboard with a cross-fade. Driven
+// by a manual pump loop (we're single-threaded in setup() here) so the timing
+// is exact and the handover happens precisely at the end. dashboardScreen must
+// already be built before this is called (it's the cross-fade target).
+static void showBootSplash() {
+    lv_obj_t *splash = lv_obj_create(NULL);
+    lv_obj_remove_style_all(splash);
+    lv_obj_set_style_bg_opa(splash, LV_OPA_COVER, 0);
+    // Subtle vertical gradient (deep navy -> near-black) for a modern feel.
+    lv_obj_set_style_bg_color(splash, lv_color_hex(0x0A1526), 0);
+    lv_obj_set_style_bg_grad_color(splash, lv_color_hex(0x04060A), 0);
+    lv_obj_set_style_bg_grad_dir(splash, LV_GRAD_DIR_VER, 0);
+    lv_obj_clear_flag(splash, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *logo = lv_image_create(splash);
+    lv_image_set_src(logo, &logo_vre);
+    lv_obj_center(logo);
+    lv_image_set_pivot(logo, logo_vre.header.w / 2, logo_vre.header.h / 2);
+    lv_image_set_scale(logo, 128);          // start at 0.5x
+    lv_obj_set_style_opa(logo, LV_OPA_TRANSP, 0);
+    lv_screen_load(splash);
+
+    const uint32_t IN = 700, HOLD_END = 1550, TOTAL = 2000;
+    const float c1 = 1.70158f, c3 = c1 + 1.0f; // ease-out-back overshoot
+    uint32_t t0 = millis(), lastTick = t0;
+    for (;;) {
+        uint32_t now = millis();
+        uint32_t el = now - t0;
+        int scale; lv_opa_t opa;
+        if (el < IN) {
+            float p = (float)el / (float)IN;
+            float p1 = p - 1.0f;
+            float eb = 1.0f + c3 * p1 * p1 * p1 + c1 * p1 * p1; // overshoots ~1.1 then settles to 1
+            scale = 128 + (int)((256 - 128) * eb);
+            float o = (float)el / 500.0f; if (o > 1.0f) o = 1.0f;
+            opa = (lv_opa_t)(255.0f * o);
+        } else if (el < HOLD_END) {
+            scale = 256; opa = LV_OPA_COVER;
+        } else if (el < TOTAL) {
+            float q = (float)(el - HOLD_END) / (float)(TOTAL - HOLD_END);
+            scale = 256 + (int)(44 * q);                 // gentle grow on the way out
+            opa = (lv_opa_t)(255.0f * (1.0f - q));
+        } else {
+            break;
+        }
+        lv_image_set_scale(logo, scale);
+        lv_obj_set_style_opa(logo, opa, 0);
+        lv_tick_inc(now - lastTick); lastTick = now;
+        lv_timer_handler();
+        esp_task_wdt_reset();
+        delay(8);
+    }
+    // Cross-fade to the Dashboard; auto_del=true frees the splash afterwards.
+    lv_screen_load_anim(dashboardScreen, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, true);
+    // Pump the transition so it actually plays before setup() moves on.
+    uint32_t tt = millis(), lt = tt;
+    while (millis() - tt < 340) {
+        uint32_t now = millis();
+        lv_tick_inc(now - lt); lt = now;
+        lv_timer_handler();
+        esp_task_wdt_reset();
+        delay(8);
+    }
+}
+
+// ---------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
     delay(200);
@@ -93,7 +188,7 @@ void setup() {
     // hang confirmed 2026-09-14 blocked loop() outright with no error ever
     // returned). If loop() doesn't come back around to feed this within 5s,
     // the watchdog panics and reboots instead of freezing forever.
-    esp_task_wdt_init(5, true);
+    esp_task_wdt_init(10, true);
     esp_task_wdt_add(NULL);
 
     loadConfigFromNVS(cfg);
@@ -134,15 +229,17 @@ void setup() {
     lv_timer_set_period(lv_indev_get_read_timer(lvTouchIndev), 20);
     lv_indev_set_long_press_time(lvTouchIndev, HOLD_PRESS_MS);      // hold 1s anywhere on the dashboard = Settings
 
+    sdMgrMount();
     buildDashboard();
     buildSettingsScreen();
-    lv_screen_load(dashboardScreen);
+    showBootSplash(); // ~2s animated VRE logo, then cross-fades to the Dashboard
 
     sharedStateInit();
     gnssTaskStart();  // Core 0 — real GNSS M10N on UART2
     webPortalInit(); // Core 0 — WiFi AP + local web server, starts with WiFi OFF — see net/WebPortal.h
     speedLimitManagerStart(); // Core 0 — microSD speed-limit/camera/sign map matching, see map/SpeedLimitManager.h
     tripLoggerStart(); // Core 0 — microSD trip/event CSV logging, see log/TripLogger.h
+    demoModeStart(); // Core 0 — scripted UI demo, idles until switched on in Settings > Display (demo/DemoMode.h)
     // (Was disabled 2026-09-15 after two SPI-peripheral-contention
     // regressions — see pincfg.h's SD_MMC_CLK_PIN comment. Root cause: the
     // TF slot was never SPI at all, it's the ESP32-S3's dedicated SD_MMC
@@ -167,6 +264,26 @@ void loop() {
     // next boot banner pinpoints how long loop() actually ran before it
     // stuck, without needing to reproduce with a debugger attached.
     if (now0 - lastHb > 1000) { lastHb = now0; Serial.printf("[hb %lu]\n", now0); }
+
+    // TEMPORARY serial-triggered demo toggle (2026-09-22) — added purely to
+    // verify the live background-map feature while the touch controller is
+    // reporting a stuck/wrong X coordinate on real hardware (a real,
+    // pre-existing bug, separate from the map work — see [touch] log lines
+    // showing x=0 on every touch regardless of where the panel was actually
+    // pressed), which makes the Settings > Display > Demo mode SWITCH
+    // unreachable by touch right now. Type 'd' + Enter in the serial
+    // monitor to toggle it without touching the screen at all. Remove once
+    // the touch calibration bug is fixed and the real switch is reachable
+    // again — this bypasses the UI entirely and isn't meant to ship.
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == 'd') {
+            bool now2 = !demoModeIsEnabled();
+            demoModeSetEnabled(now2);
+            Serial.printf("[debug] demo mode toggled via serial -> %s\n", now2 ? "ON" : "OFF");
+        }
+    }
+
     uint32_t now = millis();
     lv_tick_inc(now - lastTick);
     lastTick = now;
@@ -180,6 +297,15 @@ void loop() {
                           g_flushUs / g_flushCount, g_renderUs / g_flushCount);
         }
         g_flushUs = g_renderUs = g_flushCount = 0;
+        // Live background map's own draw cost (ui/Dashboard.h) — separate
+        // line since it only increments on the (usually rare) ticks that
+        // actually redrew the map canvas, not every frame like the counters
+        // above; see the plan's own note that the spec's "<=10ms" render
+        // target needs measuring on real hardware, not assuming.
+        if (g_mapDrawCount) {
+            Serial.printf("[perf] map redraws=%lu  draw=%luus avg\n", g_mapDrawCount, g_mapDrawUs / g_mapDrawCount);
+        }
+        g_mapDrawUs = g_mapDrawCount = 0;
     }
 
     // Slow-leak early warning: if internal-RAM free space keeps trending

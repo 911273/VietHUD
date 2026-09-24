@@ -17,6 +17,10 @@ void loadConfigFromNVS(AppConfig &cfg) {
     cfg.audioEnabled = prefs.getBool("audioEn", cfg.audioEnabled);
     cfg.gnssSpeedFilterAlpha = prefs.getFloat("gnssAlpha", cfg.gnssSpeedFilterAlpha);
     cfg.gnssFixTimeoutS = prefs.getFloat("gnssFixTo", cfg.gnssFixTimeoutS);
+    cfg.gnssSpeedCalibrationPct = prefs.getFloat("gnssCalPct", cfg.gnssSpeedCalibrationPct);
+    cfg.overspeedOffsetKmh = prefs.getFloat("overspeedOff", cfg.overspeedOffsetKmh);
+    cfg.aheadLimitWarnDistM = prefs.getFloat("aheadWarnM", cfg.aheadLimitWarnDistM);
+    cfg.cameraWarnDistM = prefs.getFloat("camWarnM", cfg.cameraWarnDistM);
     cfg.tripLoggingEnabled = prefs.getBool("tripLogEn", cfg.tripLoggingEnabled);
     // getString(), not getFloat() — see AppConfig.h's wifiSsid/wifiPassword
     // comment. Copied into the fixed buffers rather than kept as a String:
@@ -30,6 +34,12 @@ void loadConfigFromNVS(AppConfig &cfg) {
     cfg.wifiPassword[sizeof(cfg.wifiPassword) - 1] = '\0';
     cfg.screenRotation = prefs.getFloat("screenRot", cfg.screenRotation);
     cfg.themeMode = prefs.getFloat("themeMode", cfg.themeMode);
+    cfg.mapSource = prefs.getFloat("mapSource", cfg.mapSource);
+    cfg.showVectorRoads = prefs.getBool("showVecRoads", cfg.showVectorRoads);
+    cfg.showVehicleTrail = prefs.getBool("showTrail", cfg.showVehicleTrail);
+    cfg.showRasterMap = prefs.getBool("showRaster", cfg.showRasterMap);
+    cfg.mapHeadingUp = prefs.getBool("mapHeadUp", cfg.mapHeadingUp);
+    cfg.defaultLimitKmh = prefs.getFloat("defLimitKmh", cfg.defaultLimitKmh);
     prefs.end();
     sanitizeConfig(cfg); // NaN/Inf guard against a corrupted flash page — must run BEFORE clamping, see its comment
     clampConfig(cfg);
@@ -42,10 +52,20 @@ void saveConfigToNVS(const AppConfig &cfg) {
     prefs.putBool("audioEn", cfg.audioEnabled);
     prefs.putFloat("gnssAlpha", cfg.gnssSpeedFilterAlpha);
     prefs.putFloat("gnssFixTo", cfg.gnssFixTimeoutS);
+    prefs.putFloat("gnssCalPct", cfg.gnssSpeedCalibrationPct);
+    prefs.putFloat("overspeedOff", cfg.overspeedOffsetKmh);
+    prefs.putFloat("aheadWarnM", cfg.aheadLimitWarnDistM);
+    prefs.putFloat("camWarnM", cfg.cameraWarnDistM);
     prefs.putBool("tripLogEn", cfg.tripLoggingEnabled);
     prefs.putString("wifiSsid", cfg.wifiSsid);
     prefs.putString("wifiPass", cfg.wifiPassword);
     prefs.putFloat("screenRot", cfg.screenRotation);
     prefs.putFloat("themeMode", cfg.themeMode);
+    prefs.putFloat("mapSource", cfg.mapSource);
+    prefs.putBool("showVecRoads", cfg.showVectorRoads);
+    prefs.putBool("showTrail", cfg.showVehicleTrail);
+    prefs.putBool("showRaster", cfg.showRasterMap);
+    prefs.putBool("mapHeadUp", cfg.mapHeadingUp);
+    prefs.putFloat("defLimitKmh", cfg.defaultLimitKmh);
     prefs.end();
 }

@@ -33,6 +33,40 @@ struct AppConfig {
     // hardcoded, once real hardware exists to tune against.
     float gnssSpeedFilterAlpha = 0.30f; // EMA weight on the new sample; higher = less smoothing, more lag
     float gnssFixTimeoutS = 3.0f;       // no fresh fix for this long -> report GNSS lost (spec T13)
+    // GPS speed calibration (user-requested 2026-09-22, "hieu chinh toc do
+    // GPS") — a real vehicle's own speedometer and a GPS-derived speed
+    // rarely agree exactly (tire wear/size, GPS's own small systematic
+    // error), so this lets the driver nudge the displayed/logged speed to
+    // match their speedometer. A PERCENTAGE, not a flat km/h offset: the
+    // real-world mismatch this corrects for (tire circumference, etc.) scales
+    // with speed rather than being a fixed number of km/h at every speed.
+    // Applied in gnss/GNSS.cpp to the raw module reading, before the
+    // median+EMA filter, so both rawSpeedKmh and the filtered egoSpeedKmh
+    // (and everything downstream: the Dashboard, overspeed logic, map
+    // matching's heading-gate speed check) see the corrected value — there is
+    // no separate "true" vs "displayed" speed anywhere else in this project.
+    float gnssSpeedCalibrationPct = 0.0f;
+    float overspeedOffsetKmh = 1.0f; // overspeed warning fires when egoSpeed > limit + this (km/h). Clamp 0..10; user-tunable in Settings > Sensors and web /config.
+
+    // Ahead-warning lookahead/trigger distances (user-requested 2026-09-22)
+    // — both used to be fixed constants in map/SpeedLimitManager.cpp
+    // (kAheadLookaheadM/kCameraWarnDistanceM); moved here so they're tunable
+    // per-driver (a highway driver wants more warning distance at speed than
+    // someone doing city traffic) without a firmware rebuild. Sign warnings
+    // (resident-area/no-overtaking/toll/traffic-light) keep their own
+    // separate fixed distance in SpeedLimitManager.cpp — not requested to be
+    // configurable, and giving every alert type its own slider would clutter
+    // Settings for little real benefit given they're all in the same
+    // 300-400m ballpark already.
+    //
+    // Both capped at 100m max / 100m default (user-requested 2026-09-22,
+    // "khoang cach toi da de canh bao la 100m, mac dinh la 100m") — was
+    // 50-300m/100m and 100-800m/300m respectively; camera's default dropped
+    // from 300 to 100 to match. Floor stays at 50m on both (not also pulled
+    // down to 100) so the slider still has real room to move rather than
+    // collapsing to a single fixed value.
+    float aheadLimitWarnDistM = 100.0f; // how far ahead to project + re-match for an upcoming speed-limit CHANGE
+    float cameraWarnDistM = 100.0f;     // how far out an upcoming speed camera starts showing on the alert card
 
     // Trip logging (log/TripLogger.cpp) — periodic + event-triggered CSV log
     // to the microSD card, for reviewing a drive's speed-limit/camera/sign
@@ -52,7 +86,7 @@ struct AppConfig {
     // Settings > WiFi — see net/WebPortal.h. Defaults renamed 2026-09-21
     // (radar_car -> VietHUD product rename) — no functional change.
     char wifiSsid[32] = "VietHUD";
-    char wifiPassword[64] = "viethud123"; // WPA2 needs >=8 chars — see WebPortal.cpp's applyWifiState() fallback
+    char wifiPassword[64] = "12345678"; // WPA2 needs >=8 chars — see WebPortal.cpp's applyWifiState() fallback
 
     // Display settings (user-requested 2026-09-15). Both are floats used as
     // small enums — no dropdown widget exists in Settings.cpp, only sliders.
@@ -66,7 +100,7 @@ struct AppConfig {
     // take effect live (see ui/Settings.cpp's rotation row): both Dashboard
     // and Settings are laid out once at boot for whichever orientation is
     // active then, so a change only applies on the next restart.
-    float screenRotation = 1;
+    float screenRotation = 0;
     // themeMode: 0=Auto (today's only behavior — ui/Dashboard.cpp's
     // applyTheme() follows gnss.daytime's real sunrise/sunset calculation),
     // 1=Light, 2=Dark (both override gnss.daytime rather than replacing the
@@ -74,6 +108,27 @@ struct AppConfig {
     // runs regardless, since the sun icon and the local-time-from-longitude
     // estimate both still need it). Applies live, no restart needed.
     float themeMode = 0;
+    // Map settings: 0 = CartoDB Dark, 1 = OpenStreetMap (OSM), 2 = OSM Dark
+    float mapSource = 0;
+    bool showVectorRoads = true;
+    bool showVehicleTrail = true;
+    // Raster (JPEG tile) background on/off (2026-09-24, user-requested "bản đồ
+    // theo file jpeg hoặc theo vector"). Turn this OFF for a pure vector map
+    // (which needs only tiles.bin, not the 415MB maptiles.bin) — a reliable
+    // fallback if the raster tiles don't load. With showVectorRoads this gives
+    // the JPEG-vs-vector choice: both on = raster + roads; raster off = vector
+    // only; vector off = raster only.
+    bool showRasterMap = true;
+    // Heading-up map rotation (2026-09-24). true = the whole map rotates so the
+    // travel direction is always at 12 o'clock; false = north-up (map fixed,
+    // north up) — the simpler, proven mode, and a fallback if rotation
+    // misbehaves on a given panel.
+    bool mapHeadingUp = true;
+    // Fallback speed limit shown when the position genuinely can't resolve a
+    // limit (no GPS fix's road match, off the mapped network). 0 = off (show
+    // "--"). Default 50 = Vietnam's baseline urban limit (user-requested
+    // 2026-09-24). Only applied with a real fix; source is marked DEFAULT.
+    float defaultLimitKmh = 50.0f;
 };
 
 // Single shared instance, defined in main_ui_demo.cpp. NOTE: read without a
@@ -90,8 +145,14 @@ inline void clampConfig(AppConfig &c) {
     c.autoDimMin = constrain(c.autoDimMin, 0.0f, 30.0f);
     c.gnssSpeedFilterAlpha = constrain(c.gnssSpeedFilterAlpha, 0.05f, 0.90f);
     c.gnssFixTimeoutS = constrain(c.gnssFixTimeoutS, 1.0f, 10.0f);
+    c.gnssSpeedCalibrationPct = constrain(c.gnssSpeedCalibrationPct, -15.0f, 15.0f);
+    c.overspeedOffsetKmh = constrain(c.overspeedOffsetKmh, 0.0f, 10.0f);
+    c.defaultLimitKmh = constrain(c.defaultLimitKmh, 0.0f, 120.0f);
+    c.aheadLimitWarnDistM = constrain(c.aheadLimitWarnDistM, 50.0f, 100.0f);
+    c.cameraWarnDistM = constrain(c.cameraWarnDistM, 50.0f, 100.0f);
     c.screenRotation = constrain(c.screenRotation, 0.0f, 3.0f);
     c.themeMode = constrain(c.themeMode, 0.0f, 2.0f);
+    c.mapSource = constrain(c.mapSource, 0.0f, 2.0f);
 }
 
 // Replaces any non-finite (NaN/Inf) field with AppConfig's own default —
@@ -109,6 +170,12 @@ inline void sanitizeConfig(AppConfig &c) {
     if (!isfinite(c.autoDimMin)) c.autoDimMin = d.autoDimMin;
     if (!isfinite(c.gnssSpeedFilterAlpha)) c.gnssSpeedFilterAlpha = d.gnssSpeedFilterAlpha;
     if (!isfinite(c.gnssFixTimeoutS)) c.gnssFixTimeoutS = d.gnssFixTimeoutS;
+    if (!isfinite(c.gnssSpeedCalibrationPct)) c.gnssSpeedCalibrationPct = d.gnssSpeedCalibrationPct;
+    if (!isfinite(c.overspeedOffsetKmh)) c.overspeedOffsetKmh = d.overspeedOffsetKmh;
+    if (!isfinite(c.defaultLimitKmh)) c.defaultLimitKmh = d.defaultLimitKmh;
+    if (!isfinite(c.aheadLimitWarnDistM)) c.aheadLimitWarnDistM = d.aheadLimitWarnDistM;
+    if (!isfinite(c.cameraWarnDistM)) c.cameraWarnDistM = d.cameraWarnDistM;
     if (!isfinite(c.screenRotation)) c.screenRotation = d.screenRotation;
     if (!isfinite(c.themeMode)) c.themeMode = d.themeMode;
+    if (!isfinite(c.mapSource)) c.mapSource = d.mapSource;
 }

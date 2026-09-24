@@ -68,8 +68,18 @@ def main():
             heading = int(round(raw_heading * 2.0)) % 360 if raw_heading > 0 else 0xFFFF
             sign_type = int(row.get("sign_type", 1))
 
-            # Determine subtype: 0 = start/active, 1 = end
-            sub_type = 1 if speed == 0 and sign_type in (1, 2, 3) else 0
+            # Determine sign type and subtype:
+            # Type 2: R.420 - Bat dau khu dong dan cu (start: subType=0)
+            # Type 3: R.421 - Het khu dong dan cu (end: subType=1, mapped to SIGN_TYPE_RESIDENT_AREA)
+            if sign_type == 2:
+                actual_sign_type = 2 # SIGN_TYPE_RESIDENT_AREA
+                sub_type = 0         # Start
+            elif sign_type == 3:
+                actual_sign_type = 2 # SIGN_TYPE_RESIDENT_AREA
+                sub_type = 1         # End
+            else:
+                actual_sign_type = sign_type
+                sub_type = 0
 
             # 1. Type 4 is speed camera / enforcement camera -> goes into cameras.bin
             if sign_type == 4:
@@ -88,7 +98,7 @@ def main():
                 latE7=to_e7(lat),
                 lonE7=to_e7(lon),
                 directionDeg=heading,
-                signType=sign_type,
+                signType=actual_sign_type,
                 speedLimitKmh=speed if 0 <= speed <= 255 else 0,
                 subType=sub_type,
                 flags=0,

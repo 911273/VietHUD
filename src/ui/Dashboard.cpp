@@ -1,4 +1,8 @@
+#include "map/SpeedLimitManager.h"
+#include <esp_task_wdt.h>
 #include "Dashboard.h"
+#include "map/MapRenderer.h"
+#include "map/RasterMapManager.h"
 #include "Settings.h" // settingsScreen, for the hold-to-open-Settings gesture
 #include "core/AppConfig.h"
 #include "core/NvsStore.h" // saveConfigToNVS()
@@ -7,7 +11,27 @@
 #include "gnss/GNSS.h" // gnssMsSinceStationary() — auto-dim's vehicle-stationary gate
 #include "icons/Icons.h"
 #include "net/WebPortal.h"
-#include "audio/AudioPlayer.h" // webPortalIsEnabled()/webPortalRequestEnable() — the 4s hold gesture toggles WiFi
+#include "audio/AudioPlayer.h"
+
+LV_FONT_DECLARE(lv_font_montserrat_speed); // webPortalIsEnabled()/webPortalRequestEnable() — the 4s hold gesture toggles WiFi
+LV_FONT_DECLARE(lv_font_vn_14); // Vietnamese-capable text font (Arial 14px, ASCII+VN); drop-in for montserrat_14
+
+// Copies a UTF-8 road name into `out`, abbreviating a leading Vietnamese
+// "Đường " to "Đ. " (user-requested 2026-09-24 — street names from the OSM DB
+// are almost all prefixed "Đường ...", which overflows the narrow badge). The
+// match is on the raw UTF-8 bytes of "Đường " so it is encoding-safe. Only the
+// leading occurrence is abbreviated; the rest is copied verbatim.
+static void abbreviateRoadName(const char *in, char *out, size_t outsz) {
+    if (!in || !out || outsz == 0) return;
+    static const char kDuong[] = "\xC4\x90\xC6\xB0\xE1\xBB\x9Dng "; // "Đường " in UTF-8
+    const size_t kLen = sizeof(kDuong) - 1;
+    if (strncmp(in, kDuong, kLen) == 0) {
+        snprintf(out, outsz, "\xC4\x90. %s", in + kLen); // "Đ. " + remainder
+    } else {
+        strncpy(out, in, outsz - 1);
+        out[outsz - 1] = '\0';
+    }
+}
 #include <math.h>
 #include <string.h>
 
@@ -124,11 +148,36 @@ static const int LS_PARAM_COL_W = 240, LS_ROAD_COL_W = LS_SCR_W - LS_PARAM_COL_W
 static const int LS_ROAD_COL_X = LS_PARAM_COL_W;
 static const int LS_COL_TOP = LS_TOP_H, LS_COL_H = LS_SCR_H - LS_TOP_H - LS_BOTTOM_H;
 
+// --- Map Canvas & Digital Zoom ---
+static lv_obj_t *mapCanvas = nullptr;
+static uint16_t *mapCanvasBuf = nullptr;
+static lv_obj_t *egoArrow = nullptr;
+static lv_obj_t *egoHalo = nullptr;
+// North indicator (user-requested 2026-09-24): a short line + "N" that always
+// points to true North. In heading-up mode the map rotates, so North swings
+// around the car; this line shows it. Lives in a fixed screen corner, updated
+// each refresh from the current heading.
+static lv_obj_t *northLine = nullptr;
+static lv_obj_t *northLabel = nullptr;
+static int northCx = 30, northCy = 34; // compass center (screen px)
+static const int kNorthR = 16;         // line length
+static uint32_t lastDrawnMapGeneration = 0xFFFFFFFFu;
+static bool mapDimmed = false;
+static int egoAnchorX = 240, egoAnchorY = 213;
+static int gCanvasW = 480, gCanvasH = 320;
+static int gMapSideS = 578, gMapCenter = 289; // oversized heading-up canvas: square side + its center (rotation pivot)
+static int gRefMinDim = 160;                  // on-screen minDim framing the zoom (see buildMapCanvas)
+static float gMapZoomScale = 1.0f; // Default 2.0x digital zoom (~2.2m/px)
+uint32_t g_mapDrawUs = 0, g_mapDrawCount = 0;
+
 // --- Top bar ---
 static lv_obj_t *gnssIcon, *gnssCaption;
 static lv_obj_t *sunIcon, *clockLabel;
 static lv_obj_t *gearIcon;
-static lv_obj_t *wifiTopIcon; // shown only while WiFi is on — see refreshDashboard()
+static lv_obj_t *wifiTopIcon; // shown only while WiFi is on
+static lv_obj_t *streetNameBadge = nullptr;
+static lv_obj_t *streetNameIcon = nullptr;
+static lv_obj_t *streetNameLabel = nullptr;
 static lv_obj_t *colDividerLine[2];
 
 // --- Left column: speed + speed limit ---
@@ -172,100 +221,78 @@ static lv_obj_t *aheadLimitLabel;
 static lv_obj_t *cameraAheadLabel;
 static lv_obj_t *trafficSignLabel;
 
-// Dedicated Traffic & Camera Alert Card (Redesigned HUD for GPS Speed & Traffic Signs)
+// Dedicated Traffic & Camera Alert Card (Minimalist HUD: Icon + Mini Speed Sign + Distance)
 static lv_obj_t *trafficCard = nullptr;
-static lv_obj_t *alertBadgeLabel = nullptr;
+static lv_obj_t *alertIconImg = nullptr;
+static lv_obj_t *alertMiniSpeedSign = nullptr;
+static lv_obj_t *alertMiniSpeedVal = nullptr;
 static lv_obj_t *alertDistLabel = nullptr;
-static lv_obj_t *alertUnitLabel = nullptr;
-static lv_obj_t *alertSubLabel = nullptr;
 static lv_obj_t *alertProgressBar = nullptr;
-static lv_obj_t *alertFooterLabel = nullptr;
 
 static void buildTrafficCard(lv_obj_t *parent, int w, int h) {
     trafficCard = lv_obj_create(parent);
     lv_obj_set_size(trafficCard, w, h);
-    lv_obj_set_pos(trafficCard, (lv_obj_get_width(parent) - w) / 2, 8);
-    lv_obj_set_style_bg_color(trafficCard, lv_color_hex(0x111720), 0);
-    lv_obj_set_style_border_color(trafficCard, lv_color_hex(0x283848), 0);
+    lv_obj_align(trafficCard, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(trafficCard, lv_color_hex(0x0C1420), 0);
+    lv_obj_set_style_bg_opa(trafficCard, LV_OPA_90, 0);
+    lv_obj_set_style_border_color(trafficCard, lv_color_hex(0x28384C), 0);
     lv_obj_set_style_border_width(trafficCard, 2, 0);
-    lv_obj_set_style_radius(trafficCard, 10, 0);
-    lv_obj_set_style_pad_all(trafficCard, 4, 0);
+    lv_obj_set_style_radius(trafficCard, h / 2, 0); // Sleek capsule shape
+    lv_obj_set_style_pad_all(trafficCard, 0, 0);
+    lv_obj_set_style_shadow_color(trafficCard, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_width(trafficCard, 12, 0);
+    lv_obj_set_style_shadow_opa(trafficCard, LV_OPA_60, 0);
     lv_obj_clear_flag(trafficCard, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(trafficCard, LV_OBJ_FLAG_CLICKABLE);
 
-    // Badge pill at top. Explicit width + clip (2026-09-22 — see this
-    // file's buildDashboardLandscape() comment on bottomInfoLabel for why
-    // every runtime-text label in this dashboard now gets one): the longest
-    // real value here is "DEN TIN HIEU GIAO THONG" (refreshDashboard()),
-    // which was already comfortably inside the card at content-hug size, so
-    // pinning the width to the card's own usable interior just forecloses
-    // ever going wider than the card instead of trusting that to stay true.
-    alertBadgeLabel = lv_label_create(trafficCard);
-    lv_obj_set_style_bg_color(alertBadgeLabel, lv_color_hex(0x202A36), 0);
-    lv_obj_set_style_bg_opa(alertBadgeLabel, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(alertBadgeLabel, lv_color_hex(0x88A0B8), 0);
-    lv_obj_set_style_text_font(alertBadgeLabel, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_pad_hor(alertBadgeLabel, 10, 0);
-    lv_obj_set_style_pad_ver(alertBadgeLabel, 3, 0);
-    lv_obj_set_style_radius(alertBadgeLabel, 12, 0);
-    lv_obj_set_width(alertBadgeLabel, w - 16);
-    lv_label_set_long_mode(alertBadgeLabel, LV_LABEL_LONG_CLIP);
-    lv_obj_set_style_text_align(alertBadgeLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(alertBadgeLabel, LV_ALIGN_TOP_MID, 0, 6);
-    lv_label_set_text(alertBadgeLabel, "DUONG THONG THOANG");
+    // Left Slot 1: Official 36x36 QCVN Sign Icon / Camera Icon
+    alertIconImg = lv_image_create(trafficCard);
+    lv_image_set_src(alertIconImg, &camera_icon);
+    lv_obj_set_size(alertIconImg, 36, 36);
+    lv_obj_align(alertIconImg, LV_ALIGN_LEFT_MID, 16, 0);
+    lv_obj_clear_flag(alertIconImg, LV_OBJ_FLAG_CLICKABLE);
 
-    // Big countdown distance number
+    // Left Slot 2: Mini P.127 Speed Limit Sign (Diameter 38px, Circular with Red Border)
+    static const int kMiniSignDiam = 38;
+    alertMiniSpeedSign = lv_obj_create(trafficCard);
+    lv_obj_set_size(alertMiniSpeedSign, kMiniSignDiam, kMiniSignDiam);
+    lv_obj_align(alertMiniSpeedSign, LV_ALIGN_LEFT_MID, 58, 0);
+    lv_obj_set_style_radius(alertMiniSpeedSign, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(alertMiniSpeedSign, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(alertMiniSpeedSign, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(alertMiniSpeedSign, lv_color_hex(0xE60000), 0);
+    lv_obj_set_style_border_width(alertMiniSpeedSign, 4, 0);
+    lv_obj_set_style_pad_all(alertMiniSpeedSign, 0, 0);
+    lv_obj_clear_flag(alertMiniSpeedSign, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(alertMiniSpeedSign, LV_OBJ_FLAG_CLICKABLE);
+
+    alertMiniSpeedVal = lv_label_create(alertMiniSpeedSign);
+    lv_obj_set_style_text_font(alertMiniSpeedVal, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(alertMiniSpeedVal, lv_color_black(), 0);
+    lv_obj_align(alertMiniSpeedVal, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(alertMiniSpeedVal, "60");
+
+    // Right Slot: Large countdown distance ("350 m", "120 m")
     alertDistLabel = lv_label_create(trafficCard);
-    lv_obj_set_style_text_font(alertDistLabel, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_font(alertDistLabel, &lv_font_montserrat_36, 0);
     lv_obj_set_style_text_color(alertDistLabel, lv_color_white(), 0);
-    lv_obj_align(alertDistLabel, LV_ALIGN_CENTER, -10, -18);
-    lv_label_set_text(alertDistLabel, "--");
+    lv_obj_align(alertDistLabel, LV_ALIGN_RIGHT_MID, -20, 0);
+    lv_label_set_text(alertDistLabel, "");
 
-    alertUnitLabel = lv_label_create(trafficCard);
-    lv_obj_set_style_text_font(alertUnitLabel, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(alertUnitLabel, lv_color_hex(0x8899AA), 0);
-    lv_obj_align_to(alertUnitLabel, alertDistLabel, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -8);
-    lv_label_set_text(alertUnitLabel, "");
-
-    // Subtitle / limit speed. Explicit width + clip, same reasoning as
-    // alertBadgeLabel above — refreshDashboard() sets this to several
-    // different runtime-built strings (e.g. "GPS Tot (%d ve tinh)").
-    alertSubLabel = lv_label_create(trafficCard);
-    lv_obj_set_style_text_font(alertSubLabel, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(alertSubLabel, lv_color_hex(0xCCD4DC), 0);
-    lv_obj_set_width(alertSubLabel, w - 16);
-    lv_label_set_long_mode(alertSubLabel, LV_LABEL_LONG_CLIP);
-    lv_obj_set_style_text_align(alertSubLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(alertSubLabel, LV_ALIGN_CENTER, 0, 30);
-    lv_label_set_text(alertSubLabel, "Dang tim GPS...");
-
-    // Progress bar
+    // Bottom edge: Thin progress bar
     alertProgressBar = lv_bar_create(trafficCard);
-    lv_obj_set_size(alertProgressBar, w - 36, 6);
-    lv_obj_align(alertProgressBar, LV_ALIGN_BOTTOM_MID, 0, -32);
+    lv_obj_set_size(alertProgressBar, w - 36, 3);
+    lv_obj_align(alertProgressBar, LV_ALIGN_BOTTOM_MID, 0, -2);
     lv_bar_set_range(alertProgressBar, 0, 350);
     lv_bar_set_value(alertProgressBar, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(alertProgressBar, lv_color_hex(0x202B38), 0);
+    lv_obj_set_style_bg_color(alertProgressBar, lv_color_hex(0x182434), 0);
     lv_obj_set_style_bg_color(alertProgressBar, lv_color_hex(0xE0A020), LV_PART_INDICATOR);
-    lv_obj_set_style_radius(alertProgressBar, 3, 0);
-    lv_obj_set_style_radius(alertProgressBar, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(alertProgressBar, 2, 0);
+    lv_obj_set_style_radius(alertProgressBar, 2, LV_PART_INDICATOR);
 
-    // Region/version hint at very bottom (was a live radar-target hint
-    // before radar removal 2026-09-21 — see bottomInfoLabel below, which
-    // already shows this same speed-map info in the outer bottom bar; this
-    // card-local line stays a static "Offline VietHUD" caption instead of
-    // duplicating a value that changes every tick right above it).
-    // Static text (never rewritten after this), but given the same
-    // explicit width + clip as every other label in this card for
-    // consistency — cheap insurance, not because this one was suspected.
-    alertFooterLabel = lv_label_create(trafficCard);
-    lv_obj_set_style_text_font(alertFooterLabel, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(alertFooterLabel, lv_color_hex(0x607890), 0);
-    lv_obj_set_width(alertFooterLabel, w - 16);
-    lv_label_set_long_mode(alertFooterLabel, LV_LABEL_LONG_CLIP);
-    lv_obj_set_style_text_align(alertFooterLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(alertFooterLabel, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_label_set_text(alertFooterLabel, "VietHUD - Offline GPS speed guide");
+    // Hidden by default
+    lv_obj_add_flag(trafficCard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(alertMiniSpeedSign, LV_OBJ_FLAG_HIDDEN);
 }
 
 // --- Bottom info bar ---
@@ -363,17 +390,462 @@ static void onDashLongPressedRepeat(lv_event_t *) {
 
 static void onDashReleasedOrLost(lv_event_t *) {
     hideHoldRing();
-    if (releaseHandledThisPress) return; // see its own declaration comment
+    if (releaseHandledThisPress) return;
     releaseHandledThisPress = true;
-    if (wifiToggledThisPress) return; // already handled above — don't also open Settings
+    if (wifiToggledThisPress) return;
     if (longPressFired) {
         lv_screen_load(settingsScreen);
         return;
     }
+    // Short tap: Cycle map zoom level (1.5x -> 2.0x -> 2.5x -> 1.5x)
+    if (gMapZoomScale < 1.7f) {
+        gMapZoomScale = 2.0f;
+    } else if (gMapZoomScale < 2.3f) {
+        gMapZoomScale = 2.5f;
+    } else {
+        gMapZoomScale = 1.5f;
+    }
+    // Drive the unified zoom so BOTH the vector layer and the raster background
+    // change together (raster tracks the published zoomRadiusM). Force an
+    // immediate redraw by invalidating the last-drawn generation.
+    mapRendererSetZoomMultiplier(gMapZoomScale);
+    lastDrawnMapGeneration = 0;
+    char zBuf[32];
+    snprintf(zBuf, sizeof(zBuf), "Zoom: %.1fx", (double)gMapZoomScale);
+    if (wifiToastLabel) {
+        lv_label_set_text(wifiToastLabel, zBuf);
+        lv_obj_clear_flag(wifiToastLabel, LV_OBJ_FLAG_HIDDEN);
+        wifiToastUntilMs = millis() + 1200;
+    }
+    lastDrawnMapGeneration = 0; // Trigger redraw with new zoom level immediately
 }
 
 // Plain, non-interactive container — used for the top-bar row and the three
 // columns. Transparent/borderless so it's invisible except for its children.
+
+// ---------------------------------------------------------------------
+// Full-Screen Map Canvas (Raster Background + Vector Overlays)
+// ---------------------------------------------------------------------
+
+
+struct RoadClassStyle {
+    lv_color_t color;
+    int32_t width;
+};
+static RoadClassStyle mapClassStyle(uint8_t roadClass) {
+    // Neutral, understated palette (user-requested "màu trung tính ... layer
+    // ẩn"): soft greys that read on the dark map without shouting; the road
+    // you're on keeps a muted cyan accent so it's still findable at a glance.
+    switch (roadClass) {
+        case kMapLineCurrentRoad: return {lv_color_hex(0x7FD3E0), 5};  // muted cyan — current road
+        case 1: return {lv_color_hex(0xB4BCC6), 4};  // major — light neutral grey
+        case 2: return {lv_color_hex(0x8A94A0), 3};  // main — mid grey
+        default: return {lv_color_hex(0x616A76), 2}; // small/other — dim grey (still visible on 0x04060A)
+    }
+}
+
+static lv_color_t mapMarkerColor(uint8_t kind) {
+    switch (kind) {
+        case MAP_MARKER_CAMERA: return lv_color_hex(0xE0A020);
+        case MAP_MARKER_RESIDENT_AREA: return lv_color_hex(0x2080C0);
+        case MAP_MARKER_NO_OVERTAKING: return lv_color_hex(0xD04020);
+        case MAP_MARKER_TRAFFIC_LIGHT: return lv_color_hex(0x209060);
+        case MAP_MARKER_TOLL_BOOTH: return lv_color_hex(0x7050B0);
+        default: return lv_color_hex(0x90A4B8);
+    }
+}
+
+static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
+    gCanvasW = w;
+    gCanvasH = h;
+
+    // On-screen ego anchor (where the car icon sits) — keep the existing
+    // placement so the driver's viewpoint is unchanged.
+    int screenAnchorX = w / 2;
+    int screenAnchorY = (h > w) ? 200 : (h / 2);
+    egoAnchorX = screenAnchorX;
+    egoAnchorY = screenAnchorY;
+
+    // Heading-up map (2026-09-24): the map canvas is drawn NORTH-UP and rotated
+    // as a whole (LVGL image rotation) so travel points at 12 o'clock. For the
+    // rotation to never leave a screen corner blank, the canvas is an OVERSIZED
+    // SQUARE whose inscribed circle reaches every screen corner from the ego
+    // anchor. Its center is the ego (rotation pivot); it's positioned so that
+    // center lands on the on-screen anchor.
+    auto cornerDist = [&](int cx, int cy) {
+        float best = 0;
+        int xs[2] = {0, w}, ys[2] = {0, h};
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++) {
+                float dx = xs[i] - cx, dy = ys[j] - cy;
+                float d = sqrtf(dx * dx + dy * dy);
+                if (d > best) best = d;
+            }
+        return best;
+    };
+    int maxR = (int)ceilf(cornerDist(screenAnchorX, screenAnchorY)) + 4;
+    int S = maxR * 2;
+    if (S & 1) S++; // even, so center is exact
+    gMapSideS = S;
+    gMapCenter = S / 2;
+    // Reference minDim that frames the zoom to the VISIBLE screen (all four
+    // margins from the on-screen anchor), independent of the oversized canvas.
+    int refMin = screenAnchorX;
+    if (screenAnchorY < refMin) refMin = screenAnchorY;
+    if (w - screenAnchorX < refMin) refMin = w - screenAnchorX;
+    if (h - screenAnchorY < refMin) refMin = h - screenAnchorY;
+    if (refMin < 1) refMin = 1;
+    gRefMinDim = refMin;
+
+    size_t bufBytes = (size_t)S * (size_t)S * sizeof(uint16_t);
+    mapCanvasBuf = (uint16_t *)heap_caps_malloc(bufBytes, MALLOC_CAP_SPIRAM);
+    if (!mapCanvasBuf) {
+        Serial.println("[ui] WARN: PSRAM allocation for map canvas failed, falling back to internal RAM");
+        mapCanvasBuf = (uint16_t *)malloc(bufBytes);
+    }
+    mapCanvas = lv_canvas_create(parent);
+    lv_canvas_set_buffer(mapCanvas, mapCanvasBuf, S, S, LV_COLOR_FORMAT_RGB565);
+    lv_obj_set_pos(mapCanvas, screenAnchorX - S / 2, screenAnchorY - S / 2);
+    lv_obj_set_size(mapCanvas, S, S);
+    lv_canvas_fill_bg(mapCanvas, lv_color_hex(0x06080C), LV_OPA_COVER);
+    lv_obj_set_style_opa(mapCanvas, LV_OPA_COVER, 0); // opaque: avoids blending the large map canvas over the bg every redraw (perf)
+    lv_obj_clear_flag(mapCanvas, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(mapCanvas, LV_OBJ_FLAG_CLICKABLE);
+    // Rotate the whole canvas about the ego (its center) — set each redraw in
+    // updateMapCanvas(); pivot is fixed here.
+    lv_image_set_pivot(mapCanvas, S / 2, S / 2);
+    lv_image_set_antialias(mapCanvas, false); // nearest-neighbor: far cheaper per rotated frame on the ESP32
+
+    mapRendererSetGeometry(S, S / 2, S / 2, gRefMinDim);
+    mapRendererSetZoomMultiplier(gMapZoomScale);
+    RasterMapManager::instance().setMapSource((uint8_t)(int)cfg.mapSource);
+
+    int anchorX = screenAnchorX;
+    int anchorY = screenAnchorY;
+
+    // Outer navigation pulse ring
+    egoHalo = lv_obj_create(parent);
+    lv_obj_set_size(egoHalo, 38, 38);
+    lv_obj_set_pos(egoHalo, anchorX - 19, anchorY - 19);
+    lv_obj_set_style_radius(egoHalo, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(egoHalo, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_bg_opa(egoHalo, LV_OPA_20, 0);
+    lv_obj_set_style_border_color(egoHalo, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_border_width(egoHalo, 1, 0);
+    lv_obj_set_style_border_opa(egoHalo, LV_OPA_50, 0);
+    lv_obj_clear_flag(egoHalo, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(egoHalo, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Modern 3D Navigation Chevron (Tip, Right wing, Center notch, Left wing, Tip)
+    static lv_point_precise_t arrowPts[6];
+    arrowPts[0] = {(lv_value_precise_t)anchorX, (lv_value_precise_t)(anchorY - 15)};
+    arrowPts[1] = {(lv_value_precise_t)(anchorX + 11), (lv_value_precise_t)(anchorY + 11)};
+    arrowPts[2] = {(lv_value_precise_t)anchorX, (lv_value_precise_t)(anchorY + 5)};
+    arrowPts[3] = {(lv_value_precise_t)(anchorX - 11), (lv_value_precise_t)(anchorY + 11)};
+    arrowPts[4] = arrowPts[0];
+    egoArrow = lv_line_create(parent);
+    lv_line_set_points(egoArrow, arrowPts, 5);
+    lv_obj_set_style_line_width(egoArrow, 3, 0);
+    lv_obj_set_style_line_color(egoArrow, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_line_rounded(egoArrow, true, 0);
+    lv_obj_clear_flag(egoArrow, LV_OBJ_FLAG_CLICKABLE);
+
+    // --- Edge-fade vignette (user-requested 2026-09-24: "gradient mờ dần về
+    // các cạnh ... nhìn cho hiện đại"). Four screen-fixed strips, each a linear
+    // gradient from the dark bg colour at the edge fading to transparent toward
+    // the centre, so the map reads clear in the middle and melts into the bezel
+    // at the edges. Radial gradients are disabled in lv_conf, so 4 linear edges
+    // approximate a vignette (corners darkest where two overlap). Above the map
+    // + ego, below the later UI (created after this), so text stays crisp.
+    {
+        const lv_color_t edge = lv_color_hex(0x02040A);
+        const lv_opa_t EDGE_OPA = 190;
+        int fw = gCanvasW, fh = gCanvasH;
+        int vw = fw / 5, vh = fh / 4; // fade band thickness
+        static lv_grad_dsc_t gTop, gBot, gLeft, gRight;
+        auto mkStrip = [&](int x, int y, int w, int h, lv_grad_dsc_t &g, lv_grad_dir_t dir, bool edgeAtStart) {
+            lv_obj_t *o = lv_obj_create(parent);
+            lv_obj_remove_style_all(o);
+            lv_obj_set_pos(o, x, y);
+            lv_obj_set_size(o, w, h);
+            lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE);
+            g.dir = dir;
+            g.stops_count = 2;
+            // stop 0 = start of the axis (top for VER, left for HOR); stop 1 = end
+            g.stops[0].color = edge; g.stops[0].frac = 0;
+            g.stops[1].color = edge; g.stops[1].frac = 255;
+            g.stops[0].opa = edgeAtStart ? EDGE_OPA : LV_OPA_TRANSP;
+            g.stops[1].opa = edgeAtStart ? LV_OPA_TRANSP : EDGE_OPA;
+            lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_grad(o, &g, 0);
+        };
+        mkStrip(0, 0, fw, vh, gTop, LV_GRAD_DIR_VER, true);            // top edge dark -> down clear
+        mkStrip(0, fh - vh, fw, vh, gBot, LV_GRAD_DIR_VER, false);     // bottom edge dark
+        mkStrip(0, 0, vw, fh, gLeft, LV_GRAD_DIR_HOR, true);          // left edge dark
+        mkStrip(fw - vw, 0, vw, fh, gRight, LV_GRAD_DIR_HOR, false);  // right edge dark
+    }
+
+    // --- North indicator (user-requested): a short line + "N" that always
+    // points to true North. Rotated each refresh to -heading so it swings as
+    // the heading-up map rotates. Fixed in the bottom-left corner.
+    northCx = 30;
+    northCy = gCanvasH - 34;
+    static lv_point_precise_t northPts[2];
+    northPts[0] = {(lv_value_precise_t)northCx, (lv_value_precise_t)northCy};
+    northPts[1] = {(lv_value_precise_t)northCx, (lv_value_precise_t)(northCy - kNorthR)};
+    northLine = lv_line_create(parent);
+    lv_line_set_points(northLine, northPts, 2);
+    lv_obj_set_style_line_width(northLine, 3, 0);
+    lv_obj_set_style_line_color(northLine, lv_color_hex(0xFF4D4D), 0); // red = North, compass convention
+    lv_obj_set_style_line_rounded(northLine, true, 0);
+    lv_obj_clear_flag(northLine, LV_OBJ_FLAG_CLICKABLE);
+    northLabel = lv_label_create(parent);
+    lv_label_set_text(northLabel, "N");
+    lv_obj_set_style_text_font(northLabel, &lv_font_vn_14, 0);
+    lv_obj_set_style_text_color(northLabel, lv_color_hex(0xFF6666), 0);
+    lv_obj_set_pos(northLabel, northCx - 4, northCy - kNorthR - 16);
+    lv_obj_clear_flag(northLabel, LV_OBJ_FLAG_CLICKABLE);
+}
+
+// Chooses the raster tile zoom and the LVGL tile scale so the raster's
+// meters-per-pixel equals the vector layer's (pxPerM = gRefMinDim/radiusM) —
+// that's what makes raster roads sit under the vector roads at every zoom. Also
+// the FIX for the coverage gaps found 2026-09-24: it starts at max zoom and
+// falls BACK to a lower zoom when no tile covers the center (dropping a level
+// doubles groundRes, so the scale doubles to keep the same m/px), instead of
+// the old code that always asked for max zoom and drew nothing where max-zoom
+// tiles were missing. Returns false only if NO zoom has a tile there.
+static bool rasterZoomAndScale(float lat, float lon, float pxPerM, uint8_t &outZoom, float &outScale) {
+    RasterMapManager &rm = RasterMapManager::instance();
+    uint8_t minz = rm.getMinZoom(), maxz = rm.getMaxZoom();
+    if (maxz < minz || maxz == 0) { minz = 9; maxz = 15; }
+    for (int z = maxz; z >= (int)minz; z--) {
+        uint32_t tx, ty; float sx, sy;
+        RasterMapManager::latLonToTile(lat, lon, (uint8_t)z, tx, ty, sx, sy);
+        const lv_image_dsc_t *dsc = nullptr;
+        if (rm.getTileDsc((uint8_t)z, tx, ty, &dsc)) {
+            float groundRes = 156543.03f * cosf(lat * (float)M_PI / 180.0f) / (float)(1u << z);
+            float scale = pxPerM * groundRes;
+            if (scale < 0.25f) scale = 0.25f;
+            if (scale > 8.0f) scale = 8.0f;
+            outZoom = (uint8_t)z;
+            outScale = scale;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void updateMapCanvas() {
+    if (!mapCanvas) return;
+    esp_task_wdt_reset();
+
+    static MapViewSnapshot v;
+    v = mapViewSnapshot();
+
+    // Map is ALWAYS dimmed across the entire screen (70% opacity)
+    lv_obj_set_style_opa(mapCanvas, LV_OPA_COVER, 0); // opaque for cheaper compositing (was LV_OPA_90)
+
+    // Track last known coordinates or fallback to Vietnam center (21.0278, 105.8342)
+    static float sLastMapLat = 21.0278f;
+    static float sLastMapLon = 105.8342f;
+    static bool sMapDrawnOnce = false;
+
+    GnssSnapshot gnss = gnssSnapshot();
+    if (gnss.fix && gnss.latDeg > 1.0f) {
+        sLastMapLat = (float)gnss.latDeg;
+        sLastMapLon = (float)gnss.lonDeg;
+    }
+
+    // Lazy initialization / retry of raster map source if not yet loaded
+    if (!RasterMapManager::instance().isLoaded()) {
+        static uint32_t sLastLoadAttemptMs = 0;
+        uint32_t now = millis();
+        if (now - sLastLoadAttemptMs > 1500) {
+            sLastLoadAttemptMs = now;
+            RasterMapManager::instance().setMapSource((uint8_t)(int)cfg.mapSource);
+        }
+    }
+
+    // When GPS has no fix yet, draw initial background map ONCE and return
+    if (!v.valid) {
+        if (!sMapDrawnOnce && cfg.showRasterMap && RasterMapManager::instance().isLoaded()) {
+            sMapDrawnOnce = true;
+            lv_canvas_fill_bg(mapCanvas, lv_color_hex(0x04060A), LV_OPA_COVER);
+            lv_layer_t layer;
+            lv_canvas_init_layer(mapCanvas, &layer);
+            float pxPerM0 = (float)gRefMinDim / 300.0f; // default 300m radius until a real zoom arrives
+            uint8_t z0; float rscale0;
+            if (rasterZoomAndScale(sLastMapLat, sLastMapLon, pxPerM0, z0, rscale0)) {
+                RasterMapManager::instance().renderBackground(
+                    &layer, sLastMapLat, sLastMapLon, z0, gMapSideS, gMapSideS,
+                    gMapCenter, gMapCenter, rscale0);
+            }
+            lv_canvas_finish_layer(mapCanvas, &layer);
+            lv_image_set_rotation(mapCanvas, 0); // north-up until we have a heading
+            esp_task_wdt_reset();
+        }
+        return;
+    }
+
+    // Only redraw when map generation actually changed (movement >= 3m or turn >= 3 deg)
+    if (v.generation == lastDrawnMapGeneration) return;
+    lastDrawnMapGeneration = v.generation;
+    sMapDrawnOnce = true;
+
+    uint32_t drawStartUs = micros();
+
+    // Center the raster at the SAME snapped point the vector layer was
+    // projected about (v.egoLat/LonDeg), at the SAME pixels-per-meter
+    // (gRefMinDim / zoomRadiusM), so raster roads sit under the vector roads.
+    float centerLat = (v.egoLatDeg > 1.0f) ? v.egoLatDeg : sLastMapLat;
+    float centerLon = (v.egoLonDeg > 1.0f) ? v.egoLonDeg : sLastMapLon;
+    if (v.egoLatDeg > 1.0f) { sLastMapLat = v.egoLatDeg; sLastMapLon = v.egoLonDeg; }
+    float radiusM = (v.zoomRadiusM > 10.0f) ? v.zoomRadiusM : 300.0f;
+    float pxPerM = (float)gRefMinDim / radiusM;
+
+    lv_canvas_fill_bg(mapCanvas, lv_color_hex(0x04060A), LV_OPA_COVER);
+
+    lv_layer_t layer;
+    lv_canvas_init_layer(mapCanvas, &layer);
+
+    // Pass 0: Raster Map Tiles Background or Tactical Radar Rings Fallback
+    bool rasterDrawn = false;
+    if (cfg.showRasterMap && RasterMapManager::instance().isLoaded()) {
+        uint8_t z; float rscale;
+        if (rasterZoomAndScale(centerLat, centerLon, pxPerM, z, rscale)) {
+            RasterMapManager::instance().renderBackground(
+                &layer, centerLat, centerLon, z, gMapSideS, gMapSideS,
+                gMapCenter, gMapCenter, rscale);
+            rasterDrawn = true;
+        }
+    }
+    if (!rasterDrawn && !cfg.showRasterMap) {
+        // Vector-only mode (raster off) — leave the plain dark background so the
+        // vector roads/markers below stand on their own; no tactical rings.
+    } else if (!rasterDrawn) {
+        // Tactical range rings and crosshair grid when raster tiles are missing / in demo without SD
+        lv_draw_arc_dsc_t ringDsc;
+        lv_draw_arc_dsc_init(&ringDsc);
+        ringDsc.color = lv_color_hex(0x101C2B);
+        ringDsc.width = 1;
+        ringDsc.center.x = gMapCenter;
+        ringDsc.center.y = gMapCenter;
+        ringDsc.start_angle = 0;
+        ringDsc.end_angle = 360;
+
+        int r1 = (int)(75.0f * pxPerM);
+        int r2 = (int)(150.0f * pxPerM);
+        int r3 = (int)(250.0f * pxPerM);
+
+        if (r1 > 10 && r1 < gMapSideS) { ringDsc.radius = r1; lv_draw_arc(&layer, &ringDsc); }
+        if (r2 > 10 && r2 < gMapSideS) { ringDsc.radius = r2; lv_draw_arc(&layer, &ringDsc); }
+        if (r3 > 10 && r3 < gMapSideS) { ringDsc.radius = r3; lv_draw_arc(&layer, &ringDsc); }
+
+        lv_draw_line_dsc_t chDsc;
+        lv_draw_line_dsc_init(&chDsc);
+        chDsc.color = lv_color_hex(0x0C1520);
+        chDsc.width = 1;
+        chDsc.p1.x = gMapCenter; chDsc.p1.y = 0;
+        chDsc.p2.x = gMapCenter; chDsc.p2.y = gMapSideS;
+        lv_draw_line(&layer, &chDsc);
+        chDsc.p1.x = 0; chDsc.p1.y = gMapCenter;
+        chDsc.p2.x = gMapSideS; chDsc.p2.y = gMapCenter;
+        lv_draw_line(&layer, &chDsc);
+    }
+    esp_task_wdt_reset();
+
+    // Pass 1: Vector Road Lines
+    lv_draw_line_dsc_t lineDsc;
+    if (cfg.showVectorRoads) {
+        for (int i = 0; i < v.lineCount; i++) {
+            const MapLine &ln = v.lines[i];
+            RoadClassStyle style = mapClassStyle(ln.roadClass);
+            lv_draw_line_dsc_init(&lineDsc);
+            lineDsc.color = style.color;
+            lineDsc.width = style.width;
+            lineDsc.round_start = 1;
+            lineDsc.round_end = 1;
+            lineDsc.p1.x = ln.x1;
+            lineDsc.p1.y = ln.y1;
+            lineDsc.p2.x = ln.x2;
+            lineDsc.p2.y = ln.y2;
+            lv_draw_line(&layer, &lineDsc);
+        }
+    }
+
+    // Pass 2: Breadcrumb trail (Polyline track)
+    if (cfg.showVehicleTrail) {
+        for (int i = 1; i < v.trailCount; i++) {
+            lv_draw_line_dsc_init(&lineDsc);
+            int denom = v.trailCount > 1 ? v.trailCount - 1 : 1;
+            lineDsc.color = lv_color_hex(ACCENT_COLOR);
+            lineDsc.opa = (lv_opa_t)(60 + (195 * i) / denom);
+            lineDsc.width = 3;
+            lineDsc.round_start = 1;
+            lineDsc.round_end = 1;
+            lineDsc.p1.x = v.trailX[i - 1];
+            lineDsc.p1.y = v.trailY[i - 1];
+            lineDsc.p2.x = v.trailX[i];
+            lineDsc.p2.y = v.trailY[i];
+            lv_draw_line(&layer, &lineDsc);
+        }
+    }
+
+    // Pass 3: Markers (cameras and traffic signs)
+    lv_draw_rect_dsc_t dotDsc;
+    for (int i = 0; i < v.markerCount; i++) {
+        const MapMarker &m = v.markers[i];
+        lv_draw_rect_dsc_init(&dotDsc);
+        dotDsc.bg_color = mapMarkerColor(m.kind);
+        dotDsc.bg_opa = LV_OPA_COVER;
+        dotDsc.radius = LV_RADIUS_CIRCLE;
+        lv_area_t area = {m.x - 5, m.y - 5, m.x + 5, m.y + 5};
+        lv_draw_rect(&layer, &dotDsc, &area);
+    }
+
+    lv_canvas_finish_layer(mapCanvas, &layer);
+
+    // Heading-up: rotate the whole north-up canvas by -heading so travel points
+    // at 12 o'clock. LVGL rotates about the pivot set in buildMapCanvas (the
+    // ego = canvas center), which lands on the on-screen anchor, so the car
+    // stays fixed and the map spins/translates beneath it. Angle is 0.1° units,
+    // clockwise-positive; -heading (mod 360) makes the travel direction up.
+    // cfg.mapHeadingUp off = north-up (rotation 0), the simpler/proven mode.
+    {
+        int32_t rot = 0;
+        if (cfg.mapHeadingUp) {
+            rot = (int32_t)lroundf(-v.headingUpDeg * 10.0f);
+            rot %= 3600;
+            if (rot < 0) rot += 3600;
+        }
+        lv_image_set_rotation(mapCanvas, rot);
+    }
+    esp_task_wdt_reset();
+
+    // Periodic map-render diagnostics (every ~3s) so the map pipeline is
+    // visible over the serial monitor when the screen shows nothing — added
+    // 2026-09-24 after a "maps don't display" report. Tells apart raster-not-
+    // loaded vs. no-tile-at-position vs. nothing-to-draw.
+    {
+        static uint32_t sLastMapDbgMs = 0;
+        uint32_t nowDbg = millis();
+        if (nowDbg - sLastMapDbgMs > 3000) {
+            sLastMapDbgMs = nowDbg;
+            Serial.printf("[mapui] mode raster=%d(loaded=%d drawn=%d) vector=%d lines=%d markers=%d "
+                          "headingUp=%d rot=%.0f center=%.5f,%.5f pxPerM=%.3f bufOK=%d\n",
+                          cfg.showRasterMap, RasterMapManager::instance().isLoaded(), rasterDrawn,
+                          cfg.showVectorRoads, v.lineCount, v.markerCount, cfg.mapHeadingUp,
+                          (double)v.headingUpDeg, (double)centerLat, (double)centerLon, (double)pxPerM,
+                          mapCanvasBuf != nullptr);
+        }
+    }
+
+    g_mapDrawUs += micros() - drawStartUs;
+    g_mapDrawCount++;
+}
+
 static lv_obj_t *makePane(lv_obj_t *parent, int x, int y, int w, int h) {
     lv_obj_t *o = lv_obj_create(parent);
     lv_obj_set_pos(o, x, y);
@@ -413,193 +885,144 @@ static lv_obj_t *makeIcon(lv_obj_t *parent, const lv_image_dsc_t *src) {
 // ever collapse a child to near-zero.
 // ---------------------------------------------------------------------
 static void buildDashboardLandscape(lv_obj_t *scr) {
-    // ---------------- Top status bar ----------------
-    // Two zones, matching the 50/50 body split below: topLeft sits over
-    // LS_PARAM_COL, topRight over LS_ROAD_COL (sun/clock + settings gear —
-    // trip/time info alongside the alert card). topRight's internal
-    // arrangement (sun-left/clock-growing-right, gear pinned right, wifi
-    // left of gear) matches buildDashboardPortrait()'s own topRight.
-    //
-    // Status is color-only, no OK/FAULT/SEARCH words (direct request):
-    // GREEN = normal, RED = fault (nothing received at all), blinking AMBER
-    // = pending/searching (module alive, just no fix yet) — see
-    // refreshDashboard(). GNSS centers alone in topLeft's full 240px width
-    // (there's no second telltale sharing this bar anymore since radar was
-    // removed 2026-09-21).
-    lv_obj_t *topLeft = makePane(scr, 0, 0, LS_PARAM_COL_W, LS_TOP_H);
-    lv_obj_t *topRight = makePane(scr, LS_ROAD_COL_X, 0, LS_ROAD_COL_W, LS_TOP_H);
+    const int scrW = 480, scrH = 320;
+    const int topH = 34;
 
-    // GNSS icon+"GNSS" caption is ~64px wide (20px GPS glyph + 4px gap +
-    // ~40px text); centered in topLeft's full 240px width gives (240-64)/2
-    // = 88px left margin.
-    gnssIcon = lv_label_create(topLeft);
+    // ---------------- Top status bar (Full width 480, Glassmorphism) ----------------
+    lv_obj_t *topBar = makePane(scr, 0, 0, scrW, topH);
+    lv_obj_set_style_bg_opa(topBar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(topBar, lv_color_hex(0x182232), 0);
+    lv_obj_set_style_border_width(topBar, 1, 0);
+    lv_obj_set_style_border_side(topBar, LV_BORDER_SIDE_BOTTOM, 0);
+
+    // Left: GNSS status
+    gnssIcon = lv_label_create(topBar);
     lv_label_set_text(gnssIcon, LV_SYMBOL_GPS);
-    lv_obj_align(gnssIcon, LV_ALIGN_LEFT_MID, 88, 0);
+    lv_obj_align(gnssIcon, LV_ALIGN_LEFT_MID, 12, 0);
 
-    gnssCaption = lv_label_create(topLeft);
-    lv_label_set_text(gnssCaption, "GNSS");
-    lv_obj_align_to(gnssCaption, gnssIcon, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
+    gnssCaption = lv_label_create(topBar);
+    lv_obj_set_style_text_font(gnssCaption, &lv_font_vn_14, 0);
+    lv_label_set_text(gnssCaption, "--");
+    lv_obj_align_to(gnssCaption, gnssIcon, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
 
-    // Sun/moon icon anchored first (fixed 22x22, constant size) and the
-    // clock text chained off its RIGHT edge, growing away from it — the
-    // other order (icon chained off the clock) would break the moment the
-    // clock's digit count/width changes. Centered in topRight's LEFT 120px
-    // zone: block is ~71px wide (22px icon + 4px gap + ~45px "HH:MM" text),
-    // centered in 120px gives (120-71)/2 = ~25px left margin.
-    sunIcon = makeIcon(topRight, &sun_icon);
-    lv_obj_align(sunIcon, LV_ALIGN_LEFT_MID, 25, 0);
-
-    // clockLabel shows a fixed-format "HH:MM" or "--:--" (see
-    // refreshDashboard()) — never more than 5 chars, but pinned to an
-    // explicit width + clip anyway (same blanket rule this rewrite applies
-    // to every runtime-text label) rather than trusting content-hug sizing.
-    clockLabel = lv_label_create(topRight);
-    lv_obj_set_width(clockLabel, 46);
-    lv_label_set_long_mode(clockLabel, LV_LABEL_LONG_CLIP);
-    lv_obj_align_to(clockLabel, sunIcon, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
-
-    // Decorative only — the actual entry point is the long-press-anywhere
-    // gesture on dashRoot (deliberately not a short tap, so it can't be hit
-    // by accident while driving; spec section 17).
-    gearIcon = lv_label_create(topRight);
+    // Right: time & settings
+    gearIcon = lv_label_create(topBar);
     lv_label_set_text(gearIcon, LV_SYMBOL_SETTINGS);
-    lv_obj_align(gearIcon, LV_ALIGN_RIGHT_MID, -4, 0);
+    lv_obj_align(gearIcon, LV_ALIGN_RIGHT_MID, -12, 0);
 
-    // WiFi indicator (user-requested 2026-09-14) — chained off gearIcon's
-    // actual left edge via align_to, same "no guessed pixel gaps" reasoning
-    // as gnssCaption above. Cyan accent, not red/amber/green: this is a
-    // system telltale ("WiFi radio is on"), not a target-risk color (spec
-    // section 14.2 — see ACCENT_COLOR's own comment). Hidden by default:
-    // WiFi itself defaults OFF at boot (net/WebPortal.h), and
-    // refreshDashboard() only un-hides this once webPortalIsEnabled() is
-    // actually true.
-    wifiTopIcon = lv_label_create(topRight);
+    wifiTopIcon = lv_label_create(topBar);
     lv_label_set_text(wifiTopIcon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(ACCENT_COLOR), 0);
-    lv_obj_align_to(wifiTopIcon, gearIcon, LV_ALIGN_OUT_LEFT_MID, -8, 0);
+    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x00E5FF), 0);
+    lv_obj_align_to(wifiTopIcon, gearIcon, LV_ALIGN_OUT_LEFT_MID, -10, 0);
     lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
 
-    // ---------------- Column divider ----------------
-    // At the LS_PARAM_COL / LS_ROAD_COL boundary. Slot 1 is a degenerate
-    // (zero-length, hidden) placeholder — applyTheme() unconditionally
-    // recolors colDividerLine[0]/[1], same reasoning buildDashboardPortrait()
-    // uses for having no real divider at all.
+    clockLabel = lv_label_create(topBar);
+    lv_obj_set_style_text_font(clockLabel, &lv_font_vn_14, 0);
+    lv_obj_align_to(clockLabel, wifiTopIcon, LV_ALIGN_OUT_LEFT_MID, -12, 0);
+    lv_label_set_text(clockLabel, "--:--");
+
+    sunIcon = makeIcon(topBar, &sun_icon);
+    lv_obj_align_to(sunIcon, clockLabel, LV_ALIGN_OUT_LEFT_MID, -6, 0);
+
+    // Center: Street Name Badge (Glassmorphism Pill)
+    streetNameBadge = lv_obj_create(topBar);
+    lv_obj_set_size(streetNameBadge, 220, 24);
+    lv_obj_align(streetNameBadge, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(streetNameBadge, lv_color_hex(0x0C1522), 0);
+    lv_obj_set_style_bg_opa(streetNameBadge, LV_OPA_80, 0);
+    lv_obj_set_style_border_color(streetNameBadge, lv_color_hex(0x1F314A), 0);
+    lv_obj_set_style_border_width(streetNameBadge, 1, 0);
+    lv_obj_set_style_radius(streetNameBadge, 12, 0);
+    lv_obj_set_style_pad_all(streetNameBadge, 0, 0);
+    lv_obj_clear_flag(streetNameBadge, LV_OBJ_FLAG_SCROLLABLE);
+
+    streetNameIcon = lv_label_create(streetNameBadge);
+    lv_label_set_text(streetNameIcon, LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_color(streetNameIcon, lv_color_hex(0x00E5FF), 0);
+    lv_obj_align(streetNameIcon, LV_ALIGN_LEFT_MID, 8, 0);
+
+    streetNameLabel = lv_label_create(streetNameBadge);
+    lv_obj_set_style_text_font(streetNameLabel, &lv_font_vn_14, 0);
+    lv_obj_set_style_text_color(streetNameLabel, lv_color_hex(0xF0F4F8), 0);
+    lv_label_set_long_mode(streetNameLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(streetNameLabel, 180);
+    lv_obj_align(streetNameLabel, LV_ALIGN_LEFT_MID, 24, 0);
+    lv_label_set_text(streetNameLabel, "");
+    lv_obj_add_flag(streetNameBadge, LV_OBJ_FLAG_HIDDEN);
+
+    // Theme placeholders
     static lv_point_precise_t divPts[2][2];
-    {
-        lv_obj_t *line = lv_line_create(scr);
-        lv_obj_set_style_line_width(line, 1, 0);
-        lv_point_precise_t local[2] = {{(lv_value_precise_t)LS_PARAM_COL_W, (lv_value_precise_t)LS_COL_TOP},
-                                        {(lv_value_precise_t)LS_PARAM_COL_W, (lv_value_precise_t)(LS_COL_TOP + LS_COL_H)}};
-        memcpy(divPts[0], local, sizeof(local));
-        lv_line_set_points(line, divPts[0], 2);
-        lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
-        colDividerLine[0] = line;
-    }
-    {
-        lv_obj_t *line = lv_line_create(scr);
-        lv_point_precise_t local[2] = {{0, 0}, {0, 0}};
-        memcpy(divPts[1], local, sizeof(local));
-        lv_line_set_points(line, divPts[1], 2);
-        lv_obj_add_flag(line, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
-        colDividerLine[1] = line;
+    for (int i = 0; i < 2; i++) {
+        colDividerLine[i] = lv_line_create(scr);
+        lv_point_precise_t p[2] = {{0, 0}, {0, 0}};
+        memcpy(divPts[i], p, sizeof(p));
+        lv_line_set_points(colDividerLine[i], divPts[i], 2);
+        lv_obj_add_flag(colDividerLine[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(colDividerLine[i], LV_OBJ_FLAG_CLICKABLE);
     }
 
-    // ---------------- Param column (left half): speed + speed limit ----------------
-    // A 2x1 stack: leftCol is the outer 240x264 container, two equal
-    // 240x132 cells stack inside it — applyTheme() only themes specific
-    // widgets by name, never leftCol or these cells, so this structure is
-    // safe to change freely.
-    leftCol = makePane(scr, 0, LS_COL_TOP, LS_PARAM_COL_W, LS_COL_H);
-    static const int kCellH = LS_COL_H / 2; // 132
-    lv_obj_t *cellSpeed = makePane(leftCol, 0, 0, LS_PARAM_COL_W, kCellH);       // top: actual speed
-    lv_obj_t *cellLimit = makePane(leftCol, 0, kCellH, LS_PARAM_COL_W, kCellH);  // bottom: speed limit sign
+    // ---------------- Middle row: Left (Speed), Center (Dimmed Map), Right (Speed Limit) ----------------
+    // Left: Tốc độ hiện tại (Glass Card)
+    lv_obj_t *speedPane = makePane(scr, 12, 44, 138, 180);
+    lv_obj_set_style_bg_opa(speedPane, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(speedPane, 0, 0);
 
-    // Top — ego speed. y positioned (not simply centered in the cell) so
-    // this number's own vertical center lands on the SAME line as
-    // speedLimitValueLabel's center in the cell beside it — the sign is
-    // centered in its 132px cell (top=(132-88)/2=22, center=22+44=66, per
-    // its own diameter), so speedLabel's top is placed at 66 -
-    // line_height/2 = 66-52/2 = 40 (font 48's line_height is 52, confirmed
-    // from lv_font_montserrat_48.c) to match that same 66px center line.
-    // Explicit width + clip: "--" or a 1-3 digit speed, never more, but
-    // pinned rather than left to hug its content, per this rewrite's rule.
-    speedLabel = lv_label_create(cellSpeed);
-    lv_obj_set_style_text_font(speedLabel, &lv_font_montserrat_48, 0);
-    lv_obj_set_width(speedLabel, LS_PARAM_COL_W);
-    lv_label_set_long_mode(speedLabel, LV_LABEL_LONG_CLIP);
-    lv_obj_set_style_text_align(speedLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(speedLabel, LV_ALIGN_TOP_MID, 0, 40);
+    speedLabel = lv_label_create(speedPane);
+    lv_obj_set_style_text_font(speedLabel, &lv_font_montserrat_speed, 0);
+    lv_obj_align(speedLabel, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(speedLabel, "0");
 
-    // Pushed 86->94 (number's own bottom edge moved from 46+40=86 to
-    // 40+52=92 when its font grew — this caption must clear that, +2px gap).
-    kmhCaption = lv_label_create(cellSpeed);
-    lv_label_set_text(kmhCaption, "km/h");
-    lv_obj_align(kmhCaption, LV_ALIGN_TOP_MID, 0, 94);
+    kmhCaption = lv_label_create(speedPane);
+    lv_label_set_text(kmhCaption, "");
+    lv_obj_add_flag(kmhCaption, LV_OBJ_FLAG_HIDDEN);
 
-    // Bottom — speed limit sign, 88px diameter, centered in the now
-    // full-width 240x132 cell (comfortably clears the sign's own 9px
-    // border either way: (240-88)/2 = 76 horizontal, (132-88)/2 = 22
-    // vertical).
-    //
-    // Speed limit for the current road segment — sourced from
-    // map/SpeedLimitManager.cpp's microSD map-matching via
-    // RoadInfoSnapshot.
-    //
-    // A real QCVN 41:2019/BGTVT P.127 sign: white disc, thick red ring,
-    // bold black number, nothing else printed on it — drawn as plain LVGL
-    // vector primitives (a circular obj + a label), not a generated bitmap:
-    // there's no photographic detail here for a bitmap to earn its keep on,
-    // and a plain lv_obj circle stays trivially resizable.
+    // Right: Biển báo tốc độ cho phép (Glass Card)
+    lv_obj_t *signPane = makePane(scr, scrW - 138 - 12, 44, 138, 180);
+    lv_obj_set_style_bg_opa(signPane, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(signPane, 0, 0);
+
     static const int kSignDiam = 88;
-    speedLimitSign = lv_obj_create(cellLimit);
+    speedLimitSign = lv_obj_create(signPane);
     lv_obj_set_size(speedLimitSign, kSignDiam, kSignDiam);
     lv_obj_align(speedLimitSign, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(speedLimitSign, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(speedLimitSign, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(speedLimitSign, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(speedLimitSign, lv_color_hex(0xE30613), 0); // standard traffic-sign red
+    lv_obj_set_style_border_color(speedLimitSign, lv_color_hex(0xE60000), 0);
     lv_obj_set_style_border_width(speedLimitSign, 9, 0);
+    lv_obj_set_style_shadow_color(speedLimitSign, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_width(speedLimitSign, 12, 0);
+    lv_obj_set_style_shadow_opa(speedLimitSign, LV_OPA_50, 0);
     lv_obj_set_style_pad_all(speedLimitSign, 0, 0);
     lv_obj_clear_flag(speedLimitSign, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(speedLimitSign, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(speedLimitSign, LV_OBJ_FLAG_HIDDEN); // shown only once a real limit is matched — see refreshDashboard()
+    lv_obj_add_flag(speedLimitSign, LV_OBJ_FLAG_HIDDEN);
 
-    // Sibling, not a child of speedLimitSign — needs to keep showing "--"
-    // while the sign itself is hidden. align_to centers it on the sign's
-    // actual geometry rather than a guessed offset. Explicit width + clip:
-    // at most a 3-digit limit ("120") ever renders here.
-    speedLimitValueLabel = lv_label_create(cellLimit);
-    lv_obj_set_style_text_font(speedLimitValueLabel, &lv_font_montserrat_32, 0);
-    lv_obj_set_width(speedLimitValueLabel, kSignDiam - 2 * 9); // clears the sign's own 9px red ring both sides
+    speedLimitValueLabel = lv_label_create(signPane);
+    lv_obj_set_style_text_font(speedLimitValueLabel, &lv_font_montserrat_36, 0);
+    lv_obj_set_width(speedLimitValueLabel, kSignDiam - 20);
     lv_label_set_long_mode(speedLimitValueLabel, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_align(speedLimitValueLabel, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align_to(speedLimitValueLabel, speedLimitSign, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(speedLimitValueLabel, "--");
 
-    // ---------------- Road column (right half): sign/camera alert card ----------------
-    // buildTrafficCard() (shared with buildDashboardPortrait(), see its own
-    // definition above) is the column's only content; sized to use most of
-    // the vertical room (LS_COL_H is 264 here, the card sits at a fixed
-    // y=8, so 250 leaves a clean 6px bottom margin).
-    midCol = makePane(scr, LS_ROAD_COL_X, LS_COL_TOP, LS_ROAD_COL_W, LS_COL_H);
+    // Hidden floating labels
+    aheadLimitLabel = lv_label_create(scr);
+    lv_obj_add_flag(aheadLimitLabel, LV_OBJ_FLAG_HIDDEN);
+    cameraAheadLabel = lv_label_create(scr);
+    lv_obj_add_flag(cameraAheadLabel, LV_OBJ_FLAG_HIDDEN);
+    trafficSignLabel = lv_label_create(scr);
+    lv_obj_add_flag(trafficSignLabel, LV_OBJ_FLAG_HIDDEN);
 
-    buildTrafficCard(midCol, 224, 250);
+    // ---------------- Bottom row: Cảnh báo phụ (Traffic Card) ----------------
+    midCol = makePane(scr, (scrW - 270) / 2, 246, 270, 60);
+    buildTrafficCard(midCol, 270, 60);
 
-    // ---------------- Bottom info bar ----------------
-    // Explicit width + LV_LABEL_LONG_CLIP (2026-09-22 rewrite) — this is the
-    // exact label a real-hardware report described rendering vertically
-    // down the screen edge, character by character. That can only happen if
-    // a label is left in LVGL's default content-hug/wrap sizing AND
-    // whatever it's measuring its available width against collapses to
-    // something tiny; pinning an explicit width and a non-wrapping long
-    // mode here makes that entire failure class structurally impossible for
-    // this label regardless of what upstream condition might ever cause it.
+    // Bottom info bar (hidden)
     bottomInfoLabel = lv_label_create(scr);
-    lv_obj_set_width(bottomInfoLabel, LS_SCR_W - 16); // comfortable margin, never touches screen edges
-    lv_label_set_long_mode(bottomInfoLabel, LV_LABEL_LONG_CLIP);
-    lv_obj_set_style_text_align(bottomInfoLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(bottomInfoLabel, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_align(bottomInfoLabel, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_add_flag(bottomInfoLabel, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ---------------------------------------------------------------------
@@ -612,48 +1035,72 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 // removed 2026-09-21; the alert card fills that same freed space now).
 // ---------------------------------------------------------------------
 static void buildDashboardPortrait(lv_obj_t *scr) {
-    const int scrW = 320, scrH = 480; // both rotation 0 and 2 produce exactly this — see AppConfig.h's screenRotation
-    const int pTopH = 30, pBottomH = 26;
-    const int pSpeedRowH = 116;
-    const int pPad = 8;
+    const int scrW = 320, scrH = 480;
+    const int topH = 36;
 
-    // ---------------- Top status bar ----------------
-    // topLeft used to also hold a radar status cluster (removed 2026-09-21
-    // alongside radar itself) — GNSS/clock/sun/gear/wifi all still live in
-    // topRight unchanged, topLeft is just empty space now.
-    lv_obj_t *topRight = makePane(scr, scrW / 2, 0, scrW / 2, pTopH);
+    // ---------------- Top status bar (Full width 320, Glassmorphism) ----------------
+    lv_obj_t *topBar = makePane(scr, 0, 0, scrW, topH);
+    lv_obj_set_style_bg_opa(topBar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(topBar, lv_color_hex(0x182232), 0);
+    lv_obj_set_style_border_width(topBar, 1, 0);
+    lv_obj_set_style_border_side(topBar, LV_BORDER_SIDE_BOTTOM, 0);
 
-    // Narrower than landscape's top-mid zone, so GNSS/clock/sun share the
-    // right half instead of their own dedicated middle zone.
-    gnssIcon = lv_label_create(topRight);
+    // Left: GNSS status with neon dot
+    gnssIcon = lv_label_create(topBar);
     lv_label_set_text(gnssIcon, LV_SYMBOL_GPS);
-    lv_obj_align(gnssIcon, LV_ALIGN_LEFT_MID, 4, 0);
+    lv_obj_align(gnssIcon, LV_ALIGN_LEFT_MID, 10, 0);
 
-    gnssCaption = lv_label_create(topRight);
-    lv_label_set_text(gnssCaption, "GNSS");
-    lv_obj_align_to(gnssCaption, gnssIcon, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
+    gnssCaption = lv_label_create(topBar);
+    lv_obj_set_style_text_font(gnssCaption, &lv_font_vn_14, 0);
+    lv_label_set_text(gnssCaption, "--");
+    lv_obj_align_to(gnssCaption, gnssIcon, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
 
-    sunIcon = makeIcon(topRight, &sun_icon);
-    lv_obj_align(sunIcon, LV_ALIGN_RIGHT_MID, -26, 0); // leaves room for gearIcon further right
-
-    clockLabel = lv_label_create(topRight);
-    lv_obj_align_to(clockLabel, sunIcon, LV_ALIGN_OUT_LEFT_MID, -4, 0);
-
-    gearIcon = lv_label_create(topRight);
+    // Right: settings, wifi, clock, sun
+    gearIcon = lv_label_create(topBar);
     lv_label_set_text(gearIcon, LV_SYMBOL_SETTINGS);
-    lv_obj_align(gearIcon, LV_ALIGN_RIGHT_MID, -4, 0);
+    lv_obj_align(gearIcon, LV_ALIGN_RIGHT_MID, -10, 0);
 
-    wifiTopIcon = lv_label_create(topRight);
+    wifiTopIcon = lv_label_create(topBar);
     lv_label_set_text(wifiTopIcon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(ACCENT_COLOR), 0);
+    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x00E5FF), 0);
     lv_obj_align_to(wifiTopIcon, gearIcon, LV_ALIGN_OUT_LEFT_MID, -8, 0);
     lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
 
-    // applyTheme() unconditionally recolors colDividerLine[0]/[1] — portrait
-    // has no 3-column layout to divide, so these exist purely as degenerate
-    // (zero-length, hidden) placeholders rather than adding a null-check to
-    // applyTheme() for landscape's sake.
+    clockLabel = lv_label_create(topBar);
+    lv_obj_set_style_text_font(clockLabel, &lv_font_vn_14, 0);
+    lv_obj_align_to(clockLabel, wifiTopIcon, LV_ALIGN_OUT_LEFT_MID, -10, 0);
+    lv_label_set_text(clockLabel, "--:--");
+
+    sunIcon = makeIcon(topBar, &sun_icon);
+    lv_obj_align_to(sunIcon, clockLabel, LV_ALIGN_OUT_LEFT_MID, -6, 0);
+    // Center: Street Name Badge (Portrait)
+    streetNameBadge = lv_obj_create(topBar);
+    lv_obj_set_size(streetNameBadge, 160, 24);
+    lv_obj_align(streetNameBadge, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(streetNameBadge, lv_color_hex(0x0C1522), 0);
+    lv_obj_set_style_bg_opa(streetNameBadge, LV_OPA_80, 0);
+    lv_obj_set_style_border_color(streetNameBadge, lv_color_hex(0x1F314A), 0);
+    lv_obj_set_style_border_width(streetNameBadge, 1, 0);
+    lv_obj_set_style_radius(streetNameBadge, 12, 0);
+    lv_obj_set_style_pad_all(streetNameBadge, 0, 0);
+    lv_obj_clear_flag(streetNameBadge, LV_OBJ_FLAG_SCROLLABLE);
+
+    streetNameIcon = lv_label_create(streetNameBadge);
+    lv_label_set_text(streetNameIcon, LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_color(streetNameIcon, lv_color_hex(0x00E5FF), 0);
+    lv_obj_align(streetNameIcon, LV_ALIGN_LEFT_MID, 6, 0);
+
+    streetNameLabel = lv_label_create(streetNameBadge);
+    lv_obj_set_style_text_font(streetNameLabel, &lv_font_vn_14, 0);
+    lv_obj_set_style_text_color(streetNameLabel, lv_color_hex(0xF0F4F8), 0);
+    lv_label_set_long_mode(streetNameLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(streetNameLabel, 125);
+    lv_obj_align(streetNameLabel, LV_ALIGN_LEFT_MID, 22, 0);
+    lv_label_set_text(streetNameLabel, "");
+    lv_obj_add_flag(streetNameBadge, LV_OBJ_FLAG_HIDDEN);
+
+    // Line placeholders for theme compatibility
     static lv_point_precise_t divPts[2][2];
     for (int slot = 0; slot < 2; slot++) {
         lv_obj_t *line = lv_line_create(scr);
@@ -665,56 +1112,64 @@ static void buildDashboardPortrait(lv_obj_t *scr) {
         colDividerLine[slot] = line;
     }
 
-    // ---------------- Speed + speed-limit sign row ----------------
-    lv_obj_t *speedRow = makePane(scr, 0, pTopH, scrW, pSpeedRowH);
+    // ---------------- Hàng thứ hai: Tốc độ hiện tại & Biển báo tốc độ đặt cạnh nhau, thẳng hàng ----------------
+    lv_obj_t *speedPane = makePane(scr, 12, 44, 138, 120);
+    lv_obj_set_style_bg_opa(speedPane, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(speedPane, 0, 0);
 
-    // Bumped 28->48 (user-requested 2026-09-21, "tang kich thuoc cac so
-    // hien thi len nua") — pSpeedRowH is 116px, comfortable room for font
-    // 48's 52px line_height starting at the existing top=6 (bottom=58).
-    speedLabel = lv_label_create(speedRow);
-    lv_obj_set_style_text_font(speedLabel, &lv_font_montserrat_48, 0);
-    lv_obj_align(speedLabel, LV_ALIGN_TOP_LEFT, 24, 6);
+    speedLabel = lv_label_create(speedPane);
+    lv_obj_set_style_text_font(speedLabel, &lv_font_montserrat_speed, 0);
+    lv_obj_align(speedLabel, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(speedLabel, "0");
 
-    // Pushed 44->62 to clear the bigger number above (bottom edge moved
-    // from 6+30=36 to 6+52=58, +4px gap).
-    kmhCaption = lv_label_create(speedRow);
-    lv_label_set_text(kmhCaption, "km/h");
-    lv_obj_align(kmhCaption, LV_ALIGN_TOP_LEFT, 24, 62);
+    kmhCaption = lv_label_create(speedPane);
+    lv_label_set_text(kmhCaption, "");
+    lv_obj_add_flag(kmhCaption, LV_OBJ_FLAG_HIDDEN);
 
-    static const int kSignDiam = 92; // bigger than landscape's 76 — portrait has width to spare here
-    speedLimitSign = lv_obj_create(speedRow);
+    // Biển báo tốc độ cho phép (đặt cùng hàng Y=44, chiều cao 120)
+    lv_obj_t *signPane = makePane(scr, scrW - 138 - 12, 44, 138, 120);
+
+    static const int kSignDiam = 88;
+    speedLimitSign = lv_obj_create(signPane);
     lv_obj_set_size(speedLimitSign, kSignDiam, kSignDiam);
-    lv_obj_align(speedLimitSign, LV_ALIGN_TOP_RIGHT, -24, 6);
+    lv_obj_align(speedLimitSign, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(speedLimitSign, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(speedLimitSign, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(speedLimitSign, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(speedLimitSign, lv_color_hex(0xE30613), 0);
+    lv_obj_set_style_border_color(speedLimitSign, lv_color_hex(0xE60000), 0);
     lv_obj_set_style_border_width(speedLimitSign, 9, 0);
+    lv_obj_set_style_shadow_color(speedLimitSign, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_width(speedLimitSign, 12, 0);
+    lv_obj_set_style_shadow_opa(speedLimitSign, LV_OPA_50, 0);
     lv_obj_set_style_pad_all(speedLimitSign, 0, 0);
     lv_obj_clear_flag(speedLimitSign, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(speedLimitSign, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(speedLimitSign, LV_OBJ_FLAG_HIDDEN);
 
-    // Bumped 24->32 (user-requested 2026-09-21) — matches landscape's own
-    // speedLimitValueLabel choice; this sign is even bigger (92 vs 88
-    // diameter) so there's at least as much room.
-    speedLimitValueLabel = lv_label_create(speedRow);
-    lv_obj_set_style_text_font(speedLimitValueLabel, &lv_font_montserrat_32, 0);
+    speedLimitValueLabel = lv_label_create(signPane);
+    lv_obj_set_style_text_font(speedLimitValueLabel, &lv_font_montserrat_36, 0);
+    lv_obj_set_width(speedLimitValueLabel, kSignDiam - 20);
+    lv_label_set_long_mode(speedLimitValueLabel, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(speedLimitValueLabel, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align_to(speedLimitValueLabel, speedLimitSign, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(speedLimitValueLabel, "--");
 
-    // ---------------- Sign/camera alert card — the big middle area ----------------
-    // Used to hold a radar road/target view (primaryDistLabel, roadArea,
-    // per-target icons/labels) plus a separate Warning/TTC strip below it —
-    // both removed 2026-09-21 alongside radar itself. buildTrafficCard() now
-    // fills this whole reclaimed area instead.
-    midCol = makePane(scr, 0, pTopH + pSpeedRowH, scrW, scrH - pTopH - pSpeedRowH - pBottomH);
-    lv_obj_update_layout(midCol); // see buildDashboardLandscape()'s own comment on why this commit-now call matters
+    // Hidden floating labels for compatibility
+    aheadLimitLabel = lv_label_create(scr);
+    lv_obj_add_flag(aheadLimitLabel, LV_OBJ_FLAG_HIDDEN);
+    cameraAheadLabel = lv_label_create(scr);
+    lv_obj_add_flag(cameraAheadLabel, LV_OBJ_FLAG_HIDDEN);
+    trafficSignLabel = lv_label_create(scr);
+    lv_obj_add_flag(trafficSignLabel, LV_OBJ_FLAG_HIDDEN);
 
-    buildTrafficCard(midCol, scrW - 2 * pPad, lv_obj_get_height(midCol) - 16);
+    // ---------------- Hàng đáy: Cảnh báo phụ (camera/đổi tốc độ/khoảng cách) ----------------
+    midCol = makePane(scr, 25, 252, scrW - 50, 60);
+    buildTrafficCard(midCol, scrW - 50, 60);
 
-    // ---------------- Bottom info bar ----------------
+    // Bottom info bar (hidden)
     bottomInfoLabel = lv_label_create(scr);
-    lv_obj_align(bottomInfoLabel, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_align(bottomInfoLabel, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_add_flag(bottomInfoLabel, LV_OBJ_FLAG_HIDDEN);
 }
 
 void buildDashboard() {
@@ -744,6 +1199,7 @@ void buildDashboard() {
     lv_obj_add_event_cb(dashRoot, onDashReleasedOrLost, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(dashRoot, onDashReleasedOrLost, LV_EVENT_PRESS_LOST, NULL);
 
+    buildMapCanvas(dashRoot, scrW, scrH);
     lv_obj_t *scr = dashRoot;
 
     if (scrH > scrW) {
@@ -780,37 +1236,12 @@ void buildDashboard() {
     // (2026-09-21), so this now sits at the top spot itself. Text set live
     // in refreshDashboard() (the actual upcoming limit number isn't known
     // until then).
-    aheadLimitLabel = lv_label_create(scr);
-    lv_obj_set_style_bg_color(aheadLimitLabel, lv_color_hex(0x2F7CE0), 0);
-    lv_obj_set_style_bg_opa(aheadLimitLabel, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(aheadLimitLabel, lv_color_white(), 0);
-    lv_obj_set_style_pad_hor(aheadLimitLabel, 10, 0);
-    lv_obj_set_style_pad_ver(aheadLimitLabel, 4, 0);
-    lv_obj_set_style_radius(aheadLimitLabel, 6, 0);
-    lv_obj_align(aheadLimitLabel, LV_ALIGN_TOP_MID, 0, 2);
+    // Top floating banners relocated to dedicated HUD cards to prevent blocking Top Status Bar
+    if (!aheadLimitLabel) aheadLimitLabel = lv_label_create(scr);
     lv_obj_add_flag(aheadLimitLabel, LV_OBJ_FLAG_HIDDEN);
-
-    // Positioned below aheadLimitLabel above (y=28) — see its own
-    // declaration comment for the color/stacking reasoning.
     cameraAheadLabel = lv_label_create(scr);
-    lv_obj_set_style_bg_color(cameraAheadLabel, lv_color_hex(0xE0A020), 0);
-    lv_obj_set_style_bg_opa(cameraAheadLabel, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(cameraAheadLabel, lv_color_black(), 0);
-    lv_obj_set_style_pad_hor(cameraAheadLabel, 10, 0);
-    lv_obj_set_style_pad_ver(cameraAheadLabel, 4, 0);
-    lv_obj_set_style_radius(cameraAheadLabel, 6, 0);
-    lv_obj_align(cameraAheadLabel, LV_ALIGN_TOP_MID, 0, 28);
     lv_obj_add_flag(cameraAheadLabel, LV_OBJ_FLAG_HIDDEN);
-
-    // Traffic sign banner (Khu dan cu, cam vuot, tram thu phi, den tin hieu)
     trafficSignLabel = lv_label_create(scr);
-    lv_obj_set_style_bg_color(trafficSignLabel, lv_color_hex(0x2080C0), 0);
-    lv_obj_set_style_bg_opa(trafficSignLabel, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(trafficSignLabel, lv_color_white(), 0);
-    lv_obj_set_style_pad_hor(trafficSignLabel, 10, 0);
-    lv_obj_set_style_pad_ver(trafficSignLabel, 4, 0);
-    lv_obj_set_style_radius(trafficSignLabel, 6, 0);
-    lv_obj_align(trafficSignLabel, LV_ALIGN_TOP_MID, 0, 54);
     lv_obj_add_flag(trafficSignLabel, LV_OBJ_FLAG_HIDDEN);
 
     // Hold-to-open-Settings progress ring — created last so it draws on top
@@ -875,53 +1306,27 @@ static void showWifiToast(bool on) {
 // and Night would undermine the "color only means risk" rule (spec section
 // 14.2), not serve it.
 static void applyTheme(bool daytime) {
-    lv_color_t rootBg, captionText, primaryText, clockText, gearColor, dividerColor, bottomText;
-    if (daytime) {
-        rootBg = lv_color_hex(0xE9EDF1);
-        captionText = lv_color_hex(0x5A6672);
-        primaryText = lv_color_hex(0x14181C);
-        clockText = lv_color_hex(0x2A323A);
-        gearColor = lv_color_hex(0x8A96A2);
-        dividerColor = lv_color_hex(0xC7CFD6);
-        bottomText = lv_color_hex(0x5A6672);
-    } else {
-        // Pure black, not the earlier dark navy 0x0B0F14 — user-requested
-        // 2026-09-16 ("tang tuoi tho man hinh va giam choi mat, tang tap
-        // trung thi su dung mau den cho nen"): less backlight bleed-through
-        // at night (less glare, easier to focus on the road), and less
-        // sustained non-black pixel drive over the display's lifetime.
-        // Daytime keeps its light background above unchanged — that's a
-        // deliberate outdoor-sunlight-readability choice, not something this
-        // request touches.
-        rootBg = lv_color_hex(0x000000);
-        captionText = lv_color_hex(0x8899AA);
-        primaryText = lv_color_white();
-        clockText = lv_color_hex(0xCCD4DC);
-        gearColor = lv_color_hex(0x556678);
-        dividerColor = lv_color_hex(0x1C2530);
-        bottomText = lv_color_hex(0xAAB4C0);
-    }
+    // Ultra-High Contrast Automotive Cockpit Theme:
+    // Pure deep black background (#000000) for maximum legibility and zero light bleed.
+    // 100% Crisp White (#FFFFFF) and luminous silver for all text and readouts.
+    lv_color_t rootBg = lv_color_hex(0x000000);
+    lv_color_t captionText = lv_color_hex(0xD0E0F0); // Crisp high-contrast silver-white
+    lv_color_t primaryText = lv_color_white();       // 100% Pure White for speedometer
+    lv_color_t clockText = lv_color_white();         // Pure White for digital clock
+    lv_color_t gearColor = lv_color_hex(0xCCD8E6);   // Bright silver for settings
+    lv_color_t dividerColor = lv_color_hex(0x1C2530);
+    lv_color_t bottomText = lv_color_hex(0xD0E0F0);
 
     lv_obj_set_style_bg_color(dashboardScreen, rootBg, 0);
     lv_obj_set_style_bg_color(dashRoot, rootBg, 0);
 
-    lv_obj_set_style_text_color(gnssCaption, captionText, 0);
     lv_obj_set_style_text_color(clockLabel, clockText, 0);
     lv_obj_set_style_text_color(gearIcon, gearColor, 0);
     for (int i = 0; i < 2; i++) lv_obj_set_style_line_color(colDividerLine[i], dividerColor, 0);
 
-    // speedLabel's themed color is remembered (not just applied) because
-    // refreshDashboard() overrides it to red on top of this whenever the
-    // driver is over the matched speed limit — a theme-independent override
-    // on a label that ALSO needs a normal themed color the rest of the time.
     currentPrimaryTextColor = primaryText;
     lv_obj_set_style_text_color(speedLabel, primaryText, 0);
     lv_obj_set_style_text_color(kmhCaption, captionText, 0);
-    // speedLimitSign/speedLimitValueLabel are NOT themed here — a real
-    // speed-limit sign is white/red/black regardless of day or night (spec
-    // section 14.2's "a safety color must mean the same thing in both
-    // themes" reasoning extends naturally to "a regulatory sign doesn't
-    // recolor itself for you either"). See refreshDashboard().
 
     lv_obj_set_style_text_color(bottomInfoLabel, bottomText, 0);
 }
@@ -972,7 +1377,25 @@ void refreshDashboard() {
     // local copies, never the live shared state (see core/SharedState.h).
     GnssSnapshot gnss = gnssSnapshot();
 
-    // Auto-wake the instant real movement resumes (not just on touch) — the
+    // North indicator: rotate the little line/"N" to point at true North. In
+    // heading-up mode North sits at screen bearing -heading from straight up,
+    // so tip = center + r*(-sin H, -cos H). When stationary/no heading, North
+    // is up (the map is north-up then too). Only touch it on a real change.
+    if (northLine) {
+        static float sLastNorthH = -999.0f;
+        float H = (gnss.fix && gnss.headingValid) ? gnss.headingDeg : 0.0f;
+        if (fabsf(H - sLastNorthH) > 1.0f) {
+            sLastNorthH = H;
+            float r = (float)H * (float)M_PI / 180.0f;
+            static lv_point_precise_t np[2];
+            np[0] = {(lv_value_precise_t)northCx, (lv_value_precise_t)northCy};
+            np[1] = {(lv_value_precise_t)(northCx - (int)(kNorthR * sinf(r))),
+                     (lv_value_precise_t)(northCy - (int)(kNorthR * cosf(r)))};
+            lv_line_set_points(northLine, np, 2);
+            if (northLabel) lv_obj_set_pos(northLabel, np[1].x - 4, np[1].y - 15);
+        }
+    }
+
     // dim-while-stationary gate above only dims in the first place once
     // parked, so waking symmetrically on the same signal (rather than
     // leaving the driver to tap the screen themselves) is the safety-first
@@ -987,10 +1410,24 @@ void refreshDashboard() {
     // reads as "in progress" rather than steady-state.
     bool blinkOn = (millis() / 500) % 2 == 0;
     lv_color_t gnssColor;
-    if (gnss.fix) gnssColor = lv_color_hex(STATUS_GREEN);
-    else if (gnss.linkAlive) gnssColor = blinkOn ? lv_color_hex(STATUS_AMBER) : lv_color_hex(STATUS_AMBER_DIM);
-    else gnssColor = lv_color_hex(STATUS_RED);
-    lv_obj_set_style_text_color(gnssIcon, gnssColor, 0); // text itself set once at build — see buildDashboard()
+    char gBuf[24];
+    if (gnss.fix) {
+        gnssColor = lv_color_hex(STATUS_GREEN);
+        snprintf(gBuf, sizeof(gBuf), "%d", gnss.satCount);
+    } else if (gnss.linkAlive) {
+        gnssColor = blinkOn ? lv_color_hex(STATUS_AMBER) : lv_color_hex(STATUS_AMBER_DIM);
+        if (gnss.satCount > 0) {
+            snprintf(gBuf, sizeof(gBuf), "%d", gnss.satCount);
+        } else {
+            snprintf(gBuf, sizeof(gBuf), "--");
+        }
+    } else {
+        gnssColor = lv_color_hex(STATUS_RED);
+        snprintf(gBuf, sizeof(gBuf), "--");
+    }
+    lv_obj_set_style_text_color(gnssIcon, gnssColor, 0);
+    lv_obj_set_style_text_color(gnssCaption, gnssColor, 0);
+    lv_label_set_text(gnssCaption, gBuf); // text itself set once at build — see buildDashboard()
 
     // WiFi icon — shown only while actually on (net/WebPortal.h). Gated on
     // an actual state CHANGE, not called unconditionally every tick, same
@@ -1051,8 +1488,23 @@ void refreshDashboard() {
     // and a current GNSS fix matched against it — checking .valid alone is
     // suffient, no separate gnss.fix check needed for the sign itself.
     RoadInfoSnapshot road = roadInfoSnapshot();
-    static const float kSpeedingMarginKmh = 5.0f; // absorbs GPS speed-filter noise right at the boundary
-    bool speeding = road.valid && gnss.fix && gnss.egoSpeedKmh > road.speedLimitKmh + kSpeedingMarginKmh;
+    // User requirement: độ lệch cảnh báo quá tốc độ là 1km, cứ lớn hơn là cảnh báo
+    float overspeedThreshold = road.speedLimitKmh + cfg.overspeedOffsetKmh;
+    bool speeding = road.valid && gnss.fix && road.speedLimitKmh > 0 &&
+                    (gnss.egoSpeedKmh > overspeedThreshold);
+
+    // Audio overspeed chime & voice alert
+    static bool lastSpeeding = false;
+    static uint32_t lastSpeedingAudioMs = 0;
+    if (speeding) {
+        uint32_t now = millis();
+        if (!lastSpeeding || (now - lastSpeedingAudioMs > 8000)) {
+            lastSpeedingAudioMs = now;
+            audioPlayOverspeedAlert();
+            audioQueueVoice("slowdown/voice.mp3");
+        }
+    }
+    lastSpeeding = speeding;
 
     if (gnss.fix) {
         // NOTE: LVGL's builtin vsnprintf has %f support compiled out when
@@ -1099,16 +1551,16 @@ void refreshDashboard() {
     // and a stale center would look off — align_to recomputes from the
     // sign's actual geometry, same "no guessed offsets" rule this file
     // uses everywhere else.
-    if (road.valid) {
+    // Speed-limit sign: always visible as an authentic P.127 regulatory sign.
+    lv_obj_clear_flag(speedLimitSign, LV_OBJ_FLAG_HIDDEN);
+    if (road.valid && road.speedLimitKmh > 0) {
         char buf[8];
         snprintf(buf, sizeof(buf), "%.0f", (double)road.speedLimitKmh);
         lv_label_set_text(speedLimitValueLabel, buf);
         lv_obj_set_style_text_color(speedLimitValueLabel, lv_color_black(), 0);
-        lv_obj_clear_flag(speedLimitSign, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_label_set_text(speedLimitValueLabel, "--");
-        lv_obj_set_style_text_color(speedLimitValueLabel, lv_color_hex(0x7C8A9A), 0);
-        lv_obj_add_flag(speedLimitSign, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_text_color(speedLimitValueLabel, lv_color_black(), 0);
     }
     lv_obj_align_to(speedLimitValueLabel, speedLimitSign, LV_ALIGN_CENTER, 0, 0);
 
@@ -1127,7 +1579,6 @@ void refreshDashboard() {
             snprintf(buf, sizeof(buf), "Ahead: %.0f km/h in %.0fm", (double)road.aheadSpeedLimitKmh,
                      (double)road.aheadDistanceM);
             lv_label_set_text(aheadLimitLabel, buf);
-            lv_obj_align(aheadLimitLabel, LV_ALIGN_TOP_MID, 0, 2); // re-center: text width just changed
             lv_obj_clear_flag(aheadLimitLabel, LV_OBJ_FLAG_HIDDEN);
             // No existing tone call for this banner before Task E (it was
             // visual-only) — audioPlaySignNotice()'s gentle chime is reused
@@ -1159,7 +1610,6 @@ void refreshDashboard() {
                 snprintf(buf, sizeof(buf), "Camera in %.0fm", (double)road.cameraAheadDistanceM);
             }
             lv_label_set_text(cameraAheadLabel, buf);
-            lv_obj_align(cameraAheadLabel, LV_ALIGN_TOP_MID, 0, 28);
             lv_obj_clear_flag(cameraAheadLabel, LV_OBJ_FLAG_HIDDEN);
             if (newlyVisible) {
                 audioPlayCameraAlert(); // immediate tone chime — cheap, instant, plays while the voice line below queues
@@ -1177,7 +1627,7 @@ void refreshDashboard() {
     static float lastSignDist = -1;
 
     bool signVisible = road.residentAreaAheadValid || road.noOvertakingAheadValid ||
-                       road.tollBoothAheadValid || road.trafficLightAheadValid;
+                       road.tollBoothAheadValid || road.trafficLightAheadValid || road.dangerAheadValid;
 
     int currentSignType = 0;
     float currentSignDist = -1;
@@ -1186,21 +1636,25 @@ void refreshDashboard() {
     if (road.residentAreaAheadValid) {
         currentSignType = 2;
         currentSignDist = road.residentAreaAheadDistM;
-        snprintf(signBuf, sizeof(signBuf), "%s in %.0fm",
-                 road.residentAreaIsStart ? "Khu dan cu" : "Het khu dan cu", (double)currentSignDist);
+        snprintf(signBuf, sizeof(signBuf), "%s cách %.0fm",
+                 road.residentAreaIsStart ? "Khu dân cư" : "Hết khu dân cư", (double)currentSignDist);
     } else if (road.noOvertakingAheadValid) {
         currentSignType = 3;
         currentSignDist = road.noOvertakingAheadDistM;
-        snprintf(signBuf, sizeof(signBuf), "%s in %.0fm",
-                 road.noOvertakingIsStart ? "Cam vuot" : "Het cam vuot", (double)currentSignDist);
+        snprintf(signBuf, sizeof(signBuf), "%s cách %.0fm",
+                 road.noOvertakingIsStart ? "Cấm vượt" : "Hết cấm vượt", (double)currentSignDist);
     } else if (road.tollBoothAheadValid) {
         currentSignType = 5;
         currentSignDist = road.tollBoothAheadDistM;
-        snprintf(signBuf, sizeof(signBuf), "Tram thu phi in %.0fm", (double)currentSignDist);
+        snprintf(signBuf, sizeof(signBuf), "Trạm thu phí cách %.0fm", (double)currentSignDist);
     } else if (road.trafficLightAheadValid) {
         currentSignType = 6;
         currentSignDist = road.trafficLightAheadDistM;
-        snprintf(signBuf, sizeof(signBuf), "Den tin hieu in %.0fm", (double)currentSignDist);
+        snprintf(signBuf, sizeof(signBuf), "Đèn tín hiệu cách %.0fm", (double)currentSignDist);
+    } else if (road.dangerAheadValid) {
+        currentSignType = 10;
+        currentSignDist = road.dangerAheadDistM;
+        snprintf(signBuf, sizeof(signBuf), "Nguy hiểm cách %.0fm", (double)currentSignDist);
     }
 
     if (signVisible != lastSignVisible || currentSignType != lastSignType ||
@@ -1218,21 +1672,23 @@ void refreshDashboard() {
                 lv_obj_set_style_bg_color(trafficSignLabel, lv_color_hex(0xD04020), 0); // Red/Orange
             } else if (currentSignType == 5) {
                 lv_obj_set_style_bg_color(trafficSignLabel, lv_color_hex(0x7050B0), 0); // Purple
+            } else if (currentSignType == 10) {
+                lv_obj_set_style_bg_color(trafficSignLabel, lv_color_hex(0xC08000), 0); // Amber (hazard)
             } else {
                 lv_obj_set_style_bg_color(trafficSignLabel, lv_color_hex(0x209060), 0); // Green
             }
-            lv_obj_align(trafficSignLabel, LV_ALIGN_TOP_MID, 0, 54);
             lv_obj_clear_flag(trafficSignLabel, LV_OBJ_FLAG_HIDDEN);
             if (newlyVisible) {
                 audioPlaySignNotice(); // immediate tone chime — cheap, instant, plays while the voice line below queues
-                // Only resident-area/no-overtaking/toll/traffic-light have a
-                // matching voice asset in data/speedmap/sounds/vi/ (Task C) —
-                // no fallback fabricated for anything else; see AudioPlayer.h.
+                // Only resident-area/no-overtaking/toll/traffic-light/danger have
+                // a matching voice asset in data/speedmap/sounds/vi/ — no fallback
+                // fabricated for anything else; see AudioPlayer.h.
                 switch (currentSignType) {
                     case 2: audioQueueVoice(road.residentAreaIsStart ? "batdaukhudancu.mp3" : "hetkhudongdancu.mp3"); break;
                     case 3: audioQueueVoice(road.noOvertakingIsStart ? "camvuot.mp3" : "hetcamvuot.mp3"); break;
                     case 5: audioQueueVoice("tramthuphi.mp3"); break;
                     case 6: audioQueueVoice("chuydentinhieugiaothong.mp3"); break;
+                    case 10: audioQueueVoice("sapdenbienbao.mp3"); break; // generic "sắp đến biển báo" for a hazard zone
                     default: break;
                 }
             }
@@ -1241,140 +1697,247 @@ void refreshDashboard() {
         }
     }
 
-    // --- Update Traffic & Camera Alert Card (HUD) ---
+    // --- Update Traffic & Camera Alert Card (Minimalist HUD: Icon + Mini Speed Sign + Distance) ---
     if (trafficCard) {
-        if (road.cameraAheadValid) {
-            // Priority 1: Speed & Enforcement Camera
-            lv_label_set_text(alertBadgeLabel, "CAMERA PHAT NGUOI");
-            lv_obj_set_style_bg_color(alertBadgeLabel, lv_color_hex(0xE0A020), 0); // Amber
-            lv_obj_set_style_text_color(alertBadgeLabel, lv_color_black(), 0);
-
-            char dBuf[16];
-            snprintf(dBuf, sizeof(dBuf), "%.0f", (double)road.cameraAheadDistanceM);
-            lv_label_set_text(alertDistLabel, dBuf);
-            lv_label_set_text(alertUnitLabel, "m");
-
-            char sBuf[32];
-            if (road.cameraSpeedLimitKmh >= 0) {
-                snprintf(sBuf, sizeof(sBuf), "Gioi han: %.0f km/h", (double)road.cameraSpeedLimitKmh);
-            } else {
-                snprintf(sBuf, sizeof(sBuf), "Camera giam sat");
-            }
-            lv_label_set_text(alertSubLabel, sBuf);
-
-            int prog = 350 - (int)road.cameraAheadDistanceM;
-            if (prog < 0) prog = 0;
-            if (prog > 350) prog = 350;
-            lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
-            lv_color_t pColor = (road.cameraAheadDistanceM < 100.0f) ? lv_color_hex(0xFF3B30) : lv_color_hex(0xE0A020);
-            lv_obj_set_style_bg_color(alertProgressBar, pColor, LV_PART_INDICATOR);
-            lv_obj_set_style_border_color(trafficCard, pColor, 0);
-        } else if (road.residentAreaAheadValid) {
-            // Priority 2: Resident Area (Khu dong dan cu)
-            lv_label_set_text(alertBadgeLabel, road.residentAreaIsStart ? "KHU DONG DAN CU" : "HET KHU DAN CU");
-            lv_obj_set_style_bg_color(alertBadgeLabel, lv_color_hex(0x2080C0), 0); // Blue
-            lv_obj_set_style_text_color(alertBadgeLabel, lv_color_white(), 0);
-
-            char dBuf[16];
-            snprintf(dBuf, sizeof(dBuf), "%.0f", (double)road.residentAreaAheadDistM);
-            lv_label_set_text(alertDistLabel, dBuf);
-            lv_label_set_text(alertUnitLabel, "m");
-            lv_label_set_text(alertSubLabel, "Toi da 50-60 km/h");
-
-            int prog = 350 - (int)road.residentAreaAheadDistM;
-            if (prog < 0) prog = 0;
-            lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
-            lv_obj_set_style_bg_color(alertProgressBar, lv_color_hex(0x2080C0), LV_PART_INDICATOR);
-            lv_obj_set_style_border_color(trafficCard, lv_color_hex(0x2080C0), 0);
-        } else if (road.noOvertakingAheadValid) {
-            // Priority 3: No Overtaking
-            lv_label_set_text(alertBadgeLabel, road.noOvertakingIsStart ? "DOAN DUONG CAM VUOT" : "HET CAM VUOT");
-            lv_obj_set_style_bg_color(alertBadgeLabel, lv_color_hex(0xD04020), 0); // Red
-            lv_obj_set_style_text_color(alertBadgeLabel, lv_color_white(), 0);
-
-            char dBuf[16];
-            snprintf(dBuf, sizeof(dBuf), "%.0f", (double)road.noOvertakingAheadDistM);
-            lv_label_set_text(alertDistLabel, dBuf);
-            lv_label_set_text(alertUnitLabel, "m");
-            lv_label_set_text(alertSubLabel, "Chu y vach ke duong");
-
-            int prog = 350 - (int)road.noOvertakingAheadDistM;
-            if (prog < 0) prog = 0;
-            lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
-            lv_obj_set_style_bg_color(alertProgressBar, lv_color_hex(0xD04020), LV_PART_INDICATOR);
-            lv_obj_set_style_border_color(trafficCard, lv_color_hex(0xD04020), 0);
-        } else if (road.tollBoothAheadValid) {
-            // Priority 4: Toll Booth
-            lv_label_set_text(alertBadgeLabel, "TRAM THU PHI (BOT)");
-            lv_obj_set_style_bg_color(alertBadgeLabel, lv_color_hex(0x7050B0), 0); // Purple
-            lv_obj_set_style_text_color(alertBadgeLabel, lv_color_white(), 0);
-
-            char dBuf[16];
-            snprintf(dBuf, sizeof(dBuf), "%.0f", (double)road.tollBoothAheadDistM);
-            lv_label_set_text(alertDistLabel, dBuf);
-            lv_label_set_text(alertUnitLabel, "m");
-            lv_label_set_text(alertSubLabel, "Chuan bi phi duong bo");
-
-            int prog = 350 - (int)road.tollBoothAheadDistM;
-            if (prog < 0) prog = 0;
-            lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
-            lv_obj_set_style_bg_color(alertProgressBar, lv_color_hex(0x7050B0), LV_PART_INDICATOR);
-            lv_obj_set_style_border_color(trafficCard, lv_color_hex(0x7050B0), 0);
-        } else if (road.trafficLightAheadValid) {
-            // Priority 5: Traffic Light
-            lv_label_set_text(alertBadgeLabel, "DEN TIN HIEU GIAO THONG");
-            lv_obj_set_style_bg_color(alertBadgeLabel, lv_color_hex(0x209060), 0); // Green
-            lv_obj_set_style_text_color(alertBadgeLabel, lv_color_white(), 0);
-
-            char dBuf[16];
-            snprintf(dBuf, sizeof(dBuf), "%.0f", (double)road.trafficLightAheadDistM);
-            lv_label_set_text(alertDistLabel, dBuf);
-            lv_label_set_text(alertUnitLabel, "m");
-            lv_label_set_text(alertSubLabel, "Chu y tin hieu ngat");
-
-            int prog = 350 - (int)road.trafficLightAheadDistM;
-            if (prog < 0) prog = 0;
-            lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
-            lv_obj_set_style_bg_color(alertProgressBar, lv_color_hex(0x209060), LV_PART_INDICATOR);
-            lv_obj_set_style_border_color(trafficCard, lv_color_hex(0x209060), 0);
-        } else {
-            // Default: Clear road ahead
-            lv_label_set_text(alertBadgeLabel, "DUONG THONG THOANG");
-            lv_obj_set_style_bg_color(alertBadgeLabel, lv_color_hex(0x1B2430), 0);
-            lv_obj_set_style_text_color(alertBadgeLabel, lv_color_hex(0x6A829A), 0);
-
-            lv_label_set_text(alertDistLabel, "OK");
-            lv_label_set_text(alertUnitLabel, "");
-
-            if (gnss.fix) {
-                char sBuf[32];
-                snprintf(sBuf, sizeof(sBuf), "GPS Tot (%d ve tinh)", gnss.satCount);
-                lv_label_set_text(alertSubLabel, sBuf);
-            } else {
-                lv_label_set_text(alertSubLabel, "Dang tim ve tinh GPS...");
-            }
-            lv_bar_set_value(alertProgressBar, 0, LV_ANIM_OFF);
-            lv_obj_set_style_border_color(trafficCard, lv_color_hex(0x223040), 0);
+        // Pick the GENUINELY NEXT alert: the one with the smallest remaining
+        // distance, not a fixed type priority. Every distance here is now an
+        // along-route distance (map/RoutePredictor.h projects each camera/sign
+        // onto the forward route and measures how far the car actually drives
+        // to reach it), so "smallest" is truly the next thing on the road — a
+        // camera 300m ahead no longer hides a resident-area sign 40m ahead just
+        // because camera used to win by type. Ties keep the old order via
+        // strict-less-than comparisons below (camera, then limit-change, then
+        // resident/no-overtake/toll/light).
+        enum { W_NONE, W_CAMERA, W_AHEAD_LIMIT, W_RESIDENT, W_NO_OVERTAKE, W_TOLL, W_LIGHT, W_DANGER };
+        int winner = W_NONE;
+        float winnerDist = 1e9f;
+        if (road.cameraAheadValid && road.cameraAheadDistanceM < winnerDist) {
+            winner = W_CAMERA; winnerDist = road.cameraAheadDistanceM;
+        }
+        if (road.aheadLimitValid && road.aheadSpeedLimitKmh > 0 && road.aheadDistanceM < winnerDist) {
+            winner = W_AHEAD_LIMIT; winnerDist = road.aheadDistanceM;
+        }
+        if (road.residentAreaAheadValid && road.residentAreaAheadDistM < winnerDist) {
+            winner = W_RESIDENT; winnerDist = road.residentAreaAheadDistM;
+        }
+        if (road.noOvertakingAheadValid && road.noOvertakingAheadDistM < winnerDist) {
+            winner = W_NO_OVERTAKE; winnerDist = road.noOvertakingAheadDistM;
+        }
+        if (road.tollBoothAheadValid && road.tollBoothAheadDistM < winnerDist) {
+            winner = W_TOLL; winnerDist = road.tollBoothAheadDistM;
+        }
+        if (road.trafficLightAheadValid && road.trafficLightAheadDistM < winnerDist) {
+            winner = W_LIGHT; winnerDist = road.trafficLightAheadDistM;
+        }
+        if (road.dangerAheadValid && road.dangerAheadDistM < winnerDist) {
+            winner = W_DANGER; winnerDist = road.dangerAheadDistM;
         }
 
-        // alertFooterLabel's text is otherwise static (set once at build,
-        // see buildTrafficCard()) — it used to be a live "radar target
-        // ahead" hint, updated every tick here; radar is gone (2026-09-21)
-        // so there's nothing live to report in this card anymore.
+        if (winner == W_CAMERA) {
+            // Speed Camera / Traffic Camera
+            lv_obj_clear_flag(trafficCard, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(alertIconImg, LV_OBJ_FLAG_HIDDEN);
+            lv_image_set_src(alertIconImg, &camera_icon);
+
+            if (road.cameraSpeedLimitKmh > 0) {
+                // Camera WITH Speed Limit: Show Camera Icon + Mini Speed Sign
+                lv_obj_align(alertIconImg, LV_ALIGN_LEFT_MID, 16, 0);
+                lv_obj_clear_flag(alertMiniSpeedSign, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_align(alertMiniSpeedSign, LV_ALIGN_LEFT_MID, 58, 0);
+
+                char sBuf[8];
+                snprintf(sBuf, sizeof(sBuf), "%.0f", (double)road.cameraSpeedLimitKmh);
+                lv_label_set_text(alertMiniSpeedVal, sBuf);
+                if (road.cameraSpeedLimitKmh >= 100) {
+                    lv_obj_set_style_text_font(alertMiniSpeedVal, &lv_font_vn_14, 0);
+                } else {
+                    lv_obj_set_style_text_font(alertMiniSpeedVal, &lv_font_montserrat_24, 0);
+                }
+            } else {
+                // Camera WITHOUT Speed Limit: Only Camera Icon
+                lv_obj_align(alertIconImg, LV_ALIGN_LEFT_MID, 22, 0);
+                lv_obj_add_flag(alertMiniSpeedSign, LV_OBJ_FLAG_HIDDEN);
+            }
+
+            char dBuf[16];
+            snprintf(dBuf, sizeof(dBuf), "%.0f m", (double)road.cameraAheadDistanceM);
+            lv_label_set_text(alertDistLabel, dBuf);
+
+            float maxWarnM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+            int prog = (int)((maxWarnM - road.cameraAheadDistanceM) * 100.0f / maxWarnM);
+            if (prog < 0) prog = 0;
+            if (prog > 100) prog = 100;
+            lv_bar_set_range(alertProgressBar, 0, 100);
+            lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
+            lv_color_t pColor = (road.cameraAheadDistanceM < 100.0f) ? lv_color_hex(0xFF3B30) : lv_color_hex(0xFF9800);
+            lv_obj_set_style_bg_color(alertProgressBar, pColor, LV_PART_INDICATOR);
+            lv_obj_set_style_border_color(trafficCard, pColor, 0);
+
+        } else if (winner == W_AHEAD_LIMIT) {
+            // Speed Limit Change Ahead -> Mini Speed Sign + Distance
+            lv_obj_clear_flag(trafficCard, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(alertIconImg, LV_OBJ_FLAG_HIDDEN);
+
+            lv_obj_clear_flag(alertMiniSpeedSign, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_align(alertMiniSpeedSign, LV_ALIGN_LEFT_MID, 22, 0);
+
+            char sBuf[8];
+            snprintf(sBuf, sizeof(sBuf), "%.0f", (double)road.aheadSpeedLimitKmh);
+            lv_label_set_text(alertMiniSpeedVal, sBuf);
+            if (road.aheadSpeedLimitKmh >= 100) {
+                lv_obj_set_style_text_font(alertMiniSpeedVal, &lv_font_vn_14, 0);
+            } else {
+                lv_obj_set_style_text_font(alertMiniSpeedVal, &lv_font_montserrat_24, 0);
+            }
+
+            char dBuf[16];
+            snprintf(dBuf, sizeof(dBuf), "%.0f m", (double)road.aheadDistanceM);
+            lv_label_set_text(alertDistLabel, dBuf);
+
+            float maxWarnM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+            int prog = (int)((maxWarnM - road.aheadDistanceM) * 100.0f / maxWarnM);
+            if (prog < 0) prog = 0;
+            if (prog > 100) prog = 100;
+            lv_bar_set_range(alertProgressBar, 0, 100);
+            lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
+            lv_color_t pColor = (road.aheadDistanceM < 100.0f) ? lv_color_hex(0xFF9800) : lv_color_hex(0x2196F3);
+            lv_obj_set_style_bg_color(alertProgressBar, pColor, LV_PART_INDICATOR);
+            lv_obj_set_style_border_color(trafficCard, pColor, 0);
+
+        } else if (winner == W_RESIDENT) {
+            // Resident Area (Khu dong dan cu) -> Icon + Distance
+            lv_obj_clear_flag(trafficCard, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(alertIconImg, LV_OBJ_FLAG_HIDDEN);
+            lv_image_set_src(alertIconImg, &resident_icon);
+            lv_obj_align(alertIconImg, LV_ALIGN_LEFT_MID, 22, 0);
+            lv_obj_add_flag(alertMiniSpeedSign, LV_OBJ_FLAG_HIDDEN);
+
+            char dBuf[16];
+            snprintf(dBuf, sizeof(dBuf), "%.0f m", (double)road.residentAreaAheadDistM);
+            lv_label_set_text(alertDistLabel, dBuf);
+
+            float maxWarnM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+            int prog = (int)((maxWarnM - road.residentAreaAheadDistM) * 100.0f / maxWarnM);
+            if (prog < 0) prog = 0;
+            if (prog > 100) prog = 100;
+            lv_bar_set_range(alertProgressBar, 0, 100);
+            lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
+            lv_color_t pColor = (road.residentAreaAheadDistM < 100.0f) ? lv_color_hex(0xFF9800) : lv_color_hex(0x1976D2);
+            lv_obj_set_style_bg_color(alertProgressBar, pColor, LV_PART_INDICATOR);
+            lv_obj_set_style_border_color(trafficCard, pColor, 0);
+
+        } else if (winner == W_NO_OVERTAKE) {
+            // No Overtaking -> Icon + Distance
+            lv_obj_clear_flag(trafficCard, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(alertIconImg, LV_OBJ_FLAG_HIDDEN);
+            lv_image_set_src(alertIconImg, &no_overtake_icon);
+            lv_obj_align(alertIconImg, LV_ALIGN_LEFT_MID, 22, 0);
+            lv_obj_add_flag(alertMiniSpeedSign, LV_OBJ_FLAG_HIDDEN);
+
+            char dBuf[16];
+            snprintf(dBuf, sizeof(dBuf), "%.0f m", (double)road.noOvertakingAheadDistM);
+            lv_label_set_text(alertDistLabel, dBuf);
+
+            float maxWarnM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+            int prog = (int)((maxWarnM - road.noOvertakingAheadDistM) * 100.0f / maxWarnM);
+            if (prog < 0) prog = 0;
+            if (prog > 100) prog = 100;
+            lv_bar_set_range(alertProgressBar, 0, 100);
+            lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
+            lv_color_t pColor = (road.noOvertakingAheadDistM < 100.0f) ? lv_color_hex(0xFF3B30) : lv_color_hex(0xE53935);
+            lv_obj_set_style_bg_color(alertProgressBar, pColor, LV_PART_INDICATOR);
+            lv_obj_set_style_border_color(trafficCard, pColor, 0);
+
+        } else if (winner == W_TOLL) {
+            // Toll Booth -> Icon + Distance
+            lv_obj_clear_flag(trafficCard, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(alertIconImg, LV_OBJ_FLAG_HIDDEN);
+            lv_image_set_src(alertIconImg, &toll_icon);
+            lv_obj_align(alertIconImg, LV_ALIGN_LEFT_MID, 22, 0);
+            lv_obj_add_flag(alertMiniSpeedSign, LV_OBJ_FLAG_HIDDEN);
+
+            char dBuf[16];
+            snprintf(dBuf, sizeof(dBuf), "%.0f m", (double)road.tollBoothAheadDistM);
+            lv_label_set_text(alertDistLabel, dBuf);
+
+            float maxWarnM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+            int prog = (int)((maxWarnM - road.tollBoothAheadDistM) * 100.0f / maxWarnM);
+            if (prog < 0) prog = 0;
+            if (prog > 100) prog = 100;
+            lv_bar_set_range(alertProgressBar, 0, 100);
+            lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
+            lv_color_t pColor = (road.tollBoothAheadDistM < 100.0f) ? lv_color_hex(0xFF9800) : lv_color_hex(0x8E24AA);
+            lv_obj_set_style_bg_color(alertProgressBar, pColor, LV_PART_INDICATOR);
+            lv_obj_set_style_border_color(trafficCard, pColor, 0);
+
+        } else if (winner == W_LIGHT) {
+            // Traffic Light / Intersection -> Icon + Distance
+            lv_obj_clear_flag(trafficCard, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(alertIconImg, LV_OBJ_FLAG_HIDDEN);
+            lv_image_set_src(alertIconImg, &traffic_light_icon);
+            lv_obj_align(alertIconImg, LV_ALIGN_LEFT_MID, 22, 0);
+            lv_obj_add_flag(alertMiniSpeedSign, LV_OBJ_FLAG_HIDDEN);
+
+            char dBuf[16];
+            snprintf(dBuf, sizeof(dBuf), "%.0f m", (double)road.trafficLightAheadDistM);
+            lv_label_set_text(alertDistLabel, dBuf);
+
+            float maxWarnM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+            int prog = (int)((maxWarnM - road.trafficLightAheadDistM) * 100.0f / maxWarnM);
+            if (prog < 0) prog = 0;
+            if (prog > 100) prog = 100;
+            lv_bar_set_range(alertProgressBar, 0, 100);
+            lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
+            lv_color_t pColor = (road.trafficLightAheadDistM < 100.0f) ? lv_color_hex(0xFF9800) : lv_color_hex(0x00897B);
+            lv_obj_set_style_bg_color(alertProgressBar, pColor, LV_PART_INDICATOR);
+            lv_obj_set_style_border_color(trafficCard, pColor, 0);
+
+        } else if (winner == W_DANGER) {
+            // Hazard / danger zone (đoạn đường nguy hiểm / hầm / trạm dừng) -> warning icon + distance
+            lv_obj_clear_flag(trafficCard, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(alertIconImg, LV_OBJ_FLAG_HIDDEN);
+            lv_image_set_src(alertIconImg, &warning_icon);
+            lv_obj_align(alertIconImg, LV_ALIGN_LEFT_MID, 24, 0);
+            lv_obj_add_flag(alertMiniSpeedSign, LV_OBJ_FLAG_HIDDEN);
+
+            char dBuf[16];
+            snprintf(dBuf, sizeof(dBuf), "%.0f m", (double)road.dangerAheadDistM);
+            lv_label_set_text(alertDistLabel, dBuf);
+
+            float maxWarnM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+            int prog = (int)((maxWarnM - road.dangerAheadDistM) * 100.0f / maxWarnM);
+            if (prog < 0) prog = 0;
+            if (prog > 100) prog = 100;
+            lv_bar_set_range(alertProgressBar, 0, 100);
+            lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
+            lv_color_t pColor = (road.dangerAheadDistM < 120.0f) ? lv_color_hex(0xFF3B30) : lv_color_hex(0xFFB300);
+            lv_obj_set_style_bg_color(alertProgressBar, pColor, LV_PART_INDICATOR);
+            lv_obj_set_style_border_color(trafficCard, pColor, 0);
+
+        } else {
+            // No alert ahead -> completely hide the card!
+            lv_obj_add_flag(trafficCard, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    // --- Bottom info bar (permanently cleared & hidden) ---
+    if (bottomInfoLabel) {
+        lv_label_set_text(bottomInfoLabel, "");
+        lv_obj_add_flag(bottomInfoLabel, LV_OBJ_FLAG_HIDDEN);
     }
 
-    // --- Bottom info bar ---
-    // Used to show live target count ("3 lanes | %d targets | AUTO") from
-    // the now-removed radar road panel — replaced with the two GPS-only
-    // facts worth a permanent glance: whether the offline speed-map
-    // database actually loaded, and how many satellites GNSS currently
-    // sees. Plain ASCII " | " separators, not a middle-dot: the compiled
-    // Montserrat font is missing that glyph and LVGL logs (blocking
-    // Serial.printf, with LV_LOG_PRINTF=1) every time it tries to draw one
-    // — confirmed on real hardware 2026-09-14.
-    char infoBuf[48];
-    snprintf(infoBuf, sizeof(infoBuf), "%s | %d sats | VietHUD", road.mapLoaded ? "MAP OK" : "NO MAP", gnss.satCount);
-    lv_label_set_text(bottomInfoLabel, infoBuf);
+    // --- Street Name Banner ---
+    if (streetNameBadge && streetNameLabel) {
+        if (road.roadName[0] != '\0') {
+            char nameBuf[64];
+            abbreviateRoadName(road.roadName, nameBuf, sizeof(nameBuf));
+            lv_label_set_text(streetNameLabel, nameBuf);
+            lv_obj_clear_flag(streetNameBadge, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(streetNameBadge, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    updateMapCanvas();
 }
 
 // Only refresh while the Dashboard is the screen actually on-screen — this
