@@ -365,6 +365,15 @@ bool sdMgrMount() {
                 if (roadNameOffsets && roadNamePool) {
                     nameFile.read((uint8_t *)roadNameOffsets, count * sizeof(uint32_t));
                     nameFile.read((uint8_t *)roadNamePool, totalBytes);
+                    // Defensive: force a terminator on the very last byte so any
+                    // string returned by sdMgrGetRoadName() (which only checks that
+                    // its START offset is < poolSize) is guaranteed to be
+                    // NUL-terminated within the buffer. Without this, a truncated
+                    // or corrupt names.bin (e.g. an interrupted OTA) whose last
+                    // string lacks a terminator would let strncpy/label rendering
+                    // read past the pool end — an OOB read on the constantly-used
+                    // road-name display path. Costs one string entry at worst.
+                    roadNamePool[totalBytes - 1] = '\0';
                     roadNameCount = count;
                     roadNamePoolSize = totalBytes;
                     Serial.printf("[sdmgr] names.bin: %d street names loaded (%u bytes string pool)\n",
