@@ -945,7 +945,7 @@ def main():
     for root, dirs, files in os.walk(input_dir):
         dirs[:] = [d for d in dirs if d.lower() not in ignored_dir_names]
         for f in files:
-            if f.lower().endswith('.spc'):
+            if f.lower().endswith('.spc') or 'spc' in f.lower():
                 spc_candidates.append(os.path.join(root, f))
     if spc_candidates:
         spc_candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
