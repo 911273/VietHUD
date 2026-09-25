@@ -3,7 +3,7 @@
 > Kho lưu trữ chính thức đồng bộ dữ liệu giao thông, camera phạt nguội và biển báo cho thiết bị **VietHUD**.
 
 **Phiên bản phát hành (Version):** `2026.09.25.1116`  
-**Thời gian cập nhật:** `2026-09-25 11:16:04`  
+**Thời gian cập nhật:** `2026-09-25 11:16:39`  
 **Đường dẫn OTA tải về (VietHUD OTA URL):**  
 ```text
 https://raw.githubusercontent.com/911273/VietHUD/main/speedmap/
