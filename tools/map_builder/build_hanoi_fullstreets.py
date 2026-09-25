@@ -34,9 +34,9 @@ REGION = "VN-HN"
 MAPVER = time.strftime("%Y.%m")
 
 NAMES_MAGIC = b"VNNM"
-NAMES_VER = 1
-MAX_NAMES = 65000        # firmware nameId is uint16 (<65535)
-MAX_POOL = 1_950_000     # firmware caps the pool < 2,000,000 bytes
+NAMES_VER = 2
+MAX_NAMES = 4_000_000    # firmware nameId is uint32 (<5,000,000)
+MAX_POOL = 15_000_000    # firmware caps the pool < 16,000,000 bytes
 
 def main():
     minLa, minLo, maxLa, maxLo = BBOX
@@ -181,14 +181,15 @@ def main():
     offsets = bytearray(); pool = bytearray(); cur = 0
     for enc in names_list:
         offsets += struct.pack("<I", cur); pool += enc; cur += len(enc)
-    header = struct.pack("<4sHHII", NAMES_MAGIC, NAMES_VER, len(names_list), len(pool), 0)
+    # V2 Header: magic[4]="VNNM", version(u16)=2, count(u32), poolBytes(u32), reserved(u16)=0
+    header = struct.pack("<4sHIIH", NAMES_MAGIC, NAMES_VER, len(names_list), len(pool), 0)
     (OUT / "names.bin").write_bytes(header + offsets + pool)
 
     # ---- seg_names.bin: uint16[segId] (segId 1..N; index 0 unused) ----
     maxid = next_id  # ids are 1..next_id-1
-    seg_names = bytearray(maxid * 2)  # zero-filled; [0] unused
+    seg_names = bytearray(maxid * 4)  # zero-filled; [0] unused (uint32 per segment in v2)
     for s in segments:
-        struct.pack_into("<H", seg_names, s["id"] * 2, s["nm"])
+        struct.pack_into("<I", seg_names, s["id"] * 4, s["nm"])
     (OUT / "seg_names.bin").write_bytes(seg_names)
 
     print(f"WROTE: tiles.bin {len(tiles_blob)/1e6:.1f}MB ({len(tiles):,} tiles), index.bin ({len(index_entries):,}), "

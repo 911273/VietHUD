@@ -67,13 +67,16 @@ static uint32_t addSeg(uint32_t id, double e0, double n0, double e1, double n1, 
 }
 
 // Provider: return every world segment incident to (nodeLatE7,nodeLonE7).
+// Mirrors the real firmware provider (SpeedLimitManager.cpp routeSegmentProvider),
+// which as of 2026-09-25 matches nodes with segNodesCoincide() (a ~2m tolerance)
+// rather than exact E7 equality — so tile-clipped border nodes still stitch.
 static int worldProvider(int32_t nLa, int32_t nLo, RoadSegment *out, int maxOut, void *ctx) {
     (void)ctx;
     int n = 0;
     for (const auto &s : g_world) {
         if (n >= maxOut) break;
-        bool inc = (s.startLatE7 == nLa && s.startLonE7 == nLo) ||
-                   (s.endLatE7 == nLa && s.endLonE7 == nLo);
+        bool inc = segNodesCoincide(s.startLatE7, s.startLonE7, nLa, nLo) ||
+                   segNodesCoincide(s.endLatE7, s.endLonE7, nLa, nLo);
         if (inc) out[n++] = s;
     }
     return n;
@@ -266,8 +269,43 @@ static void test_oneway_wrongway() {
     CHECK(r.seg(0).headingDeg > 45.0f && r.seg(0).headingDeg < 135.0f, "first seg heads east");
 }
 
+static void test_tile_boundary_stitch() {
+    printf("[#3] node stitching: only a tiny (<0.5m rounding) gap chains; urban-close nodes do NOT merge\n");
+    // The correct fix for tile-clipped sources is PC-side node normalization; the
+    // firmware tolerance (SEG_NODE_MATCH_EPS_E7 ~0.5m) is only a rounding margin.
+    // POSITIVE: seg1 ends at (200,0); seg2 starts at (200, 0.3m) — the same
+    // normalized node, off only by sub-0.5m integer rounding. Must still chain.
+    g_world.clear();
+    addSeg(1, 0, 0, 200, 0, 60);
+    addSeg(2, 200, 0.3, 400, 0.3, 60); // start jittered 0.3m north of seg1's end
+    {
+        Route r;
+        int n = r.build(worldById(1), 90.0f, 600.0f, worldProvider, nullptr);
+        CHECK(n == 2, "<0.5m rounding gap: route stitches across the node");
+        CHECK_NEAR(r.totalLenM(), 400.0f, 4.0f, "stitched length ~400m");
+        float lat, lon, dist;
+        ptDeg(300, 0.3, lat, lon); // a point on seg2, ~300m along
+        CHECK(r.project(lat, lon, 35.0f, &dist, nullptr, nullptr), "point past the boundary projects onto the route");
+        CHECK_NEAR(dist, 300.0f, 6.0f, "arc past boundary ~300m");
+    }
+
+    // NEGATIVE: a 1.2m gap is well beyond the ~0.5m rounding margin — this is how
+    // far apart genuinely-distinct urban nodes (parallel/frontage/slip lanes) can
+    // be, and they must NOT be merged. (Under the old 2m tolerance this WOULD have
+    // wrongly merged — the exact risk the tighter margin removes.)
+    g_world.clear();
+    addSeg(1, 0, 0, 200, 0, 60);
+    addSeg(2, 200, 1.2, 400, 1.2, 60); // 1.2m north — a distinct nearby node
+    {
+        Route r;
+        int n = r.build(worldById(1), 90.0f, 600.0f, worldProvider, nullptr);
+        CHECK(n == 1, "1.2m-apart distinct nodes are NOT merged (route ends at seg1)");
+    }
+}
+
 int main() {
     test_straight_road();
+    test_tile_boundary_stitch();
     test_curve();
     test_junction_straightest();
     test_limit_change_ahead();
