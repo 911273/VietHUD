@@ -1,173 +1,110 @@
-# VietHUD (formerly radar_car)
+# 🚗 VietHUD - Standalone Offline Speed & Traffic Alert HUD
 
 GPS-only offline speed-limit / speed-camera / traffic-sign warning device —
-ESP32-S3 (JC3248W535) + u-blox M10N GNSS + an offline speed-map database
+**ESP32-S3 (JC3248W535)** + **u-blox M10N GNSS** + an offline speed-map database
 built from OpenStreetMap + a WYN traffic-signs/road-network export, loaded
-from a microSD card at boot. No radar, no cellular/data connection needed
-while driving — everything the device warns about comes from GNSS position
-plus data already on the card.
+from a microSD card at boot.
 
-This project started as `radar_car`, a forward-collision radar display
-(HLK-LD2451 + GNSS). Radar was removed entirely 2026-09-21 — this is a full
-product replacement, not a side-by-side option. `docs/radar_car_V1.1_spec.md`
-and `docs/V1.2_hardening_proposal.md` are kept for historical record (board
-bring-up notes, driver bugs found/fixed, the original radar architecture)
-but no longer describe the current product end to end.
+No radar, no cellular/SIM card, no cloud dependency needed while driving — everything the device warns about comes from real-time GNSS positioning matched against binary data stored on the MicroSD card.
 
-## What it does
+---
 
-- Reads GNSS position/speed/heading from a real u-blox M10N (UART2).
-- Matches the current position against an offline speed-map database
-  (`data/speedmap/*.bin`, built by `tools/map_builder/build_speedmap.py`
-  from OSM + WYN data) to show the current speed limit, an upcoming
-  speed-limit change, upcoming speed cameras, and upcoming resident-area /
-  no-overtaking / toll-booth / traffic-light signs — see
-  `src/map/SpeedMapFormat.h` for the on-disk format and
-  `src/map/SpeedLimitManager.cpp` for the matching algorithm.
-- Shows all of that on an LVGL Dashboard (`src/ui/Dashboard.cpp`): the
-  current speed and the speed-limit sign are the focal point in both
-  orientations (speed drawn as large 7-segment digits — `src/ui/SevenSeg.h`
-  explains why not a font), and one alert card carries whatever is coming up
-  next. That card is driven by the REMAINING distance — the countdown number
-  grows, its color escalates, the bar fills and the border starts blinking as
-  you close in. A tone chime plays immediately on a new warning and a
-  Vietnamese voice line queues behind it (`src/audio/AudioPlayer.cpp`, MP3s
-  in `data/speedmap/sounds/vi/`).
-- Logs GNSS speed + speed-limit/camera/sign state to the microSD card per
-  drive (`src/log/TripLogger.cpp`), and serves live telemetry / config / OTA
-  update over its own WiFi AP (`src/net/WebPortal.cpp`).
+## 🌟 What it does
 
-## Current status
+- **Real-Time GNSS Positioning:** Reads position, speed, and heading from a u-blox M10N module via UART2 at 5Hz.
+- **Offline Map Matching & Hazard Lookahead:** Matches current position against a vector speed-map database (`speedmap/*.bin`) to display:
+  - Current road speed limit
+  - Upcoming speed-limit changes
+  - Speed cameras / traffic enforcement cameras
+  - Resident area entry/exit (R.420 / R.421)
+  - No-overtaking zones (P.125 / DP.133)
+  - Toll booths (P.135)
+  - Traffic lights & intersection cameras
+- **Dynamic Lookahead Distance:** Automatically calculates warning distance based on vehicle velocity:
+  $$D_{warn} = \text{clamp}(v_{kmh} \times 3.0\text{ m}, 150\text{m}, 500\text{m})$$
+- **Rich LVGL Dashboard (30 FPS):** Dual-orientation HUD (Landscape & Portrait) with large high-contrast 7-segment digital speedometer and dynamic hazard countdown alert cards.
+- **Vietnamese Voice Guidance:** Real-time I2S audio announcements (`NS4168` amp + speaker) queue MP3 voice lines in Vietnamese without stutter or UI frame drops.
+- **Wi-Fi WebPortal & Cloud OTA:** Serves live telemetry, trip logs, configuration, and **wireless GitHub OTA data updates** (`src/net/DataUpdater.cpp` and `src/net/WebPortal.cpp`).
 
-Builds clean (`pio run -e viethud`) and runs on real hardware. A database IS
-now on the board's microSD card, but it is **partial** — read from the boot
-log on 2026-09-22:
+---
 
-```
-[sdmgr] mounted OK  region=XX version=2026.09 tiles=1
-[sdmgr] cameras.bin: 8075 speed camera(s) loaded
-[sdmgr] signs.bin: 38340 traffic sign(s) loaded
-[map] self-test PASS  expected road=1 got road=1 limit=50km/h confidence=1.00
-```
+## 📦 Dữ Liệu Đồng Bộ OTA Qua GitHub (SpeedMap OTA Files)
 
-`cameras.bin` and `signs.bin` are fully populated, so speed-camera and
-sign warnings (khu đông dân cư / cấm vượt / đèn tín hiệu / trạm thu phí) have
-real data — those are flat arrays, not tiled. But `tiles=1` means the road
-network is a single placeholder tile (`region=XX` is likewise a placeholder,
-not a real region code), so **current speed limit and upcoming-limit-change
-warnings will not match anything while driving.** Rebuild the database with a
-real extract (see "Rebuilding the speed-map database" below) and re-copy
-`data/speedmap/` to fix that; `tiles=` in the boot log is the number to check.
+> **Kho lưu trữ chính thức:** [https://github.com/911273/VietHUD.git](https://github.com/911273/VietHUD.git)  
+> **Đường dẫn OTA tải về thiết bị (VietHUD OTA URL):**  
+> ```text
+> https://raw.githubusercontent.com/911273/VietHUD/main/speedmap/
+> ```
 
-To review the UI itself without a GNSS fix or a complete database, turn on
-**Settings > Display > Demo mode** — it plays a scripted tour of every
-Dashboard state (see `src/demo/DemoMode.h`). It never persists across a
-reboot, by design.
+| File | Kích thước | Mô tả |
+| :--- | :--- | :--- |
+| `cameras.bin` | ~1.15 MB | Vị trí camera phạt nguội & camera tốc độ toàn quốc |
+| `signs.bin` | ~1.78 MB | Biển báo khu dân cư, cấm vượt, trạm thu phí |
+| `tiles.bin` | ~4.87 MB | Mạng lưới đường bộ vector & giới hạn tốc độ chi tiết |
+| `index.bin` | ~94.0 KB | Lưới chỉ mục không gian tra cứu nhanh |
+| `metadata.bin` | ~0.1 KB | Thông số khung tọa độ & cấu hình bản đồ |
+| `names.bin` | ~141.2 KB | Từ điển tên đường phố toàn quốc |
+| `seg_names.bin` | ~355.9 KB | Ánh xạ định danh phân đoạn đường sang tên phố |
+| `sounds/` | ~3.0 MB | Thư viện file âm thanh cảnh báo MP3 tiếng Việt |
 
-## Build & flash
+### Cách cập nhật dữ liệu OTA trên thiết bị:
+1. Kết nối VietHUD vào Hotspot Wi-Fi của điện thoại (hoặc Wi-Fi nhà).
+2. Dùng điện thoại truy cập WebPortal tại `http://192.168.4.1` (hoặc `http://viethud.local`).
+3. Dán URL trên vào ô **Data Update URL** và bấm **Lưu & Kiểm tra cập nhật**. Thiết bị sẽ tự động tải các file thay đổi, ghi vào thẻ nhớ và khởi động lại.
 
-```
-python -m platformio run -e viethud              # build the product firmware
-python -m platformio run -e viethud -t upload    # build + flash (board on COM3, 921600 baud)
-python -m platformio device monitor -e viethud   # serial log, 115200 baud
-```
+---
 
-(Or `pio ...` directly if the PlatformIO CLI is on PATH.) `env:viethud` is
-also `default_envs`, so a bare `pio run`/`pio run -t upload` builds it too.
+## 🛠 Hardware Specifications
 
-Two other envs exist, both hardware-recovery diagnostics, not the product:
-- `env:jc3248w535` — builds `src/main.cpp`, the original Phase-1 bring-up
-  stub (LCD + touch + a minimal LVGL screen). Useful for isolating a
-  display/touch hardware issue from application logic.
-- `env:rawtest` — `src/main_rawtest.cpp`, no LVGL at all, just raw
-  `Arduino_GFX` calls. The most minimal possible "is the panel alive" check.
+- **Mainboard:** JC3248W535 (ESP32-S3-N16R8V — 16 MB Flash, 8 MB Octal PSRAM)
+- **Display:** 3.5" AXS15231B QSPI LCD (480x320 / 320x480), I2C capacitive touch
+- **GNSS Module:** u-blox M10N on UART2 (RX=GPIO 17, TX=GPIO 18)
+- **Storage:** Dedicated onboard SD_MMC slot in 1-bit mode (CLK=12, CMD=11, D0=13)
+- **Audio:** Onboard NS4168 I2S power amplifier (BCLK=42, LRCK=2, DOUT=41)
+- **PlatformIO Board Definition:** `boards/esp32-s3-n16r8v.json`
 
-`env:uidemo3` is an abandoned esp_lcd migration experiment (unrelated to
-this project's direction) — do not build it; see its own comment in
-`platformio.ini` and `docs/V1.2_hardening_proposal.md` "Thử nghiệm esp_lcd".
+---
 
-**`platform = espressif32@7.1.3` is pinned on purpose** — do not remove the
-version. Installing `env:uidemo3`'s pioarduino platform silently overwrites
-the shared local platform install every other env uses too (both name their
-platform "espressif32"), breaking `env:viethud`'s build with unrelated
-compile errors. If you ever touch platform versions/URLs in this file,
-re-run `pio run -e viethud` afterward to confirm it still builds clean.
+## 🚀 Build & Flash
 
-Found and fixed a real crash early on: `lv_label_set_text_fmt()` with a
-`%f`/`%.Nf` specifier corrupts subsequent varargs and panics
-(`LoadProhibited`) because `lv_conf.h` has `LV_USE_FLOAT 0`, which strips
-float support out of LVGL's builtin `vsnprintf`. Always `snprintf()` floats
-into a buffer yourself and use `lv_label_set_text()` instead — applies
-everywhere this UI formats a float (Settings, Dashboard).
-
-## microSD card contents
-
-Copy the whole `data/speedmap/` folder onto the root of the physical
-microSD card, so the card ends up with:
-
-```
-/speedmap/metadata.bin
-/speedmap/index.bin
-/speedmap/tiles.bin
-/speedmap/cameras.bin
-/speedmap/signs.bin
-/speedmap/sounds/vi/*.mp3            (top-level voice clips)
-/speedmap/sounds/vi/speed/*.mp3      (numbered speed-value voice clips)
-/speedmap/sounds/vi/slowdown/voice.mp3
-/speedmap/sounds/vi/welcome/voice.mp3
+```bash
+python -m platformio run -e viethud              # Biên dịch firmware chính
+python -m platformio run -e viethud -t upload    # Nạp firmware vào board (COM3, 921600 baud)
+python -m platformio device monitor -e viethud   # Xem log qua cổng Serial, 115200 baud
 ```
 
-The board expects the SD card in its dedicated SD_MMC slot (1-bit mode —
-see `include/pincfg.h`'s `SD_MMC_CLK_PIN`/`CMD_PIN`/`D0_PIN` comment for why
-it's SD_MMC and not SPI). `metadata.bin`/`index.bin`/`tiles.bin` are
-required for the speed-limit map to work at all; `cameras.bin`/`signs.bin`
-are optional (an absent/empty file is treated as "zero cameras/signs", not
-an error) but needed for camera and sign warnings.
+**Lưu ý quan trọng về Toolchain:**
+`platform = espressif32@7.1.3` được ghim phiên bản cố định để tương thích với API `driver/i2s.h` của ESP-IDF 4.4 và Arduino-ESP32 2.0.17. Không nâng cấp tự do lên phiên bản 3.x/IDF 5.x để tránh xung đột thư viện âm thanh.
 
-## Rebuilding the speed-map database
+---
 
-```
-python tools/map_builder/build_speedmap.py <region>.osm data --region <code> --map-version <YYYY.MM> \
-    --wyn-signs <traffic_signs.csv> --wyn-network <wmap_network.db>
-```
+## 📂 Project Layout
 
-writes `data/speedmap/{metadata,index,tiles,cameras,signs}.bin`. See
-`tools/map_builder/build_speedmap.py`'s own docstring and
-`src/map/SpeedMapFormat.h` for the exact wire format each file follows.
-
-## Hardware
-
-- Board: JC3248W535 (ESP32-S3-N16R8V — 16 MB flash, 8 MB octal PSRAM)
-- Display: AXS15231B QSPI, 320x480 capacitive touch
-- GNSS: u-blox M10N on UART2 — see `include/pincfg.h` for the confirmed
-  wiring
-- microSD: onboard SD_MMC slot (1-bit mode)
-- Audio: onboard NS4168 I2S power amp (BCLK=42, LRCK=2, DOUT=41)
-- Custom PlatformIO board definition: `boards/esp32-s3-n16r8v.json`
-  (matches USB VID:PID 303A:1001 of the connected device)
-
-## Project layout
-
-```
-radar_car/
-├── boards/esp32-s3-n16r8v.json   custom PlatformIO board def
-├── data/speedmap/                offline speed-map database + voice mp3s (copy to the SD card)
-├── docs/                         historical spec + hardening proposal (radar-era, not fully current)
-├── include/                      lv_conf.h, pincfg.h, dispcfg.h
-├── lib/AXS15231B_Touch/          I2C touch driver for the AXS15231B panel
-├── src/
-│   ├── main_viethud.cpp          the product entry point (env:viethud)
-│   ├── main.cpp                  Phase-1 bring-up stub (env:jc3248w535)
-│   ├── main_rawtest.cpp          raw display/touch diagnostic (env:rawtest)
-│   ├── core/                     AppConfig, NVS persistence, mutex-protected shared state
-│   ├── gnss/                     u-blox M10N UART driver + NMEA parsing
-│   ├── map/                      microSD speed-map loader + GNSS map-matching
-│   ├── ui/                       Dashboard + Settings (LVGL), SevenSeg big-digit renderer
-│   ├── audio/                    tone chimes + queued Vietnamese voice playback
-│   ├── net/                      WiFi AP + live telemetry/config/OTA web portal
-│   ├── log/                      per-drive trip CSV logging
-│   ├── display/, touch/          display driver + touch task
-│   └── main_ui_demo_esplcd.cpp   abandoned esp_lcd experiment (env:uidemo3, do not build)
-├── tools/map_builder/            PC-side OSM+WYN -> speed-map database builder
-└── platformio.ini
+```text
+VietHUD/
+├── .gitignore
+├── README.md                     # Tài liệu tổng quan dự án & hướng dẫn
+├── platformio.ini                # Cấu hình PlatformIO
+├── boards/esp32-s3-n16r8v.json   # Định nghĩa board phần cứng JC3248W535
+├── docs/                         # Tài liệu kỹ thuật chi tiết
+│   ├── VIETHUD_DATA_AND_GITHUB_GUIDE.md
+│   └── VIETHUD_WEBPORTAL_AND_GITHUB_GUIDE.md
+├── include/                      # Header cấu hình phần cứng & đồ họa (pincfg.h, lv_conf.h)
+├── lib/AXS15231B_Touch/          # Driver cảm ứng I2C cho panel AXS15231B
+├── speedmap/                     # Dữ liệu bản đồ & camera phục vụ tải OTA
+│   ├── manifest.txt
+│   ├── cameras.bin, signs.bin, tiles.bin, ...
+│   └── sounds/
+├── src/                          # Toàn bộ mã nguồn firmware C++
+│   ├── main_viethud.cpp          # Điểm khởi chạy chính của thiết bị
+│   ├── core/                     # AppConfig, NVS, FreeRTOS SharedState
+│   ├── gnss/                     # UART2 u-blox M10N & NMEA parser
+│   ├── map/                      # SpeedLimitManager & SDCardManager
+│   ├── ui/                       # Dashboard, Settings (LVGL 9.2.2), SevenSeg
+│   ├── audio/                    # Bộ giải mã MP3 & Tone chimes I2S
+│   ├── net/                      # WebPortal & DataUpdater (GitHub OTA)
+│   ├── log/                      # TripLogger ghi dữ liệu ra thẻ nhớ
+│   └── display/, touch/          # QSPI Display & Touch drivers
+└── tools/                        # Bộ công cụ xử lý dữ liệu PC
+    └── viethud_builder.py        # All-in-one builder & GitHub publisher
 ```
