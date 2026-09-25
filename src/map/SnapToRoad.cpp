@@ -80,8 +80,13 @@ SnappedPosition SnapToRoad::update(float rawLat, float rawLon, float rawHeading,
     float roadHeading = (float)matchedSeg->headingDeg;
     float headingDiff = angularDiffDeg(rawHeading, roadHeading);
 
-    // If bidirectional road, check reverse heading direction
-    if (!(matchedSeg->flags & 0x01)) { // SEGFLAG_ONEWAY = 0x01
+    // If bidirectional road, check reverse heading direction.
+    // BUGFIX 2026-09-25: this used to test `flags & 0x01`, but 0x01 is
+    // SEGFLAG_HAS_CONDITIONAL — the one-way bit is SEGFLAG_ONEWAY (0x02). So a
+    // segment that merely carried a maxspeed:conditional tag was wrongly treated
+    // as one-way (its reverse heading never considered), and a genuine one-way
+    // wasn't. Use the correct flag.
+    if (!(matchedSeg->flags & SEGFLAG_ONEWAY)) {
         float reverseHeading = fmodf(roadHeading + 180.0f, 360.0f);
         float revDiff = angularDiffDeg(rawHeading, reverseHeading);
         if (revDiff < headingDiff) {
