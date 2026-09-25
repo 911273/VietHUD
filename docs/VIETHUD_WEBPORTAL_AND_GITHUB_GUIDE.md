@@ -98,8 +98,8 @@ VietHUD/ (Root)
     ├── tiles.bin           <-- Mạng lưới đường vector chi tiết
     ├── index.bin           <-- Lưới chỉ mục không gian tra cứu nhanh
     ├── metadata.bin        <-- Bounding box và metadata bản đồ
-    ├── names.bin           <-- Từ điển tên đường phố Việt Nam
-    ├── seg_names.bin       <-- Ánh xạ phân đoạn đường sang tên phố
+    ├── names.bin           <-- Từ điển tên đường phố Việt Nam (Chuẩn V2: 32-bit header & offsets)
+    ├── seg_names.bin       <-- Ánh xạ phân đoạn đường sang tên phố (Chuẩn V2: uint32 mỗi segment)
     └── sounds/             <-- Thư viện file âm thanh cảnh báo MP3 tiếng Việt
 ```
 
@@ -113,7 +113,7 @@ tiles.bin 5102776 ff41ca79e36916ca8ac2b82965818f750c799316e758ccb718ce01322d9e7f
 index.bin 96236 25656be57c8a9b9b9d411df84477f4eaa79998adb4554ea648c356bc34f16d33
 metadata.bin 140 f6beebdf94259322e93e9e60ad056ac832c9396acd23a0337cd1c79c56ffed0e
 names.bin 144563 6edd2dc0859dc9b524c60645deade49cc9a50741222212fdb487d3c5e74cd62f
-seg_names.bin 364486 d210aeeece6f42133ac01aa500dae393220c16296731bfca8cf785528bfdc6ae
+seg_names.bin 728972 905e3f19e48... (V2 32-bit: 182,243 segments x 4 bytes)
 ```
 
 **Quy tắc định dạng bất biến:**

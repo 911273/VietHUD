@@ -208,22 +208,59 @@ struct TrafficSignPoint {
     uint16_t reserved;      // aligns to 20 bytes
 };
 
+// Road Names Database Format (VNNM) — for /speedmap/names.bin & seg_names.bin
+#define NAMES_MAGIC "VNNM"
+#define NAMES_VERSION_V1 1
+#define NAMES_VERSION_V2 2
+
+struct RoadNamesHeaderV1 {
+    char     magic[4];       // "VNNM"
+    uint16_t version;        // 1
+    uint16_t nameCount;      // Total names (capped at 65,535)
+    uint32_t poolBytes;      // Size of UTF-8 NUL-terminated string pool in bytes
+    uint32_t reserved;       // Reserved (0)
+};
+
+// Format V2 (2026): Lifts 65k limit for nationwide full Vietnam street network
+struct RoadNamesHeaderV2 {
+    char     magic[4];       // "VNNM"
+    uint16_t version;        // 2
+    uint32_t nameCount;      // Total names (uint32)
+    uint32_t poolBytes;      // Size of UTF-8 NUL-terminated string pool in bytes
+    uint16_t reserved;       // Reserved / padding (0)
+};
+// Note: seg_names.bin is a headerless array indexed by segId (1-based, index 0 unused):
+//   - On V1: uint16_t per segment (2 bytes each)
+//   - On V2: uint32_t per segment (4 bytes each)
+// Value is nameId (0 = unnamed road segment).
+
 #pragma pack(pop)
 
 // Node-coincidence tolerance for chaining RoadSegments into a route
 // (map/RoutePredictor.cpp + map/SpeedLimitManager.cpp's routeSegmentProvider).
-// Two segment endpoints that represent the SAME junction node should compare
-// equal, but when the map is compiled from a tile-clipped vector source (e.g.
-// MBTiles, which cuts geometry at tile borders), the two sides of a border node
-// can differ by a sub-meter amount. Exact E7 equality would then fail to stitch
-// segments across tile boundaries and RoutePredictor's forward route would break
-// at every tile edge. So match within a small tolerance instead. 1 E7 latitude
-// unit is ~1.11 cm, so 180 E7 ~= 2 m — large enough to absorb clip rounding,
-// small enough never to merge two genuinely distinct road nodes (which are
-// metres apart). Longitude uses the same bound; at VN latitudes 1 E7 lon unit is
-// ~1.05 cm, so the effective lon tolerance is ~1.9 m, comparable. Added
-// 2026-09-25 ahead of the full-VN MBTiles-sourced dataset.
-#define SEG_NODE_MATCH_EPS_E7 180
+// Two segment endpoints that represent the SAME junction node must compare equal
+// so the forward route can chain through them.
+//
+// WHERE NODE ALIGNMENT MUST BE SOLVED (2026-09-25): on the PC COMPILER, not here.
+// When the map is built from a tile-clipped vector source (e.g. MBTiles cuts
+// geometry at tile borders), the two sides of a border node can land on slightly
+// different coordinates. The correct, deterministic fix is to NORMALIZE/STITCH
+// nodes at compile time — snap every endpoint to a single canonical E7 coordinate
+// per real node (a node table keyed by rounded lat/lon), so all segments meeting
+// there emit byte-identical start/end coords. The firmware then only needs an
+// exact (or near-exact) match. THIS IS A CONTRACT the PC compiler must uphold.
+//
+// A first version used a 2 m box here as a stopgap, but a ~2 m tolerance (≈2.7 m
+// on the diagonal) is NOT a mathematical guarantee against merging two genuinely
+// distinct urban nodes — frontage/parallel/service roads, slip lanes and very
+// close junctions in a dense city can sit that close. So this is now a TIGHT
+// safety margin: ~0.5 m, only to absorb ±1-E7 integer-rounding of an
+// already-normalized coordinate — far too small to join distinct road nodes
+// (which are ≥1 m apart even in the densest areas). Once the PC compiler's node
+// normalization is confirmed, this may be set to 0 (exact match).
+// 1 E7 latitude unit ≈ 1.11 cm, so 50 E7 ≈ 0.55 m; at VN latitudes 1 E7 lon unit
+// ≈ 1.05 cm, so the lon bound is ≈ 0.52 m.
+#define SEG_NODE_MATCH_EPS_E7 50
 static inline bool segNodesCoincide(int32_t latA, int32_t lonA, int32_t latB, int32_t lonB) {
     int32_t dLat = latA > latB ? latA - latB : latB - latA;
     int32_t dLon = lonA > lonB ? lonA - lonB : lonB - lonA;

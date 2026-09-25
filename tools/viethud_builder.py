@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-   VIETHUD MASTER DATA BUILDER & SD-CARD SYNC TOOL (2026)
-   Công cụ chuẩn hóa, tổng hợp, khử trùng lặp và đóng gói dữ liệu VietHUD
+   VIETHUD ALL-IN-ONE MASTER DATA BUILDER & GITHUB OTA PUBLISHER (2026)
+   Công cụ chuẩn hóa, tổng hợp, khử trùng lặp và tự động đồng bộ GitHub OTA
 ================================================================================
 """
 
@@ -15,11 +15,18 @@ import math
 import zlib
 import time
 import shutil
+import hashlib
+import datetime
 import subprocess
 import argparse
 from collections import defaultdict, Counter
 
-sys.stdout.reconfigure(encoding='utf-8')
+# Đảm bảo UTF-8 cho console Windows
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 # -----------------------------------------------------------------------------
 # CẤU TRÚC VÀ ĐỊNH NGHĨA CHUẨN VIETHUD FIRMWARE (SpeedMapFormat.h)
@@ -55,6 +62,22 @@ SIGN_TYPE_NAMES = {
     SIGN_TYPE_TRAFFIC_LIGHT: 'Đèn giao thông / Camera vượt đèn đỏ (Type 6)',
     SIGN_TYPE_DANGER_OTHER: 'Lối vào cao tốc / Hầm / Trạm dừng / Cầu hẹp (Type 10)'
 }
+
+# -----------------------------------------------------------------------------
+# THÔNG SỐ GITHUB OTA MẶC ĐỊNH
+# -----------------------------------------------------------------------------
+DEFAULT_REPO_URL = "https://github.com/911273/VietHUD.git"
+DEFAULT_BRANCH = "main"
+
+CORE_VECTOR_FILES = [
+    "cameras.bin",
+    "signs.bin",
+    "tiles.bin",
+    "index.bin",
+    "metadata.bin",
+    "names.bin",
+    "seg_names.bin"
+]
 
 # -----------------------------------------------------------------------------
 # TOÁN HỌC KHÔNG GIAN
@@ -400,8 +423,8 @@ def export_viethud_package(clean_points, ref_map_dir, target_dirs, mode='vector'
                 cam_id_counter,
                 lat_e7,
                 lon_e7,
-                speed if speed > 0 else -1,
-                heading_deg
+                heading_deg,
+                speed
             ))
             cam_id_counter += 1
 
@@ -412,32 +435,33 @@ def export_viethud_package(clean_points, ref_map_dir, target_dirs, mode='vector'
             lon_e7,
             heading_deg,
             p['type'],
-            speed if speed > 0 else 0,
-            0, # subtype
-            0, # flags
-            0  # reserved
+            speed,
+            0,
+            0,
+            0
         ))
         sign_id_counter += 1
 
     cameras_data = b"".join(camera_records)
-    signs_body = b"".join(sign_records)
-    crc = zlib.crc32(signs_body) & 0xFFFFFFFF
-    header = struct.pack(SIGN_HEADER_FMT, SIGN_MAGIC, SIGN_VERSION, len(sign_records), 0, crc, int(time.time()))
-    signs_data = header + signs_body
 
-    print(f"\n[DONG GOI] Kich thuoc du lieu nhi phan:")
-    print(f"  * cameras.bin: {len(camera_records):,} camera ({len(cameras_data):,} bytes)")
-    print(f"  * signs.bin:   {len(sign_records):,} bien bao ({len(signs_data):,} bytes, CRC32: 0x{crc:08X})")
+    timestamp = int(time.time())
+    total_signs = len(sign_records)
+    signs_payload = b"".join(sign_records)
+    crc = zlib.crc32(signs_payload) & 0xFFFFFFFF
+    header = struct.pack(SIGN_HEADER_FMT, SIGN_MAGIC, SIGN_VERSION, total_signs, 0, timestamp, crc)
+    signs_data = header + signs_payload
 
-    # Lọc danh sách file bản đồ theo tùy chọn người dùng
-    if mode == 'alerts':
-        map_files = []
-        mode_desc = "CHI DU LIEU CANH BAO GIAO THONG (Alerts Only ~3MB)"
-    elif mode == 'vector':
-        # Vector Roads + Street Names + Spatial Index, KHÔNG copy ảnh raster 448MB
+    print("\n[DONG GOI] Dang xuat file nhi phan chuan VietHUD...")
+    print(f"  + cameras.bin : {len(cameras_data):,} bytes ({len(camera_records):,} camera records)")
+    print(f"  + signs.bin   : {len(signs_data):,} bytes ({total_signs:,} signs records)")
+
+    if mode == 'vector':
         map_files = ["metadata.bin", "index.bin", "tiles.bin", "names.bin", "seg_names.bin"]
-        mode_desc = "BAN DO VECTOR TOI GIAN + TEN DUONG (Vector Only ~16MB, Chep the sieu nhanh)"
-    else: # full
+        mode_desc = "BAN DO VECTOR + TEN DUONG (Toi gian ~16.6MB, khong kem anh raster)"
+    elif mode == 'alerts':
+        map_files = []
+        mode_desc = "CHI DU LIEU CANH BAO GIAO THONG (Alerts only ~3MB)"
+    else:
         map_files = ["metadata.bin", "index.bin", "tiles.bin", "names.bin", "seg_names.bin", "maptiles.bin"]
         mode_desc = "BAN DO DAY DU (Full ~460MB, bao gom ca anh raster maptiles.bin)"
 
@@ -499,15 +523,280 @@ def export_viethud_package(clean_points, ref_map_dir, target_dirs, mode='vector'
                     if not os.path.exists(sounds_dst):
                         shutil.copytree(sounds_src, sounds_dst)
 
+            upgrade_speedmap_names_v2(dest_dir)
             print(f"  [OK] Dong bo thanh cong vao: {desc} -> {dest_dir}")
         except Exception as e:
             print(f"  [CANH BAO] Khong the ghi vao {desc}: {e}")
 
 # -----------------------------------------------------------------------------
+# QUY CHUẨN ĐỊNH DẠNG TÊN ĐƯỜNG NAMES.BIN & SEG_NAMES.BIN V2 (2026)
+# -----------------------------------------------------------------------------
+VNNM_MAGIC = b"VNNM"
+
+def upgrade_speedmap_names_v2(speedmap_dir):
+    """
+    Tự động kiểm tra và nâng cấp names.bin & seg_names.bin lên chuẩn V2:
+      - names.bin    : magic[4]="VNNM", version(u16)=2, count(u32), poolBytes(u32), reserved(u16)=0
+      - seg_names.bin: mảng uint32 (<I, 4 bytes mỗi segment), index = segId, giá trị = nameId
+    """
+    names_path = os.path.join(speedmap_dir, "names.bin")
+    seg_names_path = os.path.join(speedmap_dir, "seg_names.bin")
+    
+    # 1. Nâng cấp names.bin
+    if os.path.exists(names_path):
+        try:
+            with open(names_path, "rb") as f:
+                data = f.read()
+            if len(data) >= 16 and data[:4] == VNNM_MAGIC:
+                version = struct.unpack("<H", data[4:6])[0]
+                if version == 1:
+                    count_v1, pool_bytes, res32 = struct.unpack("<HII", data[6:16])
+                    v2_header = struct.pack("<4sHIIH", VNNM_MAGIC, 2, count_v1, pool_bytes, 0)
+                    with open(names_path, "wb") as f:
+                        f.write(v2_header + data[16:])
+                    print(f"  [V2 UPGRADE] Da nang cap names.bin sang V2 (u32 count={count_v1:,}): {names_path}")
+        except Exception as e:
+            print(f"  [CANH BAO] Khong the kiem tra names.bin: {e}")
+
+    # 2. Nâng cấp seg_names.bin
+    if os.path.exists(seg_names_path):
+        try:
+            with open(seg_names_path, "rb") as f:
+                data = f.read()
+            file_size = len(data)
+            # Nếu file_size chia hết cho 2 nhưng không phải định dạng V2 (u32)
+            # Kiểm tra nếu kích thước tương ứng với file u16
+            if file_size > 0:
+                is_u32 = False
+                if file_size % 4 == 0 and file_size >= 16:
+                    check_cnt = min(file_size // 4, 100)
+                    entries_u16 = struct.unpack(f"<{check_cnt * 2}H", data[:check_cnt * 4])
+                    odd_zeros = sum(1 for i in range(1, len(entries_u16), 2) if entries_u16[i] == 0)
+                    even_nonzeros = sum(1 for i in range(0, len(entries_u16), 2) if entries_u16[i] != 0)
+                    if odd_zeros >= (len(entries_u16) // 2) - 2 and (even_nonzeros > 0 or check_cnt < 5):
+                        is_u32 = True
+                if not is_u32:
+                    num_segs = file_size // 2
+                    u16_entries = struct.unpack(f"<{num_segs}H", data[:num_segs * 2])
+                    v2_data = struct.pack(f"<{num_segs}I", *u16_entries)
+                    bak_path = seg_names_path + ".v1.bak"
+                    if not os.path.exists(bak_path):
+                        with open(bak_path, "wb") as f:
+                            f.write(data)
+                    with open(seg_names_path, "wb") as f:
+                        f.write(v2_data)
+                    print(f"  [V2 UPGRADE] Da nang cap seg_names.bin sang V2 (u32 per segment, {num_segs:,} segs): {seg_names_path}")
+        except Exception as e:
+            print(f"  [CANH BAO] Khong the kiem tra seg_names.bin: {e}")
+
+# -----------------------------------------------------------------------------
+# CÔNG CỤ TÍNH SHA-256 VÀ ĐẨY LÊN GITHUB OTA
+# -----------------------------------------------------------------------------
+def calculate_sha256(filepath):
+    """Tính mã băm SHA-256 chuẩn của một file."""
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+def run_git_cmd(cmd_list, cwd):
+    """Thực thi lệnh git với kiểm tra lỗi."""
+    cmd_str = " ".join(cmd_list)
+    print(f"  [GIT] {cmd_str}")
+    res = subprocess.run(cmd_list, cwd=cwd, capture_output=True, text=True, encoding='utf-8', errors='replace')
+    if res.returncode != 0:
+        err_msg = res.stderr.strip() or res.stdout.strip()
+        print(f"  [GIT ERROR] {err_msg}")
+        return False, err_msg
+    return True, res.stdout.strip()
+
+def build_readme_content(version, files_info, update_url):
+    """Tạo nội dung README.md trực quan cho GitHub Repository."""
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "# 🚗 VietHUD - Dữ Liệu Giao Thông & Bản Đồ Ngoại Tuyến (Offline Traffic Data)",
+        "",
+        "> Kho lưu trữ chính thức đồng bộ dữ liệu giao thông, camera phạt nguội và biển báo cho thiết bị **VietHUD**.",
+        "",
+        f"**Phiên bản phát hành (Version):** `{version}`  ",
+        f"**Thời gian cập nhật:** `{now_str}`  ",
+        f"**Đường dẫn OTA tải về (VietHUD OTA URL):**  ",
+        f"```text\n{update_url}\n```",
+        "",
+        "---",
+        "",
+        "## 📦 Danh Sách Dữ Liệu Đồng Bộ (Core SpeedMap Files)",
+        "",
+        "| File | Kích thước | Mã băm SHA-256 | Mô tả |",
+        "| :--- | :--- | :--- | :--- |"
+    ]
+    
+    file_descs = {
+        "cameras.bin": "Dữ liệu vị trí camera phạt nguội & camera bắn tốc độ toàn quốc",
+        "signs.bin": "Dữ liệu biển báo giao thông (khu dân cư, cấm vượt, trạm thu phí, ...)",
+        "tiles.bin": "Mạng lưới đường bộ vector & giới hạn tốc độ chi tiết",
+        "index.bin": "Lưới chỉ mục không gian (Spatial Index) tra cứu nhanh",
+        "metadata.bin": "Thông số khung tọa độ & cấu hình bản đồ",
+        "names.bin": "Từ điển tên đường phố toàn quốc",
+        "seg_names.bin": "Ánh xạ định danh phân đoạn đường sang tên phố"
+    }
+
+    for item in files_info:
+        fname = item["name"]
+        sz_kb = item["size"] / 1024
+        sz_str = f"{sz_kb:,.1f} KB" if sz_kb < 1024 else f"{sz_kb/1024:,.2f} MB"
+        desc = file_descs.get(fname, "Dữ liệu bổ trợ")
+        lines.append(f"| `{fname}` | {sz_str} | `{item['sha'][:16]}...` | {desc} |")
+
+    lines.extend([
+        "",
+        "---",
+        "",
+        "## 🛠 Hướng Dẫn Cấu Hình Thiết Bị VietHUD Cập Nhật OTA",
+        "1. Trên thiết bị VietHUD, vào mục **Cài đặt (Settings) -> WiFi** (hoặc truy cập WebPortal tại `http://192.168.4.1` khi kết nối WiFi phát từ VietHUD).",
+        f"2. Tại ô **Data Update URL**, điền chính xác đường dẫn sau:",
+        f"   ```text\n   {update_url}\n   ```",
+        "3. Kết nối VietHUD vào Hotspot Wi-Fi của điện thoại.",
+        "4. Bấm **Kiểm tra cập nhật (Check Update)** trên WebPortal hoặc màn hình HUD. Thiết bị sẽ tự động tải các file thay đổi, ghi vào thẻ nhớ MicroSD và khởi động lại.",
+        ""
+    ])
+    return "\n".join(lines)
+
+def publish_to_github(speedmap_src, repo_url=DEFAULT_REPO_URL, branch=DEFAULT_BRANCH, dry_run=False):
+    """
+    Tự động tính mã băm SHA-256, sinh manifest.txt và đẩy lên GitHub.
+    """
+    print("\n" + "="*80)
+    print("        TIEN TRINH TU DONG DAY DU LIEU LEN GITHUB OTA")
+    print("="*80)
+    print(f"  * Thu muc speedmap nguon : {speedmap_src}")
+    print(f"  * GitHub Repository     : {repo_url}")
+    print(f"  * Nhanh (Branch)        : {branch}")
+    print("-" * 80)
+
+    if not speedmap_src or not os.path.exists(speedmap_src):
+        print(f"[LOI] Thu muc speedmap '{speedmap_src}' khong ton tai!")
+        return False
+
+    # 0. Nâng cấp names.bin & seg_names.bin lên chuẩn V2 nếu cần
+    upgrade_speedmap_names_v2(speedmap_src)
+
+    # 1. Quét và tính SHA-256
+    now = datetime.datetime.now()
+    version_str = now.strftime("%Y.%m.%d.%H%M")
+    files_info = []
+
+    print("\n[1/4] Dang tinh toan ma bam SHA-256 cac file vector...")
+    for fname in CORE_VECTOR_FILES:
+        fpath = os.path.join(speedmap_src, fname)
+        if not os.path.exists(fpath):
+            print(f"  [CANH BAO] File {fname} khong ton tai!")
+            continue
+        sz = os.path.getsize(fpath)
+        sha = calculate_sha256(fpath)
+        files_info.append({
+            "name": fname,
+            "size": sz,
+            "sha": sha
+        })
+        sz_kb = sz / 1024
+        sz_str = f"{sz_kb:,.1f} KB" if sz_kb < 1024 else f"{sz_kb/1024:,.2f} MB"
+        print(f"  + {fname:<15} : {sz_str:>10} | SHA: {sha[:16]}...")
+
+    if not files_info:
+        print("[LOI] Khong tim thay file vector hop le de dong goi manifest!")
+        return False
+
+    # 2. Sinh manifest.txt
+    manifest_lines = [f"version {version_str}"]
+    for item in files_info:
+        manifest_lines.append(f"{item['name']} {item['size']} {item['sha']}")
+    manifest_content = "\n".join(manifest_lines) + "\n"
+
+    src_manifest = os.path.join(speedmap_src, "manifest.txt")
+    with open(src_manifest, "w", encoding="utf-8") as f:
+        f.write(manifest_content)
+    print(f"\n[2/4] Da sinh file manifest.txt: {src_manifest}")
+
+    # 3. Chuẩn bị Git Staging
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    git_stage_dir = os.path.join(script_dir, "VietHUD_Git_Staging")
+    os.makedirs(git_stage_dir, exist_ok=True)
+    git_speedmap_dir = os.path.join(git_stage_dir, "speedmap")
+    os.makedirs(git_speedmap_dir, exist_ok=True)
+
+    print(f"\n[3/4] Dang sao chep du lieu vao thu muc Git Staging...")
+    for item in files_info:
+        shutil.copy2(os.path.join(speedmap_src, item["name"]), os.path.join(git_speedmap_dir, item["name"]))
+    shutil.copy2(src_manifest, os.path.join(git_speedmap_dir, "manifest.txt"))
+
+    # Sao chép thư viện âm thanh nếu có
+    sounds_src = os.path.join(speedmap_src, "sounds")
+    sounds_dst = os.path.join(git_speedmap_dir, "sounds")
+    if os.path.exists(sounds_src):
+        if os.path.exists(sounds_dst):
+            shutil.rmtree(sounds_dst)
+        shutil.copytree(sounds_src, sounds_dst)
+        print("  + Da sao chep thu vien am thanh (sounds/)")
+
+    update_url = f"https://raw.githubusercontent.com/911273/VietHUD/{branch}/speedmap/"
+    readme_content = build_readme_content(version_str, files_info, update_url)
+    with open(os.path.join(git_stage_dir, "README.md"), "w", encoding="utf-8") as f:
+        f.write(readme_content)
+
+    if dry_run:
+        print("\n[CHẾ ĐỘ DRY-RUN] Đã kiểm tra thành công, bỏ qua bước push Git.")
+        return True
+
+    # 4. Thực thi Git Push
+    print(f"\n[4/4] Dang day (Push) du lieu len GitHub: {repo_url}...")
+    git_dir = os.path.join(git_stage_dir, ".git")
+    if not os.path.exists(git_dir):
+        run_git_cmd(["git", "init"], git_stage_dir)
+        run_git_cmd(["git", "remote", "add", "origin", repo_url], git_stage_dir)
+        run_git_cmd(["git", "branch", "-M", branch], git_stage_dir)
+    else:
+        run_git_cmd(["git", "remote", "set-url", "origin", repo_url], git_stage_dir)
+
+    run_git_cmd(["git", "add", "."], git_stage_dir)
+    status_ok, status_out = run_git_cmd(["git", "status", "--porcelain"], git_stage_dir)
+    if not status_out.strip():
+        print("  [THONG BAO] Du lieu tren GitHub da o trang thai moi nhat, khong co thay doi!")
+    else:
+        commit_msg = f"VietHUD Data Update v{version_str}"
+        run_git_cmd(["git", "commit", "-m", commit_msg], git_stage_dir)
+        push_ok, push_err = run_git_cmd(["git", "push", "-u", "origin", branch], git_stage_dir)
+        if not push_ok:
+            print("  [THU LAI] Dang thu fetch va push lai...")
+            run_git_cmd(["git", "pull", "--rebase", "origin", branch], git_stage_dir)
+            push_ok, push_err = run_git_cmd(["git", "push", "-u", "origin", branch], git_stage_dir)
+            if not push_ok:
+                print(f"\n[LOI PUSH GIT] Khong the day len GitHub: {push_err}")
+                print("Vui long xac nhan dang nhap Git Credential Manager hoac kiem tra mang.")
+                return False
+
+    print("\n" + "=" * 80)
+    print(" 🎉 CHUC MUNG! DU LIEU VIETHUD DA DUOC DAY LEN GITHUB THANH CONG!")
+    print("=" * 80)
+    print(f"  * Phien ban moi       : {version_str}")
+    print(f"  * GitHub Web View     : https://github.com/911273/VietHUD")
+    print(f"  * URL cau hinh OTA cho VietHUD:")
+    print(f"    --> {update_url}")
+    print("=" * 80)
+    print("\n[HUONG DAN CAP NHAT TREN THIET BI VIETHUD]:")
+    print(f"1. Mo trinh duyet tren dien thoai vao WebPortal VietHUD.")
+    print(f"2. Tai muc 'Data Update URL', dan duong dan tren:")
+    print(f"   {update_url}")
+    print(f"3. Nhan 'Luu' va 'Kiem tra cap nhat'. Thiet bi se tu dong tai toan bo du lieu!")
+    print("=" * 80)
+    return True
+
+# -----------------------------------------------------------------------------
 # HÀM CHÍNH (MAIN)
 # -----------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="VietHUD Master Data Builder & SD-Card Sync Tool")
+    parser = argparse.ArgumentParser(description="VietHUD All-in-One Master Data Builder & GitHub OTA Tool")
     parser.add_argument('--input', '-i', default=None, help="Thu muc goc chua du lieu moi")
     parser.add_argument('--sd-drive', '-s', default=None, help="Ky tu o dia the nho (vi du: E hoac E:\\)")
     parser.add_argument('--ref-map', '-r', default=None, help="Thu muc chua ban do goc va am thanh")
@@ -517,25 +806,19 @@ def main():
                         help="Chi xuat ban do vector va canh bao, khong kem anh raster (maptiles.bin)")
     parser.add_argument('--full', action='store_true',
                         help="Xuat day du bao gom ca anh raster (maptiles.bin)")
+    parser.add_argument('--github', '-g', action='store_true',
+                        help="Tu dong day du lieu len GitHub sau khi dong goi")
+    parser.add_argument('--github-only', action='store_true',
+                        help="Chi day du lieu san co trong VietHUD_SDCard_Ready len GitHub (khong convert lai)")
+    parser.add_argument('--repo', default=DEFAULT_REPO_URL, help=f"URL GitHub Repository (Mac dinh: {DEFAULT_REPO_URL})")
+    parser.add_argument('--branch', default=DEFAULT_BRANCH, help=f"Nhanh git (Mac dinh: {DEFAULT_BRANCH})")
+    parser.add_argument('--dry-run', action='store_true', help="Kiem tra thu khong thuc su push git")
+    
     args = parser.parse_args()
 
-    # Xác định chế độ xuất: mặc định là vector tối giản (~16MB)
-    if args.full:
-        mode = 'full'
-    elif args.no_raster:
-        mode = 'vector'
-    elif args.mode:
-        mode = args.mode
-    else:
-        mode = 'vector'
-
-    print("="*80)
-    print("      VIETHUD MASTER DATA BUILDER & SD-CARD SYNC TOOL (2026)")
-    print(f"      Che do: {'BAN DO VECTOR + TEN DUONG (Khong anh raster)' if mode == 'vector' else ('BAN DO DAY DU (FULL)' if mode == 'full' else 'CHI CANH BAO GIAO THONG')}")
-    print("="*80)
-
-    # Xác định thư mục input: ưu tiên thư mục chứa script hoặc Data
     script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Xác định thư mục input
     input_dir = args.input
     if not input_dir:
         candidates = [
@@ -549,6 +832,74 @@ def main():
                 break
     if not input_dir or not os.path.exists(input_dir):
         input_dir = script_dir
+
+    ready_pkg = os.path.join(input_dir, "VietHUD_SDCard_Ready", "speedmap")
+
+    # XỬ LÝ TRƯỜNG HỢP: --github-only
+    if args.github_only:
+        publish_to_github(ready_pkg, repo_url=args.repo, branch=args.branch, dry_run=args.dry_run)
+        return
+
+    # NẾU KHÔNG CÓ THAM SỐ GÌ TRUYỀN VÀO -> HIỆN MENU TƯƠNG TÁC
+    auto_push_git = args.github
+    if len(sys.argv) == 1:
+        print("=" * 80)
+        print("       VIETHUD ALL-IN-ONE MASTER TOOL: CONVERT DATA & GITHUB OTA")
+        print("=" * 80)
+        print("  Vui long chon thao tac ban muon thuc hien:")
+        print()
+        print("   [1] DONG GOI BAN DO VECTOR (~16.6MB, Khuyen dung - Chep the nho)")
+        print("       + Canh bao camera, bien bao, tuyen duong vector & am thanh")
+        print("       - Khong kem file anh raster nang 448MB")
+        print()
+        print("   [2] DONG GOI BAN DO DAY DU (FULL - ~460MB)")
+        print("       + Bao gom toan bo muc [1] va them anh raster maptiles.bin")
+        print()
+        print("   [3] ALL-IN-ONE: CONVERT DU LIEU + TU DONG DAY LEN GITHUB OTA (Khuyen dung)")
+        print("       + Tu dong doc CSV/OSM, dong goi vector va push thang len GitHub")
+        print("       + Cung cap URL de thiet bi VietHUD tu dong tai ve qua Wi-Fi")
+        print()
+        print("   [4] CHI DAY DU LIEU SAN CO LEN GITHUB OTA (Khong convert lai)")
+        print("       + Tinh SHA-256 tren 'VietHUD_SDCard_Ready/speedmap' va day len GitHub")
+        print()
+        print("   [5] CHI DU LIEU CANH BAO GIAO THONG (Alerts Only - ~3MB)")
+        print("   [0] Thoat")
+        print("=" * 80)
+
+        choice = input("Nhap lua chon cua ban [1/2/3/4/5/0] (Nhan Enter mac dinh la 3): ").strip()
+        if choice == '0':
+            print("Tam biet!")
+            return
+        elif choice == '1':
+            mode = 'vector'
+            auto_push_git = False
+        elif choice == '2':
+            mode = 'full'
+            auto_push_git = False
+        elif choice == '4':
+            publish_to_github(ready_pkg, repo_url=args.repo, branch=args.branch, dry_run=args.dry_run)
+            return
+        elif choice == '5':
+            mode = 'alerts'
+            auto_push_git = False
+        else: # Mặc định là 3 (All-in-one)
+            mode = 'vector'
+            auto_push_git = True
+    else:
+        # Xác định chế độ xuất từ tham số CLI
+        if args.full:
+            mode = 'full'
+        elif args.no_raster:
+            mode = 'vector'
+        elif args.mode:
+            mode = args.mode
+        else:
+            mode = 'vector'
+
+    print("\n" + "="*80)
+    print("      VIETHUD MASTER DATA BUILDER & SD-CARD SYNC TOOL (2026)")
+    print(f"      Che do: {'BAN DO VECTOR + TEN DUONG (Khong anh raster)' if mode == 'vector' else ('BAN DO DAY DU (FULL)' if mode == 'full' else 'CHI CANH BAO GIAO THONG')}")
+    print("="*80)
 
     # Xác định thư mục bản đồ gốc
     ref_map_dir = args.ref_map
@@ -572,30 +923,29 @@ def main():
     datasets = []
 
     # Nguồn 1: Tìm tất cả file CSV VietMap (bỏ qua các thư mục output)
-    ignored_dir_names = {'output_viethud', 'vietmap_output', 'viethud_output', 'viethud_sdcard_ready', 'speedmap'}
+    ignored_dir_names = {'output_viethud', 'vietmap_output', 'viethud_output', 'viethud_sdcard_ready', 'speedmap', 'viethud_git_staging'}
     csv_candidates = []
     for root, dirs, files in os.walk(input_dir):
         dirs[:] = [d for d in dirs if d.lower() not in ignored_dir_names]
         for f in files:
             f_lower = f.lower()
-            if f_lower.endswith('.csv'):
-                if 'edog' in f_lower or ('vietmap' in f_lower and 'combined' not in f_lower and 'traffic' not in f_lower):
-                    csv_candidates.append(os.path.join(root, f))
-                    
-    if csv_candidates:
-        csv_candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-        latest_csv = csv_candidates[0]
-        vm_pts = load_vietmap_csv(latest_csv)
-        if vm_pts:
-            datasets.append(vm_pts)
-            print(f"  [1] Tim thay VietMap CSV (moi nhat): {latest_csv} ({len(vm_pts):,} diem)")
+            if f_lower.endswith('.csv') and 'combined' not in f_lower:
+                csv_candidates.append(os.path.join(root, f))
 
-    # Nguồn 2: Tìm file Papago SPC (nếu có)
+    if csv_candidates:
+        csv_candidates.sort(key=lambda x: os.path.getsize(x), reverse=True)
+        for csv_f in csv_candidates:
+            pts = load_vietmap_csv(csv_f)
+            if pts:
+                datasets.append(pts)
+                print(f"  [1] Tim thay CSV VietMap: {os.path.basename(csv_f)} ({len(pts):,} diem)")
+
+    # Nguồn 2: Dữ liệu GoSafe Papago SPC
     spc_candidates = []
     for root, dirs, files in os.walk(input_dir):
         dirs[:] = [d for d in dirs if d.lower() not in ignored_dir_names]
         for f in files:
-            if f.lower().endswith('.bin') and ('spc' in f.lower() or 'papago' in f.lower()):
+            if f.lower().endswith('.spc'):
                 spc_candidates.append(os.path.join(root, f))
     if spc_candidates:
         spc_candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
@@ -630,16 +980,11 @@ def main():
 
     # 3. Xác định các mục tiêu xuất dữ liệu
     target_dirs = []
-    
-    # Mục tiêu 1: Thư mục gói xuất hoàn chỉnh sẵn sàng copy
-    ready_pkg = os.path.join(input_dir, "VietHUD_SDCard_Ready", "speedmap")
     target_dirs.append(("Goi hoan chinh copy ngay (VietHUD_SDCard_Ready)", ready_pkg))
 
-    # Mục tiêu 2: Firmware project data (nếu có folder radar_car)
     if os.path.exists(ref_map_dir):
         target_dirs.append(("Thu muc du lieu firmware VietHUD", ref_map_dir))
 
-    # Mục tiêu 3: Tự động ghi vào thẻ nhớ MicroSD thật nếu có cắm vào máy
     removable = [args.sd_drive] if args.sd_drive else find_removable_drives()
     if removable:
         for drive in removable:
@@ -652,58 +997,7 @@ def main():
     # 4. Đóng gói và ghi ra các đích
     export_viethud_package(clean_points, ref_map_dir, target_dirs, mode=mode)
 
-    # 5. Tạo file hướng dẫn sử dụng trong gói xuất
-    user_guide_path = os.path.join(os.path.dirname(ready_pkg), "HUONG_DAN_SU_DUNG.txt")
-    try:
-        with open(user_guide_path, "w", encoding="utf-8") as f:
-            f.write(f"""================================================================================
-          HƯỚNG DẪN CẬP NHẬT DỮ LIỆU BẢN ĐỒ & CẢNH BÁO VIETHUD
-================================================================================
-
-1. CÁC TÙY CHỌN CHẾ ĐỘ XUẤT CỦA CÔNG CỤ:
-   - [Chế độ 1] BẢN ĐỒ VECTOR TỐI GIẢN (KHUYÊN DÙNG - Chi ~16MB):
-     + Đầy đủ Cảnh báo tốc độ, Camera phạt nguội, Biển báo giao thông toàn quốc
-     + Đầy đủ Tuyến đường Vector (tiles.bin) và Từ điển tên đường phố (names.bin)
-     + Đầy đủ Thư viện âm thanh giọng nói cảnh báo (sounds/)
-     + KHÔNG kèm file ảnh raster maptiles.bin (448MB)
-     -> Ưu điểm: Dung lượng cực nhẹ (~16MB), chép thẻ chỉ mất 1-2 giây, HUD vẽ vector mượt mà!
-
-   - [Chế độ 2] BẢN ĐỒ ĐẦY ĐỦ (FULL - ~460MB):
-     + Bao gồm toàn bộ mục [1] VÀ kèm thêm file ảnh nền raster vệ tinh (maptiles.bin).
-
-   - [Chế độ 3] CHỈ DỮ LIỆU CẢNH BÁO (ALERTS ONLY - ~3MB):
-     + Chỉ gồm cameras.bin, signs.bin và âm thanh cảnh báo.
-
-2. CÁCH CẬP NHẬT TỰ ĐỘNG VÀO THẺ NHỚ:
-   - Cắm thẻ nhớ MicroSD của VietHUD vào máy tính.
-   - Nhấp đúp vào:
-     * "VIETHUD_UPDATE_TOOL.bat"        : Hiện menu lựa chọn chế độ [1/2/3]
-     * "VIETHUD_UPDATE_VECTOR_ONLY.bat" : 1-Click cập nhật ngay chế độ Vector (~16MB)
-     * "VIETHUD_UPDATE_FULL.bat"        : 1-Click cập nhật chế độ đầy đủ (~460MB)
-
-3. CÁCH COPY THỦ CÔNG:
-   - Mở thư mục này: "VietHUD_SDCard_Ready"
-   - Copy toàn bộ thư mục con mang tên "speedmap"
-   - Dán (Paste) đè trực tiếp vào thư mục gốc của Thẻ nhớ MicroSD.
-
-4. DANH SÁCH CÁC FILE CHUẨN TRONG THƯ MỤC 'speedmap' (Chế độ hiện tại: {mode.upper()}):
-   + cameras.bin               : Dữ liệu nhị phân 60,000+ camera giao thông, phạt nguội
-   + signs.bin                 : Dữ liệu nhị phân 93,000+ biển báo toàn quốc (VNSG V1)
-   + metadata.bin              : Khung tọa độ và metadata bản đồ vector
-   + index.bin                 : Lưới chỉ mục không gian đường chạy
-   + tiles.bin                 : 3,437 ô bản đồ vector chi tiết
-   + names.bin                 : Từ điển tên đường phố
-   + seg_names.bin             : Ánh xạ đoạn đường với tên phố
-   + sounds/                   : Toàn bộ thư viện âm thanh cảnh báo giọng nói (MP3)
-   + combined_traffic_alerts.csv: Danh sách toàn bộ tọa độ cảnh báo đã làm sạch (để tra cứu)
-   {"* maptiles.bin              : Bản đồ nền raster định dạng VietHUD (Chi co o che do FULL)" if mode == 'full' else "- maptiles.bin              : Khong su dung trong che do Vector (tiet kiem 448MB)"}
-
-================================================================================
-""")
-    except Exception:
-        pass
-
-    # 6. Thống kê
+    # 5. Thống kê
     types = Counter(p['type'] for p in clean_points)
     total_cams = sum(1 for p in clean_points if p['is_camera'])
 
@@ -715,15 +1009,12 @@ def main():
     print(f"\n  ==> TONG SO CAMERA CANH BAO: {total_cams:,} camera")
     print(f"  ==> TONG SO BIEN BAO TOAN QUOC: {len(clean_points):,} bien bao")
     print("="*80)
-    print(f"HOAN TAT! Thu muc chuan da duoc dong goi 100% tai:")
+    print(f"HOAN TAT CONVERT! Thu muc chuan da duoc dong goi 100% tai:")
     print(f"  -> {ready_pkg}")
-    print("\n[HUONG DAN SU DUNG CHO NGUOI DUNG]:")
-    print("  * Cach 1 (Tu dong): Cam the nho vao may tinh roi nhap dup vao:")
-    print("             'VIETHUD_UPDATE_VECTOR_ONLY.bat' hoac 'VIETHUD_UPDATE_TOOL.bat'")
-    print("  * Cach 2 (Thu cong): Copy toan bo thu muc 'speedmap' trong thu muc:")
-    print(f"             '{ready_pkg}'")
-    print("             dan truc tiep vao thu muc goc cua The nho MicroSD la xong!")
-    print("="*80)
+
+    # 6. Tự động đẩy lên GitHub nếu được yêu cầu
+    if auto_push_git:
+        publish_to_github(ready_pkg, repo_url=args.repo, branch=args.branch, dry_run=args.dry_run)
 
 if __name__ == '__main__':
     main()
