@@ -2,6 +2,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+volatile float g_boardTempC = 0; // published by ui/Dashboard.cpp, read by net/WebPortal.cpp
+
 static SemaphoreHandle_t stateMutex;
 static GnssSnapshot gnssState;
 static RoadInfoSnapshot roadInfoState;

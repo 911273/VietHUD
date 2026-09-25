@@ -68,18 +68,35 @@
     // this board (see the same [mem] line's freeInternal, which this pool
     // does NOT count against separately � it just eats into it once at
     // lv_init()).
-    #define LV_MEM_SIZE (96 * 1024U)          /*[bytes]*/
+    // 2026-09-25 ROOT-CAUSE FIX for the "crash rất nhiều khi di chuyển" reports:
+    // the LVGL pool was being EXHAUSTED while drawing the vector map in dense
+    // areas. Every road segment in view is one lv_draw_line task, and these all
+    // live in this pool simultaneously until lv_canvas_finish_layer() dispatches
+    // them (updateMapCanvas() in ui/Dashboard.cpp, up to kMaxLines=180 lines +
+    // markers + trail per frame). On a real Hanoi drive the pool peaked at
+    // 72.8KB of an 80KB pool and then lv_malloc() returned NULL; lv_draw_add_task
+    // wrote through that NULL -> "Guru Meditation Error: StoreProhibited" on the
+    // UI task (Core 1), decoded to lv_draw_line <- refreshDashboard. The old
+    // sizing (128->96->80KB) was based on a DEMO-mode peak of ~58KB, which never
+    // exercised a dense real vector map.
+    //
+    // Fix: move the whole pool to PSRAM (3MB free) via LV_MEM_POOL_ALLOC and make
+    // it large. LVGL keeps its own proven TLSF allocator — only the backing store
+    // moves. Only tiny, transient draw-task DESCRIPTORS live here; the pixel draw
+    // buffers (lv_display_set_buffers in main) stay in internal RAM for speed, and
+    // canvas pixels render into the canvas's own buffer, so per-pixel work is
+    // unaffected. Bonus: this hands ~80KB of scarce INTERNAL RAM back to the rest
+    // of the system (WiFi/TLS/tasks). Peak usage is logged in main's [mem] line.
+    #define LV_MEM_SIZE (512 * 1024U)         /*[bytes] — now in PSRAM, so generous*/
 
     /*Size of the memory expand for `lv_malloc()` in bytes*/
     #define LV_MEM_POOL_EXPAND_SIZE 0
 
     /*Set an address for the memory pool instead of allocating it as a normal array. Can be in external SRAM too.*/
     #define LV_MEM_ADR 0     /*0: unused*/
-    /*Instead of an address give a memory allocator that will be called to get a memory pool for LVGL. E.g. my_malloc*/
-    #if LV_MEM_ADR == 0
-        #undef LV_MEM_POOL_INCLUDE
-        #undef LV_MEM_POOL_ALLOC
-    #endif
+    /*Instead of an address give a memory allocator that will be called to get a memory pool for LVGL. Here: allocate the pool from PSRAM (see the big comment above).*/
+    #define LV_MEM_POOL_INCLUDE <esp_heap_caps.h>
+    #define LV_MEM_POOL_ALLOC(size) heap_caps_malloc((size), MALLOC_CAP_SPIRAM)
 #endif  /*LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN*/
 
 /*====================
@@ -502,7 +519,7 @@
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 0
 #define LV_FONT_MONTSERRAT_18 0
-#define LV_FONT_MONTSERRAT_20 0
+#define LV_FONT_MONTSERRAT_20 1 // enabled 2026-09-25 for the bigger compass/heading letter (Dashboard.cpp)
 #define LV_FONT_MONTSERRAT_22 0
 #define LV_FONT_MONTSERRAT_24 1
 #define LV_FONT_MONTSERRAT_26 0

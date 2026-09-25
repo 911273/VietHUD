@@ -1349,5 +1349,23 @@ static void speedLimitTaskFn(void *) {
 // top of the SD_MMC File I/O this task already does. The old 4096 stack (only
 // ~920 B free even before this) overflowed and the FreeRTOS stack canary
 // panicked ("Stack canary watchpoint triggered (speedLimitTask)") in a boot
-// loop. 8192 restores a healthy margin.
-void speedLimitManagerStart() { xTaskCreatePinnedToCore(speedLimitTaskFn, "speedLimitTask", 8192, NULL, 1, NULL, 0); }
+// loop. 8192 restored a healthy margin FOR THE BENCH/DEMO load (synthetic road,
+// ~24 vector lines).
+//
+// Bumped 8192 -> 16384 on 2026-09-25 after the user reported frequent crashes
+// WHILE DRIVING in Hanoi (never on the bench). This task also runs the whole
+// live map render — mapRendererUpdate() draws every vector road segment, street
+// name and marker in view straight into the canvas from here, and a dense city
+// tile holds far more segments than the demo's 24, so real-world call depth +
+// LVGL draw scratch is much larger than anything measured at the desk. Stack
+// high-water is now logged in main's [mem] block (speedLimitTaskStackFreeBytes)
+// so the true in-city margin is finally visible; 16384 matches the loopTask
+// stack, which does comparable UI work, and internal RAM has room (~87 KB free).
+static TaskHandle_t sSpeedLimitTaskHandle = NULL;
+void speedLimitManagerStart() {
+    xTaskCreatePinnedToCore(speedLimitTaskFn, "speedLimitTask", 16384, NULL, 1, &sSpeedLimitTaskHandle, 0);
+}
+size_t speedLimitTaskStackFreeBytes() {
+    if (!sSpeedLimitTaskHandle) return 0;
+    return uxTaskGetStackHighWaterMark(sSpeedLimitTaskHandle) * sizeof(StackType_t);
+}

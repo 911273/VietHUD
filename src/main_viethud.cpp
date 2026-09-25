@@ -33,6 +33,7 @@
 
 #include <Arduino.h>
 #include <lvgl.h>
+#include <WiFi.h> // update-mode STA connect (runDataUpdateMode) — see net/DataUpdater.h
 #include <esp_heap_caps.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
@@ -49,6 +50,7 @@
 #include "map/SdCardManager.h"
 #include "log/TripLogger.h"
 #include "net/WebPortal.h"
+#include "net/DataUpdater.h" // dataUpdateStart()/GetStatus() — serial 'u' bench trigger
 #include "touch/TouchTask.h"
 #include "ui/Dashboard.h"
 #include "ui/Settings.h"
@@ -173,6 +175,138 @@ static void showBootSplash() {
 }
 
 // ---------------------------------------------------------------------
+// "Update mode": entered at boot when the user pressed "Update data" (web or
+// on-screen), which set an NVS flag and rebooted. We land here with ONLY the
+// display + LVGL + SD up — none of the map/audio/GNSS/AP tasks have started —
+// so a big block of internal RAM is free for the TLS handshake that the normal
+// running app can't spare (the "cannot fetch manifest" failure: TLS needs
+// ~16 KB contiguous, the live app leaves ~10 KB). We bring up WiFi station,
+// run the download to completion on its own task while pumping a small progress
+// screen, then reboot back into normal mode. This function never returns.
+static void runDataUpdateMode() {
+    Serial.println("[update-mode] entered — display+SD only, connecting WiFi for OTA");
+
+    // Minimal progress screen (LVGL is already initialised before this is called).
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A1526), 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, "CAP NHAT DU LIEU");
+    lv_obj_set_style_text_color(title, lv_color_hex(0x4FC3F7), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_t *msg = lv_label_create(scr);
+    lv_obj_set_width(msg, gfx->width() - 48);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(msg, lv_color_hex(0xE0E6ED), 0);
+    lv_label_set_text(msg, "Dang ket noi WiFi...");
+    lv_obj_align(msg, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_t *hint = lv_label_create(scr);
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x7A8896), 0);
+    lv_label_set_text(hint, "Khong tat nguon trong khi cap nhat");
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -22);
+    lv_screen_load(scr);
+
+    uint32_t lt = millis();
+    auto pump = [&]() {
+        uint32_t n = millis();
+        lv_tick_inc(n - lt); lt = n;
+        lv_timer_handler();
+        esp_task_wdt_reset();
+        delay(10);
+    };
+    for (int i = 0; i < 12; i++) pump();
+
+    if (cfg.staSsid[0] == '\0') {
+        Serial.println("[update-mode] no STA SSID configured — aborting");
+        lv_label_set_text(msg, "Chua cai mang WiFi.\nVao Settings > WiFi de dat.");
+        for (int i = 0; i < 350; i++) pump();
+        ESP.restart();
+    }
+
+    Serial.printf("[update-mode] connecting to \"%s\"\n", cfg.staSsid);
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false); // keep the radio hot while we wait for the AP to appear
+    WiFi.begin(cfg.staSsid, cfg.staPassword);
+    // iOS Personal Hotspot in particular parks its radio when no client is
+    // attached, so the first association attempt can miss even when the phone is
+    // "on". Wait up to 45s and re-issue begin() a couple of times to catch the
+    // AP the moment it wakes; log the raw status code each second to diagnose.
+    const uint32_t kConnectMs = 45000;
+    uint32_t t0 = millis();
+    uint32_t lastRebegin = t0;
+    int lastStatus = -99;
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < kConnectMs) {
+        int st = WiFi.status();
+        if (st != lastStatus) {
+            Serial.printf("[update-mode] wifi status=%d (%lus)\n", st,
+                          (unsigned long)((millis() - t0) / 1000));
+            lastStatus = st;
+        }
+        if (millis() - lastRebegin > 12000) { // nudge: re-begin if still not up
+            Serial.println("[update-mode] re-issuing WiFi.begin()");
+            WiFi.disconnect();
+            WiFi.begin(cfg.staSsid, cfg.staPassword);
+            lastRebegin = millis();
+        }
+        char b[80];
+        snprintf(b, sizeof(b), "Dang ket noi WiFi...\n%s (%lus)", cfg.staSsid,
+                 (unsigned long)((millis() - t0) / 1000));
+        lv_label_set_text(msg, b);
+        pump();
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.printf("[update-mode] WiFi connect FAILED (last status=%d)\n", WiFi.status());
+        lv_label_set_text(msg,
+            "Khong ket noi duoc WiFi.\nBat hotspot 2.4GHz (mo man hinh\nPersonal Hotspot) roi thu lai.");
+        for (int i = 0; i < 500; i++) pump();
+        ESP.restart();
+    }
+
+    // NTP — GitHub's TLS is happy without cert-time checks (setInsecure), but a
+    // sane clock never hurts and matches the running app's behaviour.
+    configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
+    Serial.printf("[update-mode] STA up: %s  free internal=%u biggest=%u\n",
+                  WiFi.localIP().toString().c_str(),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    lv_label_set_text(msg, "Da ket noi. Dang tai du lieu...");
+    for (int i = 0; i < 10; i++) pump();
+
+    if (!dataUpdateStart()) {
+        DataUpdateStatus st = dataUpdateGetStatus();
+        Serial.printf("[update-mode] dataUpdateStart failed: %s\n", st.message);
+        char b[96];
+        snprintf(b, sizeof(b), "Loi: %s", st.message);
+        lv_label_set_text(msg, b);
+        for (int i = 0; i < 450; i++) pump();
+        ESP.restart();
+    }
+
+    // Poll the updater task and mirror progress to the screen. On success the
+    // task reboots the device itself (to reload the new data cleanly); if it
+    // finishes without a reboot (no changes) or fails, we reboot from here.
+    for (;;) {
+        DataUpdateStatus st = dataUpdateGetStatus();
+        char b[112];
+        if (st.state == DU_RUNNING && st.filesTotal > 0) {
+            snprintf(b, sizeof(b), "%s\nFile %d/%d  (%d%%)",
+                     st.message, st.filesDone, st.filesTotal, st.percent);
+        } else {
+            snprintf(b, sizeof(b), "%s", st.message);
+        }
+        lv_label_set_text(msg, b);
+        pump();
+        if (st.state == DU_SUCCESS || st.state == DU_FAILED) {
+            Serial.printf("[update-mode] terminal state=%d: %s\n", st.state, st.message);
+            for (int i = 0; i < 300; i++) pump();  // ~3s to read the result
+            ESP.restart();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
     delay(200);
@@ -199,16 +333,24 @@ void setup() {
     displayBegin();
     touchTaskStart();
     audioInit();
-    audioPlayBeep(1);
+    // Startup music: the power-on jingle (pure tones, always works) plays now,
+    // over the ~2s boot splash. The spoken welcome greeting is deferred until
+    // AFTER the splash finishes (queued below, right after showBootSplash()).
+    audioPlayStartupJingle();
 
     lv_init();
     lvDisplay = lv_display_create(gfx->width(), gfx->height());
     lv_display_set_flush_cb(lvDisplay, dispFlushCb);
 
     // LVGL renders every pixel into these buffers, so they belong in internal
-    // SRAM — PSRAM is several times slower per access and it showed. 20 rows
-    // each keeps both buffers at ~38 KB total, which internal RAM can spare.
-    size_t bufBytes = (size_t)gfx->width() * 20 * sizeof(lv_color_t);
+    // SRAM — PSRAM is several times slower per access and it showed (and the
+    // fast dispFlushCb blit reads them strided, which is only cheap on internal
+    // SRAM). 8 rows each = ~15 KB total (reduced from 20 rows/38 KB on
+    // 2026-09-25 to free internal RAM for the WiFi driver — esp_wifi_init
+    // failed with ESP_ERR_NO_MEM at the old size, and WiFi-on free internal was
+    // still down to ~10 KB after a first trim). LVGL partial mode works with any
+    // buffer height; smaller just means more flush_cb strips per frame.
+    size_t bufBytes = (size_t)gfx->width() * 8 * sizeof(lv_color_t);
     lv_color_t *drawBuf1 = (lv_color_t *)heap_caps_malloc(bufBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     lv_color_t *drawBuf2 = (lv_color_t *)heap_caps_malloc(bufBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!drawBuf1 || !drawBuf2) {
@@ -230,9 +372,22 @@ void setup() {
     lv_indev_set_long_press_time(lvTouchIndev, HOLD_PRESS_MS);      // hold 1s anywhere on the dashboard = Settings
 
     sdMgrMount();
+
+    // If the last shutdown was a "press Update data → reboot", handle the whole
+    // download here, before any RAM-hungry task starts, then reboot back to
+    // normal. dataUpdatePending() reads AND clears the flag, so a failed run
+    // can't wedge us in a boot loop. This never returns when it fires.
+    if (dataUpdatePending()) {
+        runDataUpdateMode();
+    }
+
     buildDashboard();
     buildSettingsScreen();
-    showBootSplash(); // ~2s animated VRE logo, then cross-fades to the Dashboard
+    showBootSplash(); // ~2s animated VRE logo, then cross-fades to the Dashboard (blocking)
+    // Welcome greeting AFTER the splash has finished (user-requested 2026-09-25):
+    // the spoken "chào mừng" now plays once the dashboard is on screen, not over
+    // the logo animation. SD is already mounted above, so the clip is available.
+    audioQueueVoice("welcome/voice.mp3");
 
     sharedStateInit();
     gnssTaskStart();  // Core 0 — real GNSS M10N on UART2
@@ -281,6 +436,24 @@ void loop() {
             bool now2 = !demoModeIsEnabled();
             demoModeSetEnabled(now2);
             Serial.printf("[debug] demo mode toggled via serial -> %s\n", now2 ? "ON" : "OFF");
+        } else if (c == 'a') {
+            audioSelfTest(); // play every chime + voice clip once, for speaker bench verification
+        } else if (c == 'w') {
+            bool on = !webPortalIsEnabled();
+            webPortalRequestEnable(on); // bench: toggle WiFi/web without the touchscreen hold gesture
+            Serial.printf("[debug] WiFi toggled via serial -> %s\n", on ? "ON" : "OFF");
+        } else if (c == 's') {
+            webPortalRequestEnable(true); // bench: scan nearby WiFi (needs radio on) and log results
+            webPortalStartScan();
+            Serial.println("[debug] WiFi scan requested via serial");
+        } else if (c == 'u') {
+            // Bench trigger for the OTA data update. Uses the SAME reliable path
+            // as the web + on-screen buttons: set the NVS flag and reboot into
+            // "update mode", where the whole download runs before any RAM-hungry
+            // task starts (the running app can't spare the ~16 KB contiguous the
+            // TLS handshake needs — that was the "cannot fetch manifest" error).
+            Serial.println("[debug] data update requested via serial -> scheduling reboot to update mode");
+            dataUpdateSchedule(); // sets flag, then ESP.restart()
         }
     }
 
@@ -343,6 +516,13 @@ void loop() {
         // internal RAM like every other task's, so it's tracked here too.
         Serial.printf("[mem] loopTask stack high-water mark: %u bytes free\n",
                       (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
+        // speedLimitTask (Core 0) runs the map matcher AND the live map render +
+        // SD tile I/O — the heaviest, deepest call chain in the build and the
+        // one that has twice tripped the FreeRTOS stack canary. Watch this while
+        // driving in a dense area: if it approaches 0, the in-city crash is a
+        // stack overflow here (stack raised to 16384 on 2026-09-25).
+        Serial.printf("[mem] speedLimitTask stack high-water mark: %u bytes free\n",
+                      (unsigned)speedLimitTaskStackFreeBytes());
     }
     delay(1);
 }

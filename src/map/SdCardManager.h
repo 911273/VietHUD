@@ -128,3 +128,15 @@ int sdMgrListTripLogs(uint32_t *outIds, uint32_t *outSizes, int maxCount);
 // directly (and its mutex is held only for the duration of each call, never
 // across a whole slow HTTP response).
 int sdMgrReadFileChunk(const char *path, size_t offset, uint8_t *buf, size_t bufSize);
+
+// Deletes every /triplog/session_*.csv (mutex-guarded like the rest of this
+// module). Returns the number deleted, or -1 if the card isn't available.
+// Used by the web control panel's "Clear trip logs" action (net/WebPortal.cpp).
+int sdMgrDeleteAllTripLogs();
+
+// Mutex-guarded raw file helpers for the online data updater (net/DataUpdater.cpp).
+// sdMgrAppendBytes opens-appends-closes per call (SD mutex held one chunk at a
+// time, so the matcher can still read between chunks). Returns true on full write.
+bool sdMgrAppendBytes(const char *path, const uint8_t *buf, size_t len);
+bool sdMgrRemove(const char *path);              // true if gone (incl. already-absent)
+bool sdMgrRename(const char *from, const char *to); // removes an existing target first

@@ -15,6 +15,7 @@ void loadConfigFromNVS(AppConfig &cfg) {
     cfg.brightness = prefs.getFloat("bright", cfg.brightness);
     cfg.autoDimMin = prefs.getFloat("autoDim", cfg.autoDimMin);
     cfg.audioEnabled = prefs.getBool("audioEn", cfg.audioEnabled);
+    cfg.audioVolume = prefs.getFloat("audioVol", cfg.audioVolume);
     cfg.gnssSpeedFilterAlpha = prefs.getFloat("gnssAlpha", cfg.gnssSpeedFilterAlpha);
     cfg.gnssFixTimeoutS = prefs.getFloat("gnssFixTo", cfg.gnssFixTimeoutS);
     cfg.gnssSpeedCalibrationPct = prefs.getFloat("gnssCalPct", cfg.gnssSpeedCalibrationPct);
@@ -32,6 +33,16 @@ void loadConfigFromNVS(AppConfig &cfg) {
     String pass = prefs.getString("wifiPass", cfg.wifiPassword);
     strncpy(cfg.wifiPassword, pass.c_str(), sizeof(cfg.wifiPassword) - 1);
     cfg.wifiPassword[sizeof(cfg.wifiPassword) - 1] = '\0';
+    String sta = prefs.getString("staSsid", cfg.staSsid);
+    strncpy(cfg.staSsid, sta.c_str(), sizeof(cfg.staSsid) - 1);
+    cfg.staSsid[sizeof(cfg.staSsid) - 1] = '\0';
+    String stap = prefs.getString("staPass", cfg.staPassword);
+    strncpy(cfg.staPassword, stap.c_str(), sizeof(cfg.staPassword) - 1);
+    cfg.staPassword[sizeof(cfg.staPassword) - 1] = '\0';
+    cfg.wifiAutoOffMin = prefs.getFloat("wifiAutoOff", cfg.wifiAutoOffMin);
+    String durl = prefs.getString("dataUrl", cfg.dataUpdateUrl);
+    strncpy(cfg.dataUpdateUrl, durl.c_str(), sizeof(cfg.dataUpdateUrl) - 1);
+    cfg.dataUpdateUrl[sizeof(cfg.dataUpdateUrl) - 1] = '\0';
     cfg.screenRotation = prefs.getFloat("screenRot", cfg.screenRotation);
     cfg.themeMode = prefs.getFloat("themeMode", cfg.themeMode);
     cfg.mapSource = prefs.getFloat("mapSource", cfg.mapSource);
@@ -40,6 +51,20 @@ void loadConfigFromNVS(AppConfig &cfg) {
     cfg.showRasterMap = prefs.getBool("showRaster", cfg.showRasterMap);
     cfg.mapHeadingUp = prefs.getBool("mapHeadUp", cfg.mapHeadingUp);
     cfg.defaultLimitKmh = prefs.getFloat("defLimitKmh", cfg.defaultLimitKmh);
+
+    // One-time config migration (2026-09-25). Older builds shipped a 90 km/h
+    // fallback and persisted it, so devices carry a stale defLimitKmh=90 in NVS
+    // that overrides the current 50 km/h code default. The user wants 50 shown
+    // when a road's limit is unknown (VN urban baseline). Reset it to the code
+    // default exactly ONCE (guarded by a schema-version key) so a later manual
+    // change the user makes is still respected and never re-clobbered.
+    const uint32_t kCfgSchemaVer = 2;
+    uint32_t cfgVer = prefs.getUInt("cfgVer", 0);
+    if (cfgVer < kCfgSchemaVer) {
+        cfg.defaultLimitKmh = 50.0f;
+        prefs.putFloat("defLimitKmh", 50.0f);
+        prefs.putUInt("cfgVer", kCfgSchemaVer);
+    }
     prefs.end();
     sanitizeConfig(cfg); // NaN/Inf guard against a corrupted flash page — must run BEFORE clamping, see its comment
     clampConfig(cfg);
@@ -50,6 +75,7 @@ void saveConfigToNVS(const AppConfig &cfg) {
     prefs.putFloat("bright", cfg.brightness);
     prefs.putFloat("autoDim", cfg.autoDimMin);
     prefs.putBool("audioEn", cfg.audioEnabled);
+    prefs.putFloat("audioVol", cfg.audioVolume);
     prefs.putFloat("gnssAlpha", cfg.gnssSpeedFilterAlpha);
     prefs.putFloat("gnssFixTo", cfg.gnssFixTimeoutS);
     prefs.putFloat("gnssCalPct", cfg.gnssSpeedCalibrationPct);
@@ -59,6 +85,10 @@ void saveConfigToNVS(const AppConfig &cfg) {
     prefs.putBool("tripLogEn", cfg.tripLoggingEnabled);
     prefs.putString("wifiSsid", cfg.wifiSsid);
     prefs.putString("wifiPass", cfg.wifiPassword);
+    prefs.putString("staSsid", cfg.staSsid);
+    prefs.putString("staPass", cfg.staPassword);
+    prefs.putFloat("wifiAutoOff", cfg.wifiAutoOffMin);
+    prefs.putString("dataUrl", cfg.dataUpdateUrl);
     prefs.putFloat("screenRot", cfg.screenRotation);
     prefs.putFloat("themeMode", cfg.themeMode);
     prefs.putFloat("mapSource", cfg.mapSource);

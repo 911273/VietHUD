@@ -84,6 +84,7 @@ static bool screenDimmed = false;
 void applyConfig() {
     float level = screenDimmed ? 12.0f : cfg.brightness;
     backlightWrite((uint32_t)(level / 100.0f * 255.0f));
+    audioSetVolume((uint8_t)cfg.audioVolume); // push the configured speaker volume to the audio driver
 }
 
 void wakeScreen() {
@@ -157,10 +158,25 @@ static lv_obj_t *egoHalo = nullptr;
 // points to true North. In heading-up mode the map rotates, so North swings
 // around the car; this line shows it. Lives in a fixed screen corner, updated
 // each refresh from the current heading.
-static lv_obj_t *northLine = nullptr;
-static lv_obj_t *northLabel = nullptr;
-static int northCx = 30, northCy = 34; // compass center (screen px)
-static const int kNorthR = 16;         // line length
+// Heading readout: a single label that names the direction the vehicle is
+// CURRENTLY travelling (user-requested 2026-09-24) — heading North shows "N",
+// South "S", etc., using the 8 compass directions. Not a rotating rose; just
+// the current-travel label. kCompass8[round(heading/45)%8].
+static lv_obj_t *compassLabel = nullptr;
+// Board temperature readout (user-requested 2026-09-25): the device sits on a
+// car windscreen and gets hot, so the ESP32-S3 die temperature is shown in the
+// bottom-RIGHT corner (mirroring the heading letter bottom-left), colour-coded
+// and with safety thresholds — see refreshDashboard() and kTempWarnC below.
+static lv_obj_t *tempLabel = nullptr;
+static int tempCx = 446, tempCy = 286; // bottom-right corner (mirror of the compass)
+// ESP32-S3 die temperature thresholds. The on-chip sensor reads DIE temp, which
+// idles ~50-60C and runs 70-80C under load even at room temperature, so the
+// warning line is set well above that. Easy to tune after observing real
+// readings on the windscreen in the sun.
+static const float kTempWarnC = 80.0f; // amber + one-shot notice at/above this
+static const float kTempCritC = 92.0f; // red blinking + repeating alarm + auto-dim to shed heat
+static const char *kCompass8[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+static int northCx = 34, northCy = 34; // label center (screen px)
 static uint32_t lastDrawnMapGeneration = 0xFFFFFFFFu;
 static bool mapDimmed = false;
 static int egoAnchorX = 240, egoAnchorY = 213;
@@ -208,18 +224,14 @@ static lv_obj_t *midCol;
 // real-world "informational" road-sign color), deliberately NOT red/amber,
 // so it never reads as a safety alert the way the speeding overlay does —
 // this is advance notice of a rule change ahead, not a danger warning.
-static lv_obj_t *aheadLimitLabel;
-// Speed-camera-ahead banner (feature-requested 2026-09-21, "tai du lieu ve
-// canh bao giao thong, gom camera") — same shared-object pattern as the
-// two banners above. Own color (amber) distinct from BOTH aheadLimitLabel's
-// blue (an informational rule-change notice) and the TTC/speeding
-// overlays' red (imminent collision) — a camera is neither: it's a real,
-// location-specific reason to check your speed NOW, warranting more
-// attention than a passive rule notice but not a collision alarm.
-// Positioned below both of them (y=54 vs. their 2/28) so all three can
-// stack without overlapping on the rare tick more than one is visible.
-static lv_obj_t *cameraAheadLabel;
-static lv_obj_t *trafficSignLabel;
+// REMOVED 2026-09-24 (V2): aheadLimitLabel / cameraAheadLabel / trafficSignLabel
+// were legacy floating banners pinned at the default (0,0) top-left corner.
+// aheadLimitLabel and cameraAheadLabel had NO background styling, so they drew
+// as faint unstyled text directly over the map (the "dòng text mờ góc trên
+// trái" the user asked to remove). They duplicated the dedicated traffic alert
+// card (trafficCard, winner-based W_CAMERA / W_AHEAD_LIMIT / W_RESIDENT / … /
+// W_DANGER), which shows the same info with proper icons + distance + progress.
+// The audio cues these blocks used to fire are preserved in refreshDashboard().
 
 // Dedicated Traffic & Camera Alert Card (Minimalist HUD: Icon + Mini Speed Sign + Distance)
 static lv_obj_t *trafficCard = nullptr;
@@ -586,26 +598,31 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
         mkStrip(fw - vw, 0, vw, fh, gRight, LV_GRAD_DIR_HOR, false);  // right edge dark
     }
 
-    // --- North indicator (user-requested): a short line + "N" that always
-    // points to true North. Rotated each refresh to -heading so it swings as
-    // the heading-up map rotates. Fixed in the bottom-left corner.
-    northCx = 30;
+    // --- Heading readout: one label in the bottom-left corner showing the
+    // current travel direction as a compass letter (N/NE/E/SE/S/SW/W/NW),
+    // updated from GNSS heading in refreshDashboard().
+    northCx = 34;
     northCy = gCanvasH - 34;
-    static lv_point_precise_t northPts[2];
-    northPts[0] = {(lv_value_precise_t)northCx, (lv_value_precise_t)northCy};
-    northPts[1] = {(lv_value_precise_t)northCx, (lv_value_precise_t)(northCy - kNorthR)};
-    northLine = lv_line_create(parent);
-    lv_line_set_points(northLine, northPts, 2);
-    lv_obj_set_style_line_width(northLine, 3, 0);
-    lv_obj_set_style_line_color(northLine, lv_color_hex(0xFF4D4D), 0); // red = North, compass convention
-    lv_obj_set_style_line_rounded(northLine, true, 0);
-    lv_obj_clear_flag(northLine, LV_OBJ_FLAG_CLICKABLE);
-    northLabel = lv_label_create(parent);
-    lv_label_set_text(northLabel, "N");
-    lv_obj_set_style_text_font(northLabel, &lv_font_vn_14, 0);
-    lv_obj_set_style_text_color(northLabel, lv_color_hex(0xFF6666), 0);
-    lv_obj_set_pos(northLabel, northCx - 4, northCy - kNorthR - 16);
-    lv_obj_clear_flag(northLabel, LV_OBJ_FLAG_CLICKABLE);
+    compassLabel = lv_label_create(parent);
+    lv_label_set_text(compassLabel, "N");
+    lv_obj_set_style_text_font(compassLabel, &lv_font_montserrat_20, 0); // bigger heading letter (2026-09-25)
+    lv_obj_set_style_text_color(compassLabel, lv_color_hex(0x00E5FF), 0); // cyan accent (matches the ego arrow)
+    lv_obj_clear_flag(compassLabel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_pos(compassLabel, northCx - 6, northCy - 11);
+
+    // Board temperature readout, bottom-right corner (mirror of the compass).
+    tempCx = gCanvasW - 34;
+    tempCy = gCanvasH - 34;
+    tempLabel = lv_label_create(parent);
+    lv_label_set_text(tempLabel, "--\xC2\xB0" "C"); // "--°C" until the first reading (°=U+00B0, UTF-8 C2 B0)
+    lv_obj_set_style_text_font(tempLabel, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(tempLabel, lv_color_hex(0x93A0AE), 0); // neutral until a reading colours it
+    lv_obj_clear_flag(tempLabel, LV_OBJ_FLAG_CLICKABLE);
+    // Fixed width, right-aligned so the value stays anchored in the corner
+    // whether it's "40°C" or "100°C" (no per-reading repositioning needed).
+    lv_obj_set_width(tempLabel, 72);
+    lv_obj_set_style_text_align(tempLabel, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(tempLabel, gCanvasW - 8 - 72, tempCy - 11); // right edge ~8px from the screen edge
 }
 
 // Chooses the raster tile zoom and the LVGL tile scale so the raster's
@@ -644,8 +661,13 @@ static void updateMapCanvas() {
     static MapViewSnapshot v;
     v = mapViewSnapshot();
 
-    // Map is ALWAYS dimmed across the entire screen (70% opacity)
-    lv_obj_set_style_opa(mapCanvas, LV_OPA_COVER, 0); // opaque for cheaper compositing (was LV_OPA_90)
+    // NOTE (2026-09-24 V2): the per-tick lv_obj_set_style_opa(mapCanvas,...) that
+    // used to be here was the hidden cause of a full-screen flush EVERY frame.
+    // A style write invalidates the object (LVGL doesn't diff it), and this
+    // object is the full-screen rotated map image — so every 150ms tick the
+    // whole map recomposited + pushed the whole 307KB frame (~33ms), even when
+    // nothing had moved. The opacity is set once at creation (buildMapCanvas);
+    // it never changes, so setting it here again was pure invalidation cost.
 
     // Track last known coordinates or fallback to Vietnam center (21.0278, 105.8342)
     static float sLastMapLat = 21.0278f;
@@ -1008,12 +1030,7 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     lv_label_set_text(speedLimitValueLabel, "--");
 
     // Hidden floating labels
-    aheadLimitLabel = lv_label_create(scr);
-    lv_obj_add_flag(aheadLimitLabel, LV_OBJ_FLAG_HIDDEN);
-    cameraAheadLabel = lv_label_create(scr);
-    lv_obj_add_flag(cameraAheadLabel, LV_OBJ_FLAG_HIDDEN);
-    trafficSignLabel = lv_label_create(scr);
-    lv_obj_add_flag(trafficSignLabel, LV_OBJ_FLAG_HIDDEN);
+    // (legacy floating warning banners removed — see comment near the top of this file)
 
     // ---------------- Bottom row: Cảnh báo phụ (Traffic Card) ----------------
     midCol = makePane(scr, (scrW - 270) / 2, 246, 270, 60);
@@ -1155,12 +1172,7 @@ static void buildDashboardPortrait(lv_obj_t *scr) {
     lv_label_set_text(speedLimitValueLabel, "--");
 
     // Hidden floating labels for compatibility
-    aheadLimitLabel = lv_label_create(scr);
-    lv_obj_add_flag(aheadLimitLabel, LV_OBJ_FLAG_HIDDEN);
-    cameraAheadLabel = lv_label_create(scr);
-    lv_obj_add_flag(cameraAheadLabel, LV_OBJ_FLAG_HIDDEN);
-    trafficSignLabel = lv_label_create(scr);
-    lv_obj_add_flag(trafficSignLabel, LV_OBJ_FLAG_HIDDEN);
+    // (legacy floating warning banners removed — see comment near the top of this file)
 
     // ---------------- Hàng đáy: Cảnh báo phụ (camera/đổi tốc độ/khoảng cách) ----------------
     midCol = makePane(scr, 25, 252, scrW - 50, 60);
@@ -1237,12 +1249,7 @@ void buildDashboard() {
     // in refreshDashboard() (the actual upcoming limit number isn't known
     // until then).
     // Top floating banners relocated to dedicated HUD cards to prevent blocking Top Status Bar
-    if (!aheadLimitLabel) aheadLimitLabel = lv_label_create(scr);
-    lv_obj_add_flag(aheadLimitLabel, LV_OBJ_FLAG_HIDDEN);
-    cameraAheadLabel = lv_label_create(scr);
-    lv_obj_add_flag(cameraAheadLabel, LV_OBJ_FLAG_HIDDEN);
-    trafficSignLabel = lv_label_create(scr);
-    lv_obj_add_flag(trafficSignLabel, LV_OBJ_FLAG_HIDDEN);
+    // (legacy floating warning banners removed — see comment near the top of this file)
 
     // Hold-to-open-Settings progress ring — created last so it draws on top
     // of everything else, including the flash overlay above. Hidden until
@@ -1377,22 +1384,103 @@ void refreshDashboard() {
     // local copies, never the live shared state (see core/SharedState.h).
     GnssSnapshot gnss = gnssSnapshot();
 
-    // North indicator: rotate the little line/"N" to point at true North. In
-    // heading-up mode North sits at screen bearing -heading from straight up,
-    // so tip = center + r*(-sin H, -cos H). When stationary/no heading, North
-    // is up (the map is north-up then too). Only touch it on a real change.
-    if (northLine) {
-        static float sLastNorthH = -999.0f;
-        float H = (gnss.fix && gnss.headingValid) ? gnss.headingDeg : 0.0f;
-        if (fabsf(H - sLastNorthH) > 1.0f) {
-            sLastNorthH = H;
-            float r = (float)H * (float)M_PI / 180.0f;
-            static lv_point_precise_t np[2];
-            np[0] = {(lv_value_precise_t)northCx, (lv_value_precise_t)northCy};
-            np[1] = {(lv_value_precise_t)(northCx - (int)(kNorthR * sinf(r))),
-                     (lv_value_precise_t)(northCy - (int)(kNorthR * cosf(r)))};
-            lv_line_set_points(northLine, np, 2);
-            if (northLabel) lv_obj_set_pos(northLabel, np[1].x - 4, np[1].y - 15);
+    // GPS status chimes (2026-09-25): a friendly ascending motif the first time
+    // a fix is acquired ("device ready"), and a low descending tone if the fix
+    // drops WHILE DRIVING. Edge-detected on gnss.fix (already debounced by
+    // GNSS.cpp's gnssFixTimeoutS). The "lost" tone only fires if the vehicle
+    // actually moved during this fix session (sMovedThisFix) — so a bench with
+    // no antenna, or a parked car, doesn't cry wolf. A 3s cooldown stops any
+    // marginal-signal toggling from spamming the speaker.
+    {
+        static int sLastFix = -1; // -1 = first evaluation, no edge yet
+        static uint32_t sLastGpsChimeMs = 0;
+        static bool sMovedThisFix = false;
+        int fixNow = gnss.fix ? 1 : 0;
+        if (fixNow && gnss.egoSpeedKmh > 5.0f) sMovedThisFix = true;
+        if (sLastFix != -1 && fixNow != sLastFix && millis() - sLastGpsChimeMs > 3000) {
+            if (fixNow) {
+                audioPlayGpsReady();
+                sLastGpsChimeMs = millis();
+                sMovedThisFix = false; // new fix session
+            } else if (sMovedThisFix) {
+                audioPlayGpsLost();
+                sLastGpsChimeMs = millis();
+            }
+        }
+        sLastFix = fixNow;
+    }
+
+    // Board temperature (ESP32-S3 die sensor) + thermal safety. Shown bottom-
+    // right, colour-coded. WARNING (>=kTempWarnC): amber + a one-shot notice.
+    // CRITICAL (>=kTempCritC): red BLINKING, a repeating alarm, AND the backlight
+    // is dimmed to shed heat (the panel is the board's biggest heat source).
+    // temperatureRead() is a quick on-chip ADC read; done every ~2s. Colour is
+    // re-applied only when it actually changes, so normal operation never forces
+    // a full-screen redraw on the map beneath (only the rare critical blink does).
+    if (tempLabel) {
+        static uint32_t sLastTempMs = 0;
+        static float sTempC = -999.0f;
+        static int sLastTier = 0;
+        static uint32_t sLastCritAlarmMs = 0;
+        static uint32_t sLastTempColor = 0xFFFFFFFFu;
+        static bool sThermalDimmed = false;
+        uint32_t nowT = millis();
+        if (sTempC < -900.0f || nowT - sLastTempMs > 2000) {
+            sLastTempMs = nowT;
+            sTempC = temperatureRead(); // ESP32-S3 internal die temperature, degrees C
+            g_boardTempC = sTempC;      // publish for the web telemetry (net/WebPortal.cpp)
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.0f\xC2\xB0" "C", (double)sTempC); // "NN°C"
+            lv_label_set_text(tempLabel, buf);
+        }
+        int tier = (sTempC >= kTempCritC) ? 2 : (sTempC >= kTempWarnC) ? 1 : 0;
+        {
+            static uint32_t sLastTempLogMs = 0;
+            if (nowT - sLastTempLogMs > 10000) {
+                sLastTempLogMs = nowT;
+                Serial.printf("[temp] die=%.1fC tier=%d (warn>=%.0f crit>=%.0f)\n", (double)sTempC, tier,
+                              (double)kTempWarnC, (double)kTempCritC);
+            }
+        }
+        lv_color_t col;
+        if (tier == 2) col = ((nowT / 400) % 2 == 0) ? lv_color_hex(0xFF3B30) : lv_color_hex(0x601515); // blink
+        else if (tier == 1) col = lv_color_hex(0xE0A000);                                              // amber
+        else col = lv_color_hex(0x93A0AE);                                                             // neutral
+        uint32_t cu = lv_color_to_u32(col);
+        if (cu != sLastTempColor) { sLastTempColor = cu; lv_obj_set_style_text_color(tempLabel, col, 0); }
+        if (tier > sLastTier) {                              // crossing UP into a hotter tier
+            if (tier == 1) audioPlaySignNotice();            // gentle "getting hot" notice
+            else if (tier == 2) audioPlayOverspeedAlert();   // urgent alarm entering critical
+        }
+        sLastTier = tier;
+        if (tier == 2) {
+            if (nowT - sLastCritAlarmMs > 15000) { sLastCritAlarmMs = nowT; audioPlayOverspeedAlert(); }
+            if (!sThermalDimmed) { sThermalDimmed = true; backlightWrite(40); } // ~16% to cut heat
+        } else if (sThermalDimmed) {
+            sThermalDimmed = false;
+            applyConfig(); // cooled below critical — restore the configured brightness
+        }
+    }
+
+    // Compass: place each cardinal LETTER toward its true geographic direction.
+    // On the heading-up map a bearing B appears at screen-bearing (B - heading)
+    // clockwise from straight up, i.e. offset (sin th, -cos th)*R. N=0, E=90,
+    // S=180, W=270. Stationary/no heading -> north-up. Only touch on a real
+    // change (>1 deg) so it doesn't invalidate the map every tick.
+    // Heading readout: show the current travel direction letter. Only recompute
+    // while actually moving with a valid heading (>=3 km/h) — at a standstill
+    // u-blox heading is noise and would flicker the label between directions;
+    // below that we keep the last shown direction. Update (and re-center for the
+    // 1- vs 2-char width) only when the direction actually changes.
+    if (compassLabel && gnss.fix && gnss.headingValid && gnss.egoSpeedKmh >= 3.0f) {
+        static int sLastDir = -1;
+        int dir = ((int)lroundf(gnss.headingDeg / 45.0f)) % 8;
+        if (dir < 0) dir += 8;
+        if (dir != sLastDir) {
+            sLastDir = dir;
+            lv_label_set_text(compassLabel, kCompass8[dir]);
+            // center the bigger glyph: ~6px per character horizontally, ~11px vertically
+            lv_obj_set_pos(compassLabel, northCx - (int)strlen(kCompass8[dir]) * 6, northCy - 11);
         }
     }
 
@@ -1425,8 +1513,20 @@ void refreshDashboard() {
         gnssColor = lv_color_hex(STATUS_RED);
         snprintf(gBuf, sizeof(gBuf), "--");
     }
-    lv_obj_set_style_text_color(gnssIcon, gnssColor, 0);
-    lv_obj_set_style_text_color(gnssCaption, gnssColor, 0);
+    // Only recolor on an actual change (2026-09-24 V2). A style write always
+    // invalidates the object even if the value is identical — doing it every
+    // 150ms tick was one of several redraws that, over the full-screen rotated
+    // map beneath, forced a whole-frame QSPI flush every tick. lv_label_set_text
+    // already diffs internally, so it stays unconditional.
+    {
+        static uint32_t sLastGnssColor = 0xFFFFFFFFu;
+        uint32_t gc = lv_color_to_u32(gnssColor);
+        if (gc != sLastGnssColor) {
+            sLastGnssColor = gc;
+            lv_obj_set_style_text_color(gnssIcon, gnssColor, 0);
+            lv_obj_set_style_text_color(gnssCaption, gnssColor, 0);
+        }
+    }
     lv_label_set_text(gnssCaption, gBuf); // text itself set once at build — see buildDashboard()
 
     // WiFi icon — shown only while actually on (net/WebPortal.h). Gated on
@@ -1447,11 +1547,17 @@ void refreshDashboard() {
     // half). GPS gives UTC only; local offset is estimated from longitude
     // (round(lon/15)), which is exact for this deployment (Vietnam, UTC+7)
     // and a reasonable approximation generally without a timezone DB.
+    int ntpH, ntpM;
     if (gnss.timeValid) {
         int offsetHours = (int)lroundf(gnss.lonDeg / 15.0f);
         int localHour = ((gnss.utcHour + offsetHours) % 24 + 24) % 24;
         char buf[8];
         snprintf(buf, sizeof(buf), "%02d:%02d", localHour, gnss.utcMinute);
+        lv_label_set_text(clockLabel, buf);
+    } else if (webPortalLocalTime(&ntpH, &ntpM)) {
+        // No GPS time yet, but WiFi station + NTP gave us the time (feature F).
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%02d:%02d", ntpH, ntpM);
         lv_label_set_text(clockLabel, buf);
     } else {
         lv_label_set_text(clockLabel, "--:--");
@@ -1460,7 +1566,13 @@ void refreshDashboard() {
     // sunrise/sunset calc off real date/time/lat/lon (spec section 15.2).
     // Defaults to sun (daytime=true) while timeValid is false, so this is
     // safe to call unconditionally before any fix.
-    lv_image_set_src(sunIcon, gnss.daytime ? &sun_icon : &moon_icon);
+    {
+        static int sLastDay = -1; // only swap the icon (an invalidating op) when day/night flips
+        if ((int)gnss.daytime != sLastDay) {
+            sLastDay = (int)gnss.daytime;
+            lv_image_set_src(sunIcon, gnss.daytime ? &sun_icon : &moon_icon);
+        }
+    }
 
     // Theme mode (user-requested 2026-09-15, Settings > Display): Auto
     // follows the real sunrise/sunset calc below unchanged; Light/Dark
@@ -1525,7 +1637,15 @@ void refreshDashboard() {
     // the direct replacement for what used to be the sign's own compliance
     // color before the sign became an authentic, fixed-color regulatory
     // sign.
-    lv_obj_set_style_text_color(speedLabel, speeding ? lv_color_hex(STATUS_RED) : currentPrimaryTextColor, 0);
+    {
+        static uint32_t sLastSpeedColor = 0xFFFFFFFFu; // only recolor the big speed number on a change
+        lv_color_t sColor = speeding ? lv_color_hex(STATUS_RED) : currentPrimaryTextColor;
+        uint32_t su = lv_color_to_u32(sColor);
+        if (su != sLastSpeedColor) {
+            sLastSpeedColor = su;
+            lv_obj_set_style_text_color(speedLabel, sColor, 0);
+        }
+    }
 
     // Full-screen speeding overlay (user-requested 2026-09-16, "neu vuot
     // qua toc do toi da thi cung canh bao bang layer mau toan man hinh",
@@ -1557,10 +1677,15 @@ void refreshDashboard() {
         char buf[8];
         snprintf(buf, sizeof(buf), "%.0f", (double)road.speedLimitKmh);
         lv_label_set_text(speedLimitValueLabel, buf);
-        lv_obj_set_style_text_color(speedLimitValueLabel, lv_color_black(), 0);
     } else {
         lv_label_set_text(speedLimitValueLabel, "--");
-        lv_obj_set_style_text_color(speedLimitValueLabel, lv_color_black(), 0);
+    }
+    {
+        static bool sLimitColorSet = false; // the sign value is always black — set it once, not every tick
+        if (!sLimitColorSet) {
+            sLimitColorSet = true;
+            lv_obj_set_style_text_color(speedLimitValueLabel, lv_color_black(), 0);
+        }
     }
     lv_obj_align_to(speedLimitValueLabel, speedLimitSign, LV_ALIGN_CENTER, 0, 0);
 
@@ -1574,23 +1699,12 @@ void refreshDashboard() {
         bool newlyVisible = (road.aheadLimitValid && !lastAheadVisible);
         lastAheadVisible = road.aheadLimitValid;
         lastAheadLimit = road.aheadSpeedLimitKmh;
-        if (road.aheadLimitValid) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "Ahead: %.0f km/h in %.0fm", (double)road.aheadSpeedLimitKmh,
-                     (double)road.aheadDistanceM);
-            lv_label_set_text(aheadLimitLabel, buf);
-            lv_obj_clear_flag(aheadLimitLabel, LV_OBJ_FLAG_HIDDEN);
-            // No existing tone call for this banner before Task E (it was
-            // visual-only) — audioPlaySignNotice()'s gentle chime is reused
-            // here rather than inventing a third tone shape, same "cheap,
-            // instant" role it already plays for the sign banner below.
-            if (newlyVisible) {
-                audioPlaySignNotice();
-                audioQueueVoice("tocdogioihan.mp3");
-                queueSpeedVoice(road.aheadSpeedLimitKmh);
-            }
-        } else {
-            lv_obj_add_flag(aheadLimitLabel, LV_OBJ_FLAG_HIDDEN);
+        // Visual is the trafficCard (W_AHEAD_LIMIT); this block only fires the
+        // audio cue when a speed-limit change first appears ahead.
+        if (road.aheadLimitValid && newlyVisible) {
+            audioPlaySignNotice();
+            audioQueueVoice("tocdogioihan.mp3");
+            queueSpeedVoice(road.aheadSpeedLimitKmh);
         }
     }
 
@@ -1601,23 +1715,12 @@ void refreshDashboard() {
         bool newlyVisible = (road.cameraAheadValid && !lastCameraVisible);
         lastCameraVisible = road.cameraAheadValid;
         lastCameraDist = road.cameraAheadDistanceM;
-        if (road.cameraAheadValid) {
-            char buf[40];
-            if (road.cameraSpeedLimitKmh >= 0) {
-                snprintf(buf, sizeof(buf), "Camera in %.0fm (%.0f km/h)", (double)road.cameraAheadDistanceM,
-                          (double)road.cameraSpeedLimitKmh);
-            } else {
-                snprintf(buf, sizeof(buf), "Camera in %.0fm", (double)road.cameraAheadDistanceM);
-            }
-            lv_label_set_text(cameraAheadLabel, buf);
-            lv_obj_clear_flag(cameraAheadLabel, LV_OBJ_FLAG_HIDDEN);
-            if (newlyVisible) {
-                audioPlayCameraAlert(); // immediate tone chime — cheap, instant, plays while the voice line below queues
-                audioQueueVoice("speedcamera.mp3");
-                if (road.cameraSpeedLimitKmh >= 0) queueSpeedVoice(road.cameraSpeedLimitKmh);
-            }
-        } else {
-            lv_obj_add_flag(cameraAheadLabel, LV_OBJ_FLAG_HIDDEN);
+        // Visual is the trafficCard (W_CAMERA); this block only fires the audio
+        // cue when a camera first appears ahead.
+        if (road.cameraAheadValid && newlyVisible) {
+            audioPlayCameraAlert(); // immediate tone chime — cheap, instant, plays while the voice line below queues
+            audioQueueVoice("speedcamera.mp3");
+            if (road.cameraSpeedLimitKmh >= 0) queueSpeedVoice(road.cameraSpeedLimitKmh);
         }
     }
 
@@ -1631,30 +1734,22 @@ void refreshDashboard() {
 
     int currentSignType = 0;
     float currentSignDist = -1;
-    char signBuf[48] = "";
 
     if (road.residentAreaAheadValid) {
         currentSignType = 2;
         currentSignDist = road.residentAreaAheadDistM;
-        snprintf(signBuf, sizeof(signBuf), "%s cách %.0fm",
-                 road.residentAreaIsStart ? "Khu dân cư" : "Hết khu dân cư", (double)currentSignDist);
     } else if (road.noOvertakingAheadValid) {
         currentSignType = 3;
         currentSignDist = road.noOvertakingAheadDistM;
-        snprintf(signBuf, sizeof(signBuf), "%s cách %.0fm",
-                 road.noOvertakingIsStart ? "Cấm vượt" : "Hết cấm vượt", (double)currentSignDist);
     } else if (road.tollBoothAheadValid) {
         currentSignType = 5;
         currentSignDist = road.tollBoothAheadDistM;
-        snprintf(signBuf, sizeof(signBuf), "Trạm thu phí cách %.0fm", (double)currentSignDist);
     } else if (road.trafficLightAheadValid) {
         currentSignType = 6;
         currentSignDist = road.trafficLightAheadDistM;
-        snprintf(signBuf, sizeof(signBuf), "Đèn tín hiệu cách %.0fm", (double)currentSignDist);
     } else if (road.dangerAheadValid) {
         currentSignType = 10;
         currentSignDist = road.dangerAheadDistM;
-        snprintf(signBuf, sizeof(signBuf), "Nguy hiểm cách %.0fm", (double)currentSignDist);
     }
 
     if (signVisible != lastSignVisible || currentSignType != lastSignType ||
@@ -1664,36 +1759,22 @@ void refreshDashboard() {
         lastSignType = currentSignType;
         lastSignDist = currentSignDist;
 
-        if (signVisible) {
-            lv_label_set_text(trafficSignLabel, signBuf);
-            if (currentSignType == 2) {
-                lv_obj_set_style_bg_color(trafficSignLabel, lv_color_hex(0x2080C0), 0); // Cyan/blue
-            } else if (currentSignType == 3) {
-                lv_obj_set_style_bg_color(trafficSignLabel, lv_color_hex(0xD04020), 0); // Red/Orange
-            } else if (currentSignType == 5) {
-                lv_obj_set_style_bg_color(trafficSignLabel, lv_color_hex(0x7050B0), 0); // Purple
-            } else if (currentSignType == 10) {
-                lv_obj_set_style_bg_color(trafficSignLabel, lv_color_hex(0xC08000), 0); // Amber (hazard)
-            } else {
-                lv_obj_set_style_bg_color(trafficSignLabel, lv_color_hex(0x209060), 0); // Green
+        // Visual is the trafficCard (W_RESIDENT/W_NO_OVERTAKE/W_TOLL/W_LIGHT/
+        // W_DANGER, icon + distance); this block only fires the audio cue when a
+        // sign first appears ahead.
+        if (signVisible && newlyVisible) {
+            audioPlaySignNotice(); // immediate tone chime — cheap, instant, plays while the voice line below queues
+            // Only resident-area/no-overtaking/toll/traffic-light/danger have
+            // a matching voice asset in data/speedmap/sounds/vi/ — no fallback
+            // fabricated for anything else; see AudioPlayer.h.
+            switch (currentSignType) {
+                case 2: audioQueueVoice(road.residentAreaIsStart ? "batdaukhudancu.mp3" : "hetkhudongdancu.mp3"); break;
+                case 3: audioQueueVoice(road.noOvertakingIsStart ? "camvuot.mp3" : "hetcamvuot.mp3"); break;
+                case 5: audioQueueVoice("tramthuphi.mp3"); break;
+                case 6: audioQueueVoice("chuydentinhieugiaothong.mp3"); break;
+                case 10: audioQueueVoice("sapdenbienbao.mp3"); break; // generic "sắp đến biển báo" for a hazard zone
+                default: break;
             }
-            lv_obj_clear_flag(trafficSignLabel, LV_OBJ_FLAG_HIDDEN);
-            if (newlyVisible) {
-                audioPlaySignNotice(); // immediate tone chime — cheap, instant, plays while the voice line below queues
-                // Only resident-area/no-overtaking/toll/traffic-light/danger have
-                // a matching voice asset in data/speedmap/sounds/vi/ — no fallback
-                // fabricated for anything else; see AudioPlayer.h.
-                switch (currentSignType) {
-                    case 2: audioQueueVoice(road.residentAreaIsStart ? "batdaukhudancu.mp3" : "hetkhudongdancu.mp3"); break;
-                    case 3: audioQueueVoice(road.noOvertakingIsStart ? "camvuot.mp3" : "hetcamvuot.mp3"); break;
-                    case 5: audioQueueVoice("tramthuphi.mp3"); break;
-                    case 6: audioQueueVoice("chuydentinhieugiaothong.mp3"); break;
-                    case 10: audioQueueVoice("sapdenbienbao.mp3"); break; // generic "sắp đến biển báo" for a hazard zone
-                    default: break;
-                }
-            }
-        } else {
-            lv_obj_add_flag(trafficSignLabel, LV_OBJ_FLAG_HIDDEN);
         }
     }
 

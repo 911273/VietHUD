@@ -1,4 +1,6 @@
 .pio/
+.cache/
+*.exe
 compile_commands.json
 
 # --- Map / warning / voice DATA (frozen separately per release, NOT in git) ---

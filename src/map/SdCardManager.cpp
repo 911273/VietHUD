@@ -561,6 +561,38 @@ int sdMgrListTripLogs(uint32_t *outIds, uint32_t *outSizes, int maxCount) {
     return n;
 }
 
+int sdMgrDeleteAllTripLogs() {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return -1;
+    File dir = SD_MMC.open("/triplog");
+    if (!dir || !dir.isDirectory()) {
+        if (dir) dir.close();
+        return 0;
+    }
+    // Collect session IDs first (4 bytes each, not full path strings — keeps
+    // internal RAM tiny), THEN remove: deleting while an openNextFile()
+    // iteration is live is unreliable on SD_MMC.
+    static uint32_t ids[128];
+    int n = 0;
+    for (File f = dir.openNextFile(); f && n < 128; f = dir.openNextFile()) {
+        const char *name = f.name();
+        const char *lastSlash = strrchr(name, '/');
+        const char *bare = lastSlash ? lastSlash + 1 : name;
+        unsigned id = 0;
+        if (!f.isDirectory() && sscanf(bare, "session_%u.csv", &id) == 1) ids[n++] = (uint32_t)id;
+        f.close();
+    }
+    dir.close();
+    int deleted = 0;
+    char path[40];
+    for (int i = 0; i < n; i++) {
+        snprintf(path, sizeof(path), "/triplog/session_%04lu.csv", (unsigned long)ids[i]);
+        if (SD_MMC.remove(path)) deleted++;
+    }
+    Serial.printf("[sdmgr] deleted %d/%d trip log(s)\n", deleted, n);
+    return deleted;
+}
+
 int sdMgrReadFileChunk(const char *path, size_t offset, uint8_t *buf, size_t bufSize) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return -1;
@@ -607,6 +639,45 @@ bool sdMgrAppendLine(const char *path, const char *line) {
     f.println(line);
     f.close();
     return true;
+}
+
+// Append raw bytes to a file (creates it + one-level parent dir if missing),
+// mutex-guarded like the rest of this module. Open-append-close per call so the
+// SD mutex is only held for one chunk at a time — the map-matcher task can still
+// read tiles between chunks during a long online data download (net/
+// DataUpdater.cpp). Returns true only if the full len was written.
+bool sdMgrAppendBytes(const char *path, const uint8_t *buf, size_t len) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    const char *slash = strrchr(path, '/');
+    if (slash && slash != path) {
+        char dir[64];
+        size_t dirLen = (size_t)(slash - path);
+        if (dirLen < sizeof(dir)) {
+            memcpy(dir, path, dirLen);
+            dir[dirLen] = '\0';
+            if (!SD_MMC.exists(dir)) SD_MMC.mkdir(dir);
+        }
+    }
+    File f = SD_MMC.open(path, FILE_APPEND);
+    if (!f) return false;
+    size_t wrote = f.write(buf, len);
+    f.close();
+    return wrote == len;
+}
+
+bool sdMgrRemove(const char *path) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    if (!SD_MMC.exists(path)) return true; // already gone = success
+    return SD_MMC.remove(path);
+}
+
+bool sdMgrRename(const char *from, const char *to) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    SD_MMC.remove(to); // rename won't overwrite an existing target on some FS impls
+    return SD_MMC.rename(from, to);
 }
 
 bool sdMgrFindTileEntry(uint32_t tileId, TileIndexEntry *outEntry) {

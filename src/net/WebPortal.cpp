@@ -5,14 +5,20 @@
 #include "map/SdCardManager.h" // sdMgrListTripLogs()/sdMgrReadFileChunk() — /triplog download page
 #include "map/SpeedLimitManager.h" // speedLimitManagerGetInfo()/speedSourceStr() — /api/speedlimit, /api/speedmap/debug
 #include "ui/Dashboard.h" // applyConfig() — a web-submitted brightness change needs the same PWM rewrite Settings.cpp's slider does
+#include "audio/AudioPlayer.h" // audioSelfTest() — web control panel "test audio" action
+#include "demo/DemoMode.h"      // demoModeSetEnabled()/IsEnabled() — web control panel demo toggle
+#include "net/DataUpdater.h"    // dataUpdateStart()/GetStatus() — online data update action
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>  // MDNS — viethud.local (feature B)
+#include <DNSServer.h> // captive portal (feature E)
 #include <Update.h>
 #include <esp_heap_caps.h>
 #include <esp_task_wdt.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <time.h>   // configTime()/time()/localtime() — NTP time sync over STA (feature F)
 #include <math.h> // isinf() — used directly below, not just transitively via AppConfig.h
 #include <string.h> // strlen() — used in applyWifiState()'s password-length check
 
@@ -23,6 +29,39 @@
 // now live in AppConfig (cfg.wifiSsid/cfg.wifiPassword — editable from
 // Settings > WiFi or /config), not hardcoded here.
 static WebServer server(80);
+static DNSServer dnsServer;                 // captive portal: answers every lookup with the AP IP (feature E)
+static const char *kMdnsHost = "viethud";   // -> http://viethud.local (feature B)
+static const IPAddress kApIp(192, 168, 4, 1); // default SoftAP address, used by the captive portal
+
+// Station/NTP state (feature F). staConnected tracks the last-seen STA link so a
+// connect/disconnect only logs + (re)syncs NTP once. ntpSynced flips true after
+// the first time NTP delivers a plausible epoch (> 2021), after which the clock
+// can use it as a GPS-independent time source.
+static volatile bool staConnected = false;
+static volatile bool ntpSynced = false;
+static char g_apSsid[40] = "VietHUD"; // the actual AP SSID in use (set in applyWifiState) — for status display
+
+// WiFi scan cache (filled by the web task, read by the UI). g_scanCount: -1 idle,
+// -2 scanning, >=0 results ready. g_scanReq triggers a fresh async scan.
+#define SCAN_MAX 16
+static char g_scanSsid[SCAN_MAX][33];
+static int8_t g_scanRssi[SCAN_MAX];
+static uint8_t g_scanLocked[SCAN_MAX];
+static volatile int g_scanCount = -1;
+static volatile bool g_scanReq = false;
+static volatile bool g_staReconnectReq = false;
+
+void webPortalStartScan() { g_scanReq = true; g_scanCount = -2; }
+int webPortalScanState() { return g_scanCount; }
+int webPortalScanResult(int i, char *ssid, size_t cap, int *rssi, bool *locked) {
+    if (i < 0 || i >= g_scanCount) return 0;
+    strncpy(ssid, g_scanSsid[i], cap - 1);
+    ssid[cap - 1] = '\0';
+    if (rssi) *rssi = g_scanRssi[i];
+    if (locked) *locked = g_scanLocked[i] != 0;
+    return 1;
+}
+void webPortalReconnectSta() { g_staReconnectReq = true; }
 
 // wifiEnabledRequest: what the UI wants (written by webPortalRequestEnable(),
 // read by webTaskFn()). wifiActuallyEnabled: what's actually been applied
@@ -42,8 +81,47 @@ void webPortalRequestEnable(bool on) { wifiEnabledRequest = on; }
 bool webPortalIsEnabled() { return wifiActuallyEnabled; }
 
 void webPortalStatusText(char *buf, size_t cap) {
-    if (wifiActuallyEnabled) snprintf(buf, cap, "ON, IP=%s", WiFi.softAPIP().toString().c_str());
-    else snprintf(buf, cap, "OFF");
+    if (wifiActuallyEnabled)
+        snprintf(buf, cap, "%s  %s  %d may", g_apSsid, WiFi.softAPIP().toString().c_str(),
+                 (int)WiFi.softAPgetStationNum());
+    else
+        snprintf(buf, cap, "OFF");
+}
+
+// STA (internet) connection line for the on-screen Settings + web. Decodes the
+// station status so a failure is diagnosable at a glance (the iPhone-hotspot
+// 5 GHz gotcha shows up here as "khong thay mang").
+void webPortalStaInfo(char *buf, size_t cap) {
+    if (cfg.staSsid[0] == '\0') {
+        snprintf(buf, cap, "Tat (chua dat mang)");
+        return;
+    }
+    if (!wifiActuallyEnabled) {
+        snprintf(buf, cap, "Cho bat WiFi");
+        return;
+    }
+    wl_status_t wl = WiFi.status();
+    if (wl == WL_CONNECTED) {
+        snprintf(buf, cap, "Da noi %s  %s  %ddBm%s", cfg.staSsid, WiFi.localIP().toString().c_str(),
+                 (int)WiFi.RSSI(), ntpSynced ? "  NTP" : "");
+    } else if (wl == WL_NO_SSID_AVAIL) {
+        snprintf(buf, cap, "Khong thay \"%s\" (5GHz/tat?)", cfg.staSsid);
+    } else if (wl == WL_CONNECT_FAILED) {
+        snprintf(buf, cap, "Sai mat khau \"%s\"?", cfg.staSsid);
+    } else {
+        snprintf(buf, cap, "Dang ket noi \"%s\"...", cfg.staSsid);
+    }
+}
+
+bool webPortalLocalTime(int *hour, int *minute) {
+    if (!ntpSynced) return false;
+    time_t now = time(nullptr);
+    if (now < 1609459200) return false; // < 2021-01-01 => clock not really set yet
+    struct tm lt;
+    localtime_r(&now, &lt); // configTime() below sets the VN UTC+7 offset, so this is local
+    if (hour) *hour = lt.tm_hour;
+    if (minute) *minute = lt.tm_min;
+    return true;
 }
 
 // ---------------------------------------------------------------------
@@ -67,13 +145,30 @@ h1{font-size:18px;color:#fff;margin:0 0 12px}
 .card.camera{background:#E0A020;grid-column:1/-1}
 .card.camera .label,.card.camera .value{color:#000}
 nav a{color:#4AA3FF;margin-right:16px;font-size:13px;text-decoration:none}
+.ctl{margin:14px 0}.ctl button{background:#1E2A38;color:#CFE0F0;border:1px solid #2E3F52;border-radius:6px;padding:8px 12px;margin:4px 6px 0 0;font-size:13px;cursor:pointer}
+.ctl button:hover{background:#28394C}.ctl button.danger{border-color:#7A2E2E;color:#FF9A9A}
+#msg{color:#7C8A9A;font-size:12px;margin-left:6px}
 </style></head><body>
 <nav><a href="/">Live</a><a href="/triplog">Trip logs</a><a href="/config">Config</a><a href="/update">OTA Update</a></nav>
 <h1>VietHUD - Live Telemetry</h1>
 <div class="grid" id="grid"></div>
+<div class="ctl">
+  <button onclick="if(confirm('Tai du lieu ban do/canh bao moi ve the?'))act('dataupdate')">&#11015; Update data</button>
+  <button onclick="act('audiotest')">&#128266; Test audio</button>
+  <button onclick="act('demo')">&#127916; Toggle demo</button>
+  <button class="danger" onclick="if(confirm('Xoa toan bo trip log?'))act('clearlogs')">&#128465; Clear trip logs</button>
+  <button class="danger" onclick="if(confirm('Khoi dong lai thiet bi?'))act('reboot')">&#128260; Reboot</button>
+  <span id="msg"></span>
+</div>
+<div id="du" style="margin:8px 0;font-size:13px"></div>
 <script>
 function card(label, value, cls) {
   return '<div class="card"><div class="label">' + label + '</div><div class="value ' + (cls||'') + '">' + value + '</div></div>';
+}
+async function act(a) {
+  document.getElementById('msg').textContent = a + '...';
+  try { const r = await fetch('/api/action?do=' + a, {method:'POST'}); document.getElementById('msg').textContent = await r.text(); }
+  catch(e){ document.getElementById('msg').textContent = 'error'; }
 }
 async function tick() {
   try {
@@ -91,17 +186,39 @@ async function tick() {
       html += '<div class="card camera"><div class="label">Speed camera ahead</div><div class="value">' +
               c.distanceM.toFixed(0) + ' m' + limitTxt + '</div></div>';
     }
+    const tc = d.boardTempC;
+    const tcls = tc >= 92 ? 'bad' : (tc >= 80 ? 'warn' : 'ok');
+    html += card('Board temp', tc.toFixed(0) + ' °C', tcls);
     html += card('GNSS fix', d.gnss.fix ? 'OK' : (d.gnss.linkAlive ? 'SEARCHING' : 'FAULT'),
                   d.gnss.fix ? 'ok' : (d.gnss.linkAlive ? 'warn' : 'bad'));
     html += card('Satellites', d.gnss.satCount);
+    html += card('Direction', d.gnss.headingValid ? (d.gnss.dir + ' (' + d.gnss.headingDeg.toFixed(0) + '°)') : '--');
     html += card('Speed (filtered)', d.gnss.speedKmh.toFixed(1) + ' km/h');
     html += card('Speed (raw)', d.gnss.rawSpeedKmh.toFixed(1) + ' km/h');
     html += card('Speed map', d.speedMap.loaded ? 'LOADED' : 'NOT LOADED', d.speedMap.loaded ? 'ok' : 'bad');
     html += card('Speed limit', d.speedMap.limitValid ? d.speedMap.limitKmh.toFixed(0) + ' km/h' : '--');
+    const w = d.wifi;
+    html += card('Hotspot (AP)', w.on ? (w.apSsid + ' · ' + w.apIp) : 'OFF', w.on ? 'ok' : '');
+    html += card('AP clients', w.clients);
+    // STA status decoded from w.staStatus (3=WL_CONNECTED,1=no SSID,4=fail,...)
+    let staTxt, staCls;
+    if (w.staConnected) { staTxt = (w.staSsid || 'STA') + ' · ' + w.staIp + ' · ' + w.rssi + 'dBm' + (w.ntp ? ' · NTP✓' : ''); staCls = 'ok'; }
+    else if (!w.staSsid) { staTxt = 'chua dat mang'; staCls = ''; }
+    else if (w.staStatus === 1) { staTxt = 'khong thay "' + w.staSsid + '" (5GHz/tat?)'; staCls = 'bad'; }
+    else if (w.staStatus === 4) { staTxt = 'sai mat khau "' + w.staSsid + '"?'; staCls = 'bad'; }
+    else { staTxt = 'dang ket noi "' + w.staSsid + '"...'; staCls = 'warn'; }
+    html += card('Internet (STA)', staTxt, staCls);
     html += card('Free internal RAM', d.mem.freeInternalKB + ' KB (min ' + d.mem.minFreeInternalKBEver + ' KB)');
     html += card('Free PSRAM', d.mem.freePsramKB + ' KB');
     html += card('Uptime', Math.floor(d.uptimeMs / 1000) + ' s');
     document.getElementById('grid').innerHTML = html;
+    // Data-update progress line (state: 0 idle,1 running,2 success,3 failed)
+    const u = d.dataUpdate;
+    let du = '';
+    if (u.state === 1) du = '<span class="warn">⏳ ' + u.msg + ' — ' + u.filesDone + '/' + u.filesTotal + ' (' + u.percent + '%)</span>';
+    else if (u.state === 2) du = '<span class="ok">✅ ' + u.msg + '</span>';
+    else if (u.state === 3) du = '<span class="bad">⚠ ' + u.msg + '</span>';
+    document.getElementById('du').innerHTML = du;
   } catch (e) { /* transient fetch failure — next tick retries */ }
 }
 tick();
@@ -120,11 +237,12 @@ static void handleIndex() { server.send_P(200, "text/html", kIndexHtml); }
 // ---------------------------------------------------------------------
 // Bumped 1536->1792 (2026-09-21) alongside adding the "camera" object below
 // — a comfortable margin over measured worst case, not a tight fit.
-static char statusBuf[1792];
+static char statusBuf[2560];
 
 static void handleApiStatus() {
     GnssSnapshot gnss = gnssSnapshot();
     RoadInfoSnapshot road = roadInfoSnapshot();
+    DataUpdateStatus du = dataUpdateGetStatus();
 
     // Speed-camera-ahead (user-requested 2026-09-21, "them the hien phia
     // truoc co camera") — same map/SpeedLimitManager.cpp's matchCameraAhead()
@@ -142,18 +260,33 @@ static void handleApiStatus() {
     size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     size_t minFreeInternal = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
 
+    // Compass direction letter from the current heading (same 8-way mapping the
+    // Dashboard's heading readout uses).
+    static const char *kDir8[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+    const char *dir = gnss.headingValid ? kDir8[((int)lroundf(gnss.headingDeg / 45.0f)) % 8 & 7] : "--";
+
     snprintf(statusBuf, sizeof(statusBuf),
              "{\"uptimeMs\":%lu,"
+             "\"boardTempC\":%.1f,"
              "\"gnss\":{\"fix\":%s,\"linkAlive\":%s,\"satCount\":%d,\"speedKmh\":%.1f,\"rawSpeedKmh\":%.1f,"
-             "\"timeValid\":%s,\"utcHour\":%d,\"utcMinute\":%d},"
+             "\"headingValid\":%s,\"headingDeg\":%.0f,\"dir\":\"%s\",\"timeValid\":%s,\"utcHour\":%d,\"utcMinute\":%d},"
              "\"speedMap\":{\"loaded\":%s,\"limitValid\":%s,\"limitKmh\":%.0f},"
              "\"cameraAhead\":%s,"
+             "\"wifi\":{\"on\":%s,\"apSsid\":\"%s\",\"apIp\":\"%s\",\"clients\":%d,\"staSsid\":\"%s\","
+             "\"staConnected\":%s,\"staIp\":\"%s\",\"rssi\":%d,\"staStatus\":%d,\"ntp\":%s},"
+             "\"dataUpdate\":{\"state\":%d,\"filesDone\":%d,\"filesTotal\":%d,\"percent\":%d,\"msg\":\"%s\"},"
              "\"mem\":{\"freeInternalKB\":%u,\"minFreeInternalKBEver\":%u,\"freePsramKB\":%u}}",
-             (unsigned long)millis(), gnss.fix ? "true" : "false",
+             (unsigned long)millis(), (double)g_boardTempC, gnss.fix ? "true" : "false",
              gnss.linkAlive ? "true" : "false", gnss.satCount, (double)gnss.egoSpeedKmh, (double)gnss.rawSpeedKmh,
+             gnss.headingValid ? "true" : "false", (double)gnss.headingDeg, dir,
              gnss.timeValid ? "true" : "false", gnss.utcHour, gnss.utcMinute,
              road.mapLoaded ? "true" : "false", road.valid ? "true" : "false",
              road.valid ? (double)road.speedLimitKmh : 0.0, cameraBuf,
+             wifiActuallyEnabled ? "true" : "false", g_apSsid, WiFi.softAPIP().toString().c_str(),
+             (int)WiFi.softAPgetStationNum(), cfg.staSsid, staConnected ? "true" : "false",
+             staConnected ? WiFi.localIP().toString().c_str() : "", staConnected ? (int)WiFi.RSSI() : 0,
+             (int)WiFi.status(), ntpSynced ? "true" : "false",
+             (int)du.state, du.filesDone, du.filesTotal, du.percent, du.message,
              (unsigned)(freeInternal / 1024), (unsigned)(minFreeInternal / 1024), (unsigned)(ESP.getFreePsram() / 1024));
 
     server.send(200, "application/json", statusBuf);
@@ -284,7 +417,7 @@ static void handleTripLogGet() {
 // this file and Settings.cpp, so a new AppConfig field needs adding in
 // both places, same as NvsStore.cpp already requires today.
 // ---------------------------------------------------------------------
-static char configBuf[6144];
+static char configBuf[7680];
 
 static size_t appendField(char *buf, size_t cap, size_t len, const char *name, const char *label, float value,
                            float step, float minV, float maxV) {
@@ -338,6 +471,7 @@ static void handleConfigGet() {
 
     len += snprintf(configBuf + len, sizeof(configBuf) - len, "<fieldset><legend>Alerts</legend>");
     len = appendCheckbox(configBuf, sizeof(configBuf), len, "audioEnabled", "Alert audio enabled", cfg.audioEnabled);
+    len = appendField(configBuf, sizeof(configBuf), len, "audioVolume", "Volume (%)", cfg.audioVolume, 1, 0, 100);
     len += snprintf(configBuf + len, sizeof(configBuf) - len, "</fieldset><fieldset><legend>Display</legend>");
     len = appendField(configBuf, sizeof(configBuf), len, "brightness", "Brightness (%)", cfg.brightness, 1, 5, 100);
     len = appendField(configBuf, sizeof(configBuf), len, "autoDimMin", "Auto-dim after (min)", cfg.autoDimMin, 1, 0,
@@ -357,14 +491,30 @@ static void handleConfigGet() {
     // the lookahead uses a dynamic speed-based warn distance.)
     len = appendCheckbox(configBuf, sizeof(configBuf), len, "tripLoggingEnabled", "Trip logging (SD card)",
                           cfg.tripLoggingEnabled);
-    len += snprintf(configBuf + len, sizeof(configBuf) - len, "</fieldset><fieldset><legend>WiFi</legend>");
+    len += snprintf(configBuf + len, sizeof(configBuf) - len, "</fieldset><fieldset><legend>WiFi hotspot (AP)</legend>");
     len = appendTextField(configBuf, sizeof(configBuf), len, "wifiSsid", "SSID", cfg.wifiSsid, false);
     len = appendTextField(configBuf, sizeof(configBuf), len, "wifiPassword", "New password (blank = keep current)",
                            "", true);
+    len = appendField(configBuf, sizeof(configBuf), len, "wifiAutoOffMin", "Auto-off after (min, 0=never)",
+                       cfg.wifiAutoOffMin, 1, 0, 120);
     len += snprintf(configBuf + len, sizeof(configBuf) - len,
                      "<p style=\"font-size:11px;color:#7C8A9A\">On/off is on the device screen only (Settings &gt; "
                      "WiFi, or hold the Dashboard 3s+) — not here, since submitting an off request over WiFi would "
-                     "disconnect this page mid-request.</p>"
+                     "disconnect this page mid-request.</p></fieldset>"
+                     "<fieldset><legend>Internet (Station / NTP)</legend>"
+                     "<p style=\"font-size:11px;color:#7C8A9A\">Optionally join your phone hotspot / home WiFi so the "
+                     "device can sync the clock over the internet (NTP) without waiting for GPS. Leave SSID blank for "
+                     "hotspot-only. Applied on the next WiFi on/off.</p>");
+    len = appendTextField(configBuf, sizeof(configBuf), len, "staSsid", "Network SSID (blank = off)", cfg.staSsid, false);
+    len = appendTextField(configBuf, sizeof(configBuf), len, "staPassword", "Network password (blank = keep current)",
+                           "", true);
+    len += snprintf(configBuf + len, sizeof(configBuf) - len,
+                     "</fieldset><fieldset><legend>Online data update</legend>"
+                     "<p style=\"font-size:11px;color:#7C8A9A\">Base URL serving the map/warning data + "
+                     "manifest.txt (your Raspberry Pi). The Live page's \"Update data\" button pulls from here.</p>");
+    len = appendTextField(configBuf, sizeof(configBuf), len, "dataUpdateUrl", "Data URL (e.g. https://host/speedmap/)",
+                           cfg.dataUpdateUrl, false);
+    len += snprintf(configBuf + len, sizeof(configBuf) - len,
                      "</fieldset><button type=\"submit\">Save to device</button></form></body></html>");
 
     server.send(200, "text/html", configBuf);
@@ -377,6 +527,7 @@ static float argFloat(const char *name, float fallback) {
 
 static void handleConfigPost() {
     cfg.brightness = argFloat("brightness", cfg.brightness);
+    cfg.audioVolume = argFloat("audioVolume", cfg.audioVolume);
     cfg.autoDimMin = argFloat("autoDimMin", cfg.autoDimMin);
     cfg.gnssSpeedFilterAlpha = argFloat("gnssSpeedFilterAlpha", cfg.gnssSpeedFilterAlpha);
     cfg.gnssFixTimeoutS = argFloat("gnssFixTimeoutS", cfg.gnssFixTimeoutS);
@@ -391,6 +542,19 @@ static void handleConfigPost() {
     if (server.hasArg("wifiPassword") && server.arg("wifiPassword").length() > 0) {
         strncpy(cfg.wifiPassword, server.arg("wifiPassword").c_str(), sizeof(cfg.wifiPassword) - 1);
         cfg.wifiPassword[sizeof(cfg.wifiPassword) - 1] = '\0';
+    }
+    cfg.wifiAutoOffMin = argFloat("wifiAutoOffMin", cfg.wifiAutoOffMin);
+    if (server.hasArg("staSsid")) { // may be intentionally blank (= station off)
+        strncpy(cfg.staSsid, server.arg("staSsid").c_str(), sizeof(cfg.staSsid) - 1);
+        cfg.staSsid[sizeof(cfg.staSsid) - 1] = '\0';
+    }
+    if (server.hasArg("staPassword") && server.arg("staPassword").length() > 0) { // blank = keep current
+        strncpy(cfg.staPassword, server.arg("staPassword").c_str(), sizeof(cfg.staPassword) - 1);
+        cfg.staPassword[sizeof(cfg.staPassword) - 1] = '\0';
+    }
+    if (server.hasArg("dataUpdateUrl")) { // may be intentionally blank (= updater off)
+        strncpy(cfg.dataUpdateUrl, server.arg("dataUpdateUrl").c_str(), sizeof(cfg.dataUpdateUrl) - 1);
+        cfg.dataUpdateUrl[sizeof(cfg.dataUpdateUrl) - 1] = '\0';
     }
     // Checkboxes only appear in POST data when checked — an absent arg means unchecked, not "leave unchanged".
     cfg.audioEnabled = server.hasArg("audioEnabled");
@@ -453,6 +617,53 @@ static void handleUpdatePost() {
 }
 
 // ---------------------------------------------------------------------
+// "/api/action" (POST ?do=...) — the Live page's control panel (feature G).
+// Small, explicit actions only; runs in the web task's context so it can call
+// audio/demo/SD helpers directly. Every action is idempotent-ish and safe to
+// fire from a phone. Reboot sends its reply first, then restarts after a beat.
+// ---------------------------------------------------------------------
+static void handleApiAction() {
+    String a = server.arg("do");
+    if (a == "audiotest") {
+        audioSelfTest();
+        server.send(200, "text/plain", "Audio self-test started");
+    } else if (a == "demo") {
+        bool on = !demoModeIsEnabled();
+        demoModeSetEnabled(on);
+        server.send(200, "text/plain", on ? "Demo mode ON" : "Demo mode OFF");
+    } else if (a == "clearlogs") {
+        int n = sdMgrDeleteAllTripLogs();
+        char msg[48];
+        snprintf(msg, sizeof(msg), n < 0 ? "SD not available" : "Deleted %d trip log(s)", n);
+        server.send(200, "text/plain", msg);
+    } else if (a == "dataupdate") {
+        if (cfg.dataUpdateUrl[0] == '\0') {
+            server.send(200, "text/plain", "No update URL set (Config)");
+        } else {
+            server.send(200, "text/plain", "Rebooting into update mode...");
+            delay(300);
+            dataUpdateSchedule(); // sets NVS flag + reboots; download runs at next boot with RAM free for TLS
+        }
+    } else if (a == "reboot") {
+        server.sendHeader("Connection", "close");
+        server.send(200, "text/plain", "Rebooting...");
+        delay(400);
+        ESP.restart();
+    } else {
+        server.send(400, "text/plain", "unknown action");
+    }
+}
+
+// Captive-portal catch-all (feature E): any URL the WebServer doesn't have a
+// route for gets a redirect to the portal root, so connecting to the AP pops
+// the page open (phones probe a handful of "is there internet?" URLs on
+// join; answering them with a 302 to us is what triggers the captive sign-in).
+static void handleCaptiveRedirect() {
+    server.sendHeader("Location", String("http://") + kApIp.toString(), true);
+    server.send(302, "text/plain", "");
+}
+
+// ---------------------------------------------------------------------
 // Applies a WiFi on/off transition — the ONLY place in this file that calls
 // WiFi.*()/server.begin()/server.stop(), and only ever from webTaskFn()'s
 // own context (see wifiEnabledRequest's comment above for why that
@@ -460,8 +671,25 @@ static void handleUpdatePost() {
 static void applyWifiState(bool enable) {
     if (enable == wifiActuallyEnabled) return;
     if (enable) {
-        WiFi.mode(WIFI_AP);
-        const char *ssid = cfg.wifiSsid[0] ? cfg.wifiSsid : "VietHUD"; // guard an emptied-out SSID field
+        // AP + optional STATION (feature F): if the user configured a station
+        // SSID, join it too (AP_STA) for internet/NTP; otherwise plain AP.
+        bool wantSta = cfg.staSsid[0] != '\0';
+        WiFi.mode(wantSta ? WIFI_AP_STA : WIFI_AP);
+        // AP SSID: a user-set custom name, else "VietHUD-XXXX" (last 4 MAC hex)
+        // so multiple units don't collide (spec 2.1). "VietHUD" alone counts as
+        // "not customised" and gets the MAC suffix too.
+        char apSsid[40];
+        if (cfg.wifiSsid[0] && strcmp(cfg.wifiSsid, "VietHUD") != 0) {
+            strncpy(apSsid, cfg.wifiSsid, sizeof(apSsid) - 1);
+            apSsid[sizeof(apSsid) - 1] = '\0';
+        } else {
+            uint8_t mac[6];
+            WiFi.macAddress(mac);
+            snprintf(apSsid, sizeof(apSsid), "VietHUD-%02X%02X", mac[4], mac[5]);
+        }
+        strncpy(g_apSsid, apSsid, sizeof(g_apSsid) - 1);
+        g_apSsid[sizeof(g_apSsid) - 1] = '\0';
+        const char *ssid = apSsid;
         size_t pwLen = strlen(cfg.wifiPassword);
         bool secured = pwLen >= 8; // WPA2 minimum — WiFi.softAP() silently fails to secure below this
         bool ok = secured ? WiFi.softAP(ssid, cfg.wifiPassword) : WiFi.softAP(ssid);
@@ -469,13 +697,33 @@ static void applyWifiState(bool enable) {
             Serial.printf("[web] WARN: password %s (%u chars, WPA2 needs >=8) — starting an OPEN (unsecured) AP\n",
                           pwLen == 0 ? "empty" : "too short", (unsigned)pwLen);
         }
+        if (wantSta) {
+            WiFi.begin(cfg.staSsid, cfg.staPassword);
+            // VN UTC+7; NTP daemon fills the system clock in the background once
+            // the station associates — webPortalLocalTime() reads it afterwards.
+            configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
+            Serial.printf("[web] STA joining \"%s\" for internet/NTP\n", cfg.staSsid);
+        }
         server.begin();
-        Serial.printf("[web] WiFi ON — AP \"%s\" (%s) %s, IP=%s\n", ssid, secured ? "secured" : "OPEN",
-                      ok ? "up" : "FAILED to start", WiFi.softAPIP().toString().c_str());
+        MDNS.end();                 // in case a stale instance is lingering
+        if (MDNS.begin(kMdnsHost)) { // feature B: http://viethud.local
+            MDNS.addService("http", "tcp", 80);
+            Serial.printf("[web] mDNS up: http://%s.local\n", kMdnsHost);
+        }
+        dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+        dnsServer.start(53, "*", kApIp); // feature E: captive portal — resolve everything to us
+        Serial.printf("[web] WiFi ON — AP \"%s\" (%s) %s, IP=%s%s\n", ssid, secured ? "secured" : "OPEN",
+                      ok ? "up" : "FAILED to start", WiFi.softAPIP().toString().c_str(),
+                      wantSta ? " (+STA)" : "");
     } else {
+        dnsServer.stop();
+        MDNS.end();
         server.stop();
         WiFi.softAPdisconnect(true);
+        WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
+        staConnected = false;
+        ntpSynced = false;
         Serial.println("[web] WiFi OFF");
     }
     wifiActuallyEnabled = enable;
@@ -496,11 +744,112 @@ static void webTaskFn(void *) {
     server.on("/config", HTTP_POST, handleConfigPost);
     server.on("/update", HTTP_GET, handleUpdateGet);
     server.on("/update", HTTP_POST, handleUpdatePost, handleUpdateUpload);
+    server.on("/api/action", HTTP_POST, handleApiAction);       // feature G: control panel
+    // Common captive-portal probe URLs + a catch-all, all 302 -> portal root.
+    server.on("/generate_204", HTTP_GET, handleCaptiveRedirect);       // Android
+    server.on("/gen_204", HTTP_GET, handleCaptiveRedirect);           // Android (older)
+    server.on("/hotspot-detect.html", HTTP_GET, handleCaptiveRedirect); // iOS/macOS
+    server.on("/ncsi.txt", HTTP_GET, handleCaptiveRedirect);          // Windows
+    server.onNotFound(handleCaptiveRedirect);                         // feature E
 
     esp_task_wdt_add(NULL);
+    uint32_t lastClientMs = millis();  // feature D: auto-off timer baseline
     for (;;) {
-        if (wifiEnabledRequest != wifiActuallyEnabled) applyWifiState(wifiEnabledRequest);
-        if (wifiActuallyEnabled) server.handleClient();
+        if (wifiEnabledRequest != wifiActuallyEnabled) {
+            applyWifiState(wifiEnabledRequest);
+            lastClientMs = millis(); // reset the idle timer on every on transition
+        }
+        // WiFi scan for the on-screen setup overlay — needs the radio, and STA
+        // reconnect with freshly-entered creds. Both here so all WiFi.* stays on
+        // this task. Scan works in AP_STA; it briefly disturbs the AP, fine for
+        // a setup moment.
+        if (wifiActuallyEnabled) {
+            if (g_scanReq) {
+                g_scanReq = false;
+                // SYNCHRONOUS scan on the web task: async scanComplete() never
+                // returned while the STA was stuck associating to a missing
+                // hotspot. Blocking here (~2-4s) is fine — the UI is on Core 1.
+                Serial.println("[web] scanning nearby WiFi (2.4GHz)...");
+                esp_task_wdt_reset();
+                // Free the radio: a STA stuck retrying a missing hotspot makes the
+                // scan return 0 results. Disconnect STA (keeps the AP up), scan,
+                // then resume the STA connect if one is configured.
+                WiFi.disconnect(false, false);
+                delay(120);
+                int n = WiFi.scanNetworks(false /*sync*/, false /*skip hidden — blank names are useless to pick*/);
+                esp_task_wdt_reset();
+                if (cfg.staSsid[0]) WiFi.begin(cfg.staSsid, cfg.staPassword); // resume STA after scan
+                int m = 0;
+                for (int i = 0; i < n && m < SCAN_MAX; i++) {
+                    String ss = WiFi.SSID(i);
+                    if (ss.length() == 0) continue; // skip hidden/blank
+                    strncpy(g_scanSsid[m], ss.c_str(), 32);
+                    g_scanSsid[m][32] = '\0';
+                    g_scanRssi[m] = (int8_t)WiFi.RSSI(i);
+                    g_scanLocked[m] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) ? 1 : 0;
+                    m++;
+                }
+                g_scanCount = m;
+                Serial.printf("[web] scan done: %d network(s)\n", m);
+                for (int i = 0; i < m; i++)
+                    Serial.printf("  [%d] %s  %ddBm  %s\n", i, g_scanSsid[i], (int)g_scanRssi[i],
+                                  g_scanLocked[i] ? "locked" : "open");
+                WiFi.scanDelete();
+            }
+            if (g_staReconnectReq) {
+                g_staReconnectReq = false;
+                if (cfg.staSsid[0]) {
+                    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+                    WiFi.begin(cfg.staSsid, cfg.staPassword);
+                    configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
+                    staConnected = false;
+                    ntpSynced = false;
+                    Serial.printf("[web] STA reconnecting to \"%s\"\n", cfg.staSsid);
+                }
+            }
+        }
+        if (wifiActuallyEnabled) {
+            dnsServer.processNextRequest(); // feature E: captive portal DNS
+            server.handleClient();
+
+            // Feature F: track the station link, sync NTP once associated.
+            wl_status_t wl = WiFi.status();
+            bool sta = (wl == WL_CONNECTED);
+            if (sta != staConnected) {
+                staConnected = sta;
+                Serial.printf("[web] STA %s%s\n", sta ? "connected, IP=" : "disconnected",
+                              sta ? WiFi.localIP().toString().c_str() : "");
+            }
+            // Diagnostic: while a station is configured but NOT connected, log the
+            // reason every ~5s. WL_NO_SSID_AVAIL usually means the hotspot is off,
+            // out of range, the name doesn't match, OR it's 5 GHz-only (an iPhone
+            // hotspot needs "Maximize Compatibility" ON to broadcast 2.4 GHz —
+            // the ESP32-S3 radio is 2.4 GHz only). WL_CONNECT_FAILED = wrong pass.
+            if (cfg.staSsid[0] && !sta) {
+                static uint32_t sLastStaDiag = 0;
+                if (millis() - sLastStaDiag > 5000) {
+                    sLastStaDiag = millis();
+                    const char *r = wl == WL_NO_SSID_AVAIL   ? "SSID not found (off/out-of-range/5GHz/name)"
+                                    : wl == WL_CONNECT_FAILED ? "connect failed (wrong password?)"
+                                    : wl == WL_IDLE_STATUS    ? "idle"
+                                    : wl == WL_DISCONNECTED   ? "disconnected/associating"
+                                                              : "status?";
+                    Serial.printf("[web] STA \"%s\" not connected: status=%d (%s)\n", cfg.staSsid, (int)wl, r);
+                }
+            }
+            if (sta && !ntpSynced && time(nullptr) > 1609459200) { // NTP delivered a real epoch
+                ntpSynced = true;
+                Serial.println("[web] NTP time synced");
+            }
+
+            // Feature D: auto-off after wifiAutoOffMin with no AP client.
+            if (WiFi.softAPgetStationNum() > 0) lastClientMs = millis();
+            uint32_t idleLimitMs = (uint32_t)(cfg.wifiAutoOffMin * 60000.0f);
+            if (idleLimitMs > 0 && millis() - lastClientMs > idleLimitMs) {
+                Serial.printf("[web] WiFi auto-off: no client for %.0f min\n", (double)cfg.wifiAutoOffMin);
+                wifiEnabledRequest = false; // applied on the next loop iteration
+            }
+        }
         esp_task_wdt_reset();
         // No need to poll fast while off — nothing to service until someone
         // asks for WiFi again.
