@@ -2,8 +2,8 @@
 
 > Kho lưu trữ chính thức đồng bộ dữ liệu giao thông, camera phạt nguội và biển báo cho thiết bị **VietHUD**.
 
-**Phiên bản phát hành (Version):** `2026.09.25.1049`  
-**Thời gian cập nhật:** `2026-09-25 10:49:54`  
+**Phiên bản phát hành (Version):** `2026.09.25.1116`  
+**Thời gian cập nhật:** `2026-09-25 11:16:04`  
 **Đường dẫn OTA tải về (VietHUD OTA URL):**  
 ```text
 https://raw.githubusercontent.com/911273/VietHUD/main/speedmap/
@@ -16,7 +16,7 @@ https://raw.githubusercontent.com/911273/VietHUD/main/speedmap/
 | File | Kích thước | Mã băm SHA-256 | Mô tả |
 | :--- | :--- | :--- | :--- |
 | `cameras.bin` | 1.15 MB | `b8f4538e1659a3d7...` | Dữ liệu vị trí camera phạt nguội & camera bắn tốc độ toàn quốc |
-| `signs.bin` | 1.78 MB | `446c57d3a608f954...` | Dữ liệu biển báo giao thông (khu dân cư, cấm vượt, trạm thu phí, ...) |
+| `signs.bin` | 1.78 MB | `151146e506f582e1...` | Dữ liệu biển báo giao thông (khu dân cư, cấm vượt, trạm thu phí, ...) |
 | `tiles.bin` | 4.87 MB | `ff41ca79e36916ca...` | Mạng lưới đường bộ vector & giới hạn tốc độ chi tiết |
 | `index.bin` | 94.0 KB | `25656be57c8a9b9b...` | Lưới chỉ mục không gian (Spatial Index) tra cứu nhanh |
 | `metadata.bin` | 0.1 KB | `f6beebdf94259322...` | Thông số khung tọa độ & cấu hình bản đồ |
