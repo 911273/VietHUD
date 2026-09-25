@@ -1,4 +1,5 @@
 #pragma once
+#include <stddef.h> // size_t — speedLimitTaskStackFreeBytes()
 #include "SpeedMapFormat.h"
 
 // The map-matching engine (spec section 18's "SpeedLimitManager" module) —
@@ -18,6 +19,12 @@
 // pipeline can be verified from the serial log without a live GNSS fix
 // (this project has not seen one in any session yet).
 void speedLimitManagerStart();
+
+// Stack head-room (bytes never used) of the speedLimitTask, for the [mem]
+// audit in main. This task runs both the map matcher AND the live map render,
+// so it's the one to watch for stack pressure while driving in dense areas.
+// Returns 0 before the task exists.
+size_t speedLimitTaskStackFreeBytes();
 
 // Dynamic warning distance based on vehicle speed:
 // Minimum 100m. Scales smoothly with vehicle speed (lead time ~14-15s: ~4.5m per km/h).

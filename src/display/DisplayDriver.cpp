@@ -48,6 +48,16 @@ static inline void blitRot1ToCanvas(uint16_t *fb, const uint16_t *src, int x1, i
     }
 }
 
+// NOTE (2026-09-24 V2): a dirty-row PARTIAL flush was tried here to cut the
+// ~33 ms full-frame QSPI push, but on this AXS15231B panel pushing sub-regions
+// per frame caused visible flicker/tearing and an apparent left shift, so it
+// was reverted to the proven full-frame flush below. The real per-frame cost
+// was NOT the flush anyway — it was the whole-screen redraw every tick, which
+// is fixed separately (removed the per-tick mapCanvas style-opa invalidation +
+// gated the per-tick colour/icon writes in Dashboard.cpp). With those, an idle
+// screen dirties nothing, so lv_display flushes nothing (0 ms); only a genuine
+// change triggers one full ~33 ms push. blitRot1ToCanvas() still gives the
+// cache-friendly transpose (canvas-copy 141 ms -> ~3 ms).
 void dispFlushCb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     uint32_t w = area->x2 - area->x1 + 1;
     uint32_t h = area->y2 - area->y1 + 1;

@@ -8,6 +8,7 @@
 #include "map/RasterMapManager.h"
 #include "map/SpeedLimitManager.h" // speedSourceStr() — Speed Map group in the Sensors tab
 #include "net/WebPortal.h"    // webPortalIsEnabled()/webPortalRequestEnable() — WiFi tab
+#include "net/DataUpdater.h"  // dataUpdateStart()/GetStatus() — WiFi tab "Update data" button
 #include <string.h>
 
 // ---------------------------------------------------------------------
@@ -49,6 +50,15 @@ static lv_obj_t *restartConfirmOverlay = nullptr;
 // declare-early/build-late split refreshSensorsPanel()'s own widget
 // pointers already use.
 static lv_obj_t *wifiEnableSwitch, *wifiSsidTa, *wifiPasswordTa;
+static lv_obj_t *staSsidTa = nullptr, *staPasswordTa = nullptr; // Internet (station) creds — WiFi tab
+static lv_obj_t *staStatusVal = nullptr;                        // STA connection info row
+// "WiFi setup" overlay: scan nearby networks + pick one + enter password, on a
+// non-scrolling full-screen modal so the on-screen keyboard works reliably
+// (2026-09-25 — user couldn't type a password on the scrollable WiFi tab).
+static lv_obj_t *wifiScanOverlay = nullptr, *scanList = nullptr, *scanStatusLbl = nullptr;
+static lv_obj_t *scanSelLbl = nullptr, *scanPassTa = nullptr;
+static char g_selectedStaSsid[33] = "";
+static int g_lastRenderedScan = -99;
 // Demo mode (Settings > Display) — like WiFi's switch above, deliberately not
 // an AppConfig/NVS field, so it can never survive a reboot into real driving.
 // See demo/DemoMode.h.
@@ -78,7 +88,7 @@ static void onSliderChanged(lv_event_t *e) {
     // so dragging e.g. "Max range" was rewriting the backlight duty
     // dozens of times for no reason. User-reported 2026-09-15 as Settings
     // feeling laggy.
-    if (b->target == &cfg.brightness) applyConfig();
+    if (b->target == &cfg.brightness || b->target == &cfg.audioVolume) applyConfig(); // both are pushed to hardware in applyConfig()
     // Rotation can't apply live (see AppConfig.h's screenRotation comment —
     // both screens are laid out once at boot for whichever orientation was
     // active then) — say so immediately rather than let the slider silently
@@ -158,9 +168,166 @@ static void onWifiKbReadyOrCancel(lv_event_t *) {
     } else if (ta == wifiPasswordTa) {
         strncpy(cfg.wifiPassword, lv_textarea_get_text(ta), sizeof(cfg.wifiPassword) - 1);
         cfg.wifiPassword[sizeof(cfg.wifiPassword) - 1] = '\0';
+    } else if (ta == staSsidTa) {
+        strncpy(cfg.staSsid, lv_textarea_get_text(ta), sizeof(cfg.staSsid) - 1);
+        cfg.staSsid[sizeof(cfg.staSsid) - 1] = '\0';
+    } else if (ta == staPasswordTa || ta == scanPassTa) {
+        strncpy(cfg.staPassword, lv_textarea_get_text(ta), sizeof(cfg.staPassword) - 1);
+        cfg.staPassword[sizeof(cfg.staPassword) - 1] = '\0';
     }
     lv_keyboard_set_textarea(wifiKeyboard, NULL);
     lv_obj_add_flag(wifiKeyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ---- "WiFi setup" overlay: scan + pick + password + connect ----
+static void onScanItemClicked(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_target_obj(e);
+    int idx = (int)(intptr_t)lv_obj_get_user_data(btn);
+    if (webPortalScanResult(idx, g_selectedStaSsid, sizeof(g_selectedStaSsid), nullptr, nullptr)) {
+        if (scanSelLbl) {
+            char b[48];
+            snprintf(b, sizeof(b), "Chon: %s", g_selectedStaSsid);
+            lv_label_set_text(scanSelLbl, b);
+        }
+    }
+}
+static void onWifiScanBtnClicked(lv_event_t *) {
+    webPortalRequestEnable(true); // scanning needs the radio on
+    webPortalStartScan();
+    g_lastRenderedScan = -99;
+    if (scanStatusLbl) lv_label_set_text(scanStatusLbl, "Dang quet...");
+    if (scanList) lv_obj_clean(scanList);
+}
+static void onWifiScanOpen(lv_event_t *) {
+    lv_obj_clear_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(wifiScanOverlay);
+    g_selectedStaSsid[0] = '\0';
+    if (scanSelLbl) lv_label_set_text(scanSelLbl, "Chon: (chua chon)");
+    if (scanPassTa) lv_textarea_set_text(scanPassTa, "");
+    onWifiScanBtnClicked(nullptr); // auto-scan on open
+}
+static void onWifiScanClose(lv_event_t *) {
+    lv_obj_add_flag(wifiKeyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
+}
+static void onWifiScanConnect(lv_event_t *) {
+    if (g_selectedStaSsid[0] == '\0') {
+        if (scanStatusLbl) lv_label_set_text(scanStatusLbl, "Chua chon mang!");
+        return;
+    }
+    strncpy(cfg.staSsid, g_selectedStaSsid, sizeof(cfg.staSsid) - 1);
+    cfg.staSsid[sizeof(cfg.staSsid) - 1] = '\0';
+    const char *pw = lv_textarea_get_text(scanPassTa);
+    if (pw && pw[0]) { // blank = keep existing password
+        strncpy(cfg.staPassword, pw, sizeof(cfg.staPassword) - 1);
+        cfg.staPassword[sizeof(cfg.staPassword) - 1] = '\0';
+    }
+    saveConfigToNVS(cfg);
+    webPortalReconnectSta(); // apply the new station creds on the web task
+    if (staSsidTa) lv_textarea_set_text(staSsidTa, cfg.staSsid); // reflect in the manual field
+    onWifiScanClose(nullptr);
+}
+
+static void buildWifiScanOverlay(lv_obj_t *parent) {
+    wifiScanOverlay = lv_obj_create(parent);
+    lv_obj_set_pos(wifiScanOverlay, 0, 0);
+    lv_obj_set_size(wifiScanOverlay, gfx->width(), gfx->height());
+    lv_obj_set_style_bg_color(wifiScanOverlay, lv_color_hex(0x0B0F14), 0);
+    lv_obj_set_style_bg_opa(wifiScanOverlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(wifiScanOverlay, 0, 0);
+    lv_obj_set_style_radius(wifiScanOverlay, 0, 0);
+    lv_obj_clear_flag(wifiScanOverlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *title = lv_label_create(wifiScanOverlay);
+    lv_label_set_text(title, "Ket noi Internet (WiFi)");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_pos(title, 8, 6);
+
+    lv_obj_t *rescan = lv_button_create(wifiScanOverlay);
+    lv_obj_set_size(rescan, 90, 30);
+    lv_obj_align(rescan, LV_ALIGN_TOP_RIGHT, -8, 4);
+    lv_obj_add_event_cb(rescan, onWifiScanBtnClicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *rescanLbl = lv_label_create(rescan);
+    lv_label_set_text(rescanLbl, "Quet lai");
+    lv_obj_center(rescanLbl);
+
+    scanStatusLbl = lv_label_create(wifiScanOverlay);
+    lv_label_set_text(scanStatusLbl, "");
+    lv_obj_set_style_text_color(scanStatusLbl, lv_color_hex(0x9FB2C6), 0);
+    lv_obj_set_pos(scanStatusLbl, 8, 30);
+
+    // Left: scrollable list of found networks.
+    scanList = lv_list_create(wifiScanOverlay);
+    lv_obj_set_pos(scanList, 4, 50);
+    lv_obj_set_size(scanList, 280, gfx->height() - 58);
+    lv_obj_set_style_bg_color(scanList, lv_color_hex(0x151C24), 0);
+
+    // Right column: selected + password + buttons.
+    int rx = 292;
+    scanSelLbl = lv_label_create(wifiScanOverlay);
+    lv_label_set_text(scanSelLbl, "Chon: (chua chon)");
+    lv_obj_set_style_text_color(scanSelLbl, lv_color_hex(0xCCD6E0), 0);
+    lv_obj_set_width(scanSelLbl, gfx->width() - rx - 6);
+    lv_label_set_long_mode(scanSelLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_pos(scanSelLbl, rx, 50);
+
+    scanPassTa = lv_textarea_create(wifiScanOverlay);
+    lv_textarea_set_one_line(scanPassTa, true);
+    lv_textarea_set_password_mode(scanPassTa, true);
+    lv_textarea_set_max_length(scanPassTa, sizeof(cfg.staPassword) - 1);
+    lv_textarea_set_placeholder_text(scanPassTa, "Mat khau");
+    lv_obj_set_pos(scanPassTa, rx, 90);
+    lv_obj_set_size(scanPassTa, gfx->width() - rx - 6, 30);
+    lv_obj_add_event_cb(scanPassTa, onWifiTaClicked, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *connBtn = lv_button_create(wifiScanOverlay);
+    lv_obj_set_size(connBtn, gfx->width() - rx - 6, 34);
+    lv_obj_set_pos(connBtn, rx, 128);
+    lv_obj_set_style_bg_color(connBtn, lv_color_hex(0x2E7D4F), 0);
+    lv_obj_add_event_cb(connBtn, onWifiScanConnect, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *connLbl = lv_label_create(connBtn);
+    lv_label_set_text(connLbl, "Ket noi");
+    lv_obj_center(connLbl);
+
+    lv_obj_t *closeBtn = lv_button_create(wifiScanOverlay);
+    lv_obj_set_size(closeBtn, gfx->width() - rx - 6, 30);
+    lv_obj_set_pos(closeBtn, rx, 166);
+    lv_obj_set_style_bg_color(closeBtn, lv_color_hex(0x44505C), 0);
+    lv_obj_add_event_cb(closeBtn, onWifiScanClose, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *closeLbl = lv_label_create(closeBtn);
+    lv_label_set_text(closeLbl, "Dong");
+    lv_obj_center(closeLbl);
+}
+
+// Rebuilds the scan list when a scan finishes (called from refreshSensorsPanel
+// while the overlay is open). Kept out of the WiFi task — only reads the cached
+// results via webPortalScanResult().
+static void refreshScanListIfOpen() {
+    if (!wifiScanOverlay || lv_obj_has_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN)) return;
+    int st = webPortalScanState();
+    if (st == -2) {
+        if (scanStatusLbl) lv_label_set_text(scanStatusLbl, "Dang quet...");
+        return;
+    }
+    if (st >= 0 && st != g_lastRenderedScan) {
+        g_lastRenderedScan = st;
+        lv_obj_clean(scanList);
+        for (int i = 0; i < st; i++) {
+            char ssid[33];
+            int rssi = 0;
+            bool locked = false;
+            webPortalScanResult(i, ssid, sizeof(ssid), &rssi, &locked);
+            char item[64];
+            snprintf(item, sizeof(item), "%s  %s%ddBm", ssid, locked ? "* " : "", rssi);
+            lv_obj_t *b = lv_list_add_button(scanList, NULL, item);
+            lv_obj_set_user_data(b, (void *)(intptr_t)i);
+            lv_obj_add_event_cb(b, onScanItemClicked, LV_EVENT_CLICKED, NULL);
+        }
+        char s[40];
+        snprintf(s, sizeof(s), st ? "Tim thay %d mang (* = co khoa)" : "Khong thay mang 2.4GHz", st);
+        if (scanStatusLbl) lv_label_set_text(scanStatusLbl, s);
+    }
 }
 
 // Row layout tuned for the ~372px-wide / 260px-tall LANDSCAPE category
@@ -382,6 +549,15 @@ static lv_obj_t *addWideReadonlyRow(lv_obj_t *parent, int &y, const char *name) 
 
 static lv_obj_t *gnssFixVal, *gnssSatsVal, *gnssSpeedRawVal, *gnssSpeedFilteredVal;
 static lv_obj_t *wifiStatusVal; // Settings > WiFi tab — see refreshSensorsPanel()
+static lv_obj_t *dataUpdateStatusVal = nullptr; // Settings > WiFi tab, online data update progress
+static void onDataUpdateBtnClicked(lv_event_t *) {
+    if (cfg.dataUpdateUrl[0] == '\0') {
+        if (dataUpdateStatusVal) lv_label_set_text(dataUpdateStatusVal, "Chua dat URL (Config)");
+        return;
+    }
+    if (dataUpdateStatusVal) lv_label_set_text(dataUpdateStatusVal, "Khoi dong lai de cap nhat...");
+    dataUpdateSchedule(); // reboots into update mode (download runs there with RAM free for TLS)
+}
 // Settings > Sensors > "Speed Map" group — see refreshSensorsPanel(). Region/
 // version come from speedLimitManagerGetInfo() (static once loaded at boot);
 // the rest come from roadInfoSnapshot() (updates every ~500ms).
@@ -437,6 +613,34 @@ static void refreshSensorsPanel(lv_timer_t *) {
     webPortalStatusText(wifiBuf, sizeof(wifiBuf));
     lv_label_set_text(wifiStatusVal, wifiBuf);
     lv_obj_set_style_text_color(wifiStatusVal, wifiOn ? lv_color_hex(0x33CC66) : lv_color_hex(0x7C8A9A), 0);
+
+    refreshScanListIfOpen(); // populate the WiFi-setup overlay's list when a scan finishes
+
+    if (staStatusVal) {
+        char staBuf[80];
+        webPortalStaInfo(staBuf, sizeof(staBuf));
+        lv_label_set_text(staStatusVal, staBuf);
+        // green when "Da noi" (connected), amber while connecting, grey/red otherwise
+        uint32_t col = 0x7C8A9A;
+        if (strncmp(staBuf, "Da noi", 6) == 0) col = 0x33CC66;
+        else if (strncmp(staBuf, "Dang", 4) == 0) col = 0xE0C020;
+        else if (strncmp(staBuf, "Khong thay", 10) == 0 || strncmp(staBuf, "Sai", 3) == 0) col = 0xFF3B30;
+        lv_obj_set_style_text_color(staStatusVal, lv_color_hex(col), 0);
+    }
+
+    if (dataUpdateStatusVal) {
+        DataUpdateStatus du = dataUpdateGetStatus();
+        char dbuf[80];
+        uint32_t col = 0x7C8A9A;
+        if (du.state == DU_RUNNING) {
+            snprintf(dbuf, sizeof(dbuf), "%s %d/%d (%d%%)", du.message, du.filesDone, du.filesTotal, du.percent);
+            col = 0xE0C020;
+        } else if (du.state == DU_SUCCESS) { snprintf(dbuf, sizeof(dbuf), "%s", du.message); col = 0x33CC66; }
+        else if (du.state == DU_FAILED) { snprintf(dbuf, sizeof(dbuf), "%s", du.message); col = 0xFF3B30; }
+        else snprintf(dbuf, sizeof(dbuf), "san sang");
+        lv_label_set_text(dataUpdateStatusVal, dbuf);
+        lv_obj_set_style_text_color(dataUpdateStatusVal, lv_color_hex(col), 0);
+    }
     // Keeps the switch honest if WiFi was toggled by the Dashboard's 4s hold
     // gesture rather than this switch itself — lv_obj_add/remove_state()
     // (not lv_switch_set_state()) so this doesn't re-fire onWifiSwitchChanged
@@ -787,7 +991,7 @@ void buildSettingsScreen() {
         // tra/cấu hình," not the driving screen) rather than needing rows
         // trimmed to squeeze in. The old Radar/Safety tabs that used to also
         // need scrolling here are gone entirely (radar removed 2026-09-21).
-        if (i == 2) { // Sensors tab is now i == 2
+        if (i == 2 || i == 3) { // Sensors + WiFi tabs scroll (2026-09-25: WiFi now has AP + STA + data-update sections)
             lv_obj_set_scroll_dir(panel, LV_DIR_VER);
             lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
         } else {
@@ -805,6 +1009,7 @@ void buildSettingsScreen() {
     // than removed, when radar was taken out 2026-09-21).
     y = 4;
     addSwitchRow(categoryPanels[0], y, "Alert audio enabled", &cfg.audioEnabled);
+    addSliderRow(categoryPanels[0], y, "Volume", &cfg.audioVolume, 0, 100, 1.0f, " %");
     addSliderRow(categoryPanels[0], y, "Brightness", &cfg.brightness, 5, 100, 1.0f, " %");
     // Label updated 2026-09-16 alongside the gate itself changing from
     // touch-idle to vehicle-stationary time (see Dashboard.cpp) — "stopped"
@@ -1020,7 +1225,92 @@ void buildSettingsScreen() {
     }
     lv_obj_add_event_cb(wifiPasswordTa, onWifiTaClicked, LV_EVENT_CLICKED, NULL);
 
-    wifiStatusVal = addWideReadonlyRow(categoryPanels[3], y, "Status");
+    wifiStatusVal = addWideReadonlyRow(categoryPanels[3], y, "AP");
+
+    // --- Internet (Station) section: join a phone hotspot / home WiFi so the
+    // device gets internet for online data updates + NTP time (2026-09-25). ---
+    lv_obj_t *staHdr = lv_label_create(categoryPanels[3]);
+    lv_label_set_text(staHdr, "Internet (noi WiFi/hotspot)");
+    lv_obj_set_style_text_color(staHdr, lv_color_hex(0x6FB4FF), 0);
+    lv_obj_set_pos(staHdr, 4, y + 4);
+    y += 26;
+
+    // Easy path: scan nearby networks + pick + enter password on a full-screen
+    // overlay (keyboard works there). The manual fields below stay as a fallback.
+    lv_obj_t *scanOpenBtn = lv_button_create(categoryPanels[3]);
+    lv_obj_set_pos(scanOpenBtn, 4, y);
+    lv_obj_set_size(scanOpenBtn, lv_obj_get_width(categoryPanels[3]) - 8, 34);
+    lv_obj_set_style_bg_color(scanOpenBtn, lv_color_hex(0x2E5D8A), 0);
+    lv_obj_add_event_cb(scanOpenBtn, onWifiScanOpen, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *scanOpenLbl = lv_label_create(scanOpenBtn);
+    lv_label_set_text(scanOpenLbl, "Tim & ket noi WiFi");
+    lv_obj_center(scanOpenLbl);
+    y += 42;
+
+    lv_obj_t *staSsidLbl = lv_label_create(categoryPanels[3]);
+    lv_label_set_text(staSsidLbl, "Ten mang");
+    lv_obj_set_style_text_color(staSsidLbl, lv_color_hex(0xCCD6E0), 0);
+    staSsidTa = lv_textarea_create(categoryPanels[3]);
+    lv_textarea_set_one_line(staSsidTa, true);
+    lv_textarea_set_max_length(staSsidTa, sizeof(cfg.staSsid) - 1);
+    lv_textarea_set_text(staSsidTa, cfg.staSsid);
+    lv_textarea_set_placeholder_text(staSsidTa, "(de trong = tat)");
+    if (wifiTabNarrow) {
+        lv_obj_set_pos(staSsidLbl, 4, y);
+        lv_obj_set_pos(staSsidTa, 4, y + 18);
+        lv_obj_set_size(staSsidTa, lv_obj_get_width(categoryPanels[3]) - 8, 28);
+        y += 50;
+    } else {
+        lv_obj_set_pos(staSsidLbl, 4, y + 6);
+        lv_obj_set_pos(staSsidTa, 140, y);
+        lv_obj_set_size(staSsidTa, 220, 28);
+        y += 34;
+    }
+    lv_obj_add_event_cb(staSsidTa, onWifiTaClicked, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *staPassLbl = lv_label_create(categoryPanels[3]);
+    lv_label_set_text(staPassLbl, "Mat khau");
+    lv_obj_set_style_text_color(staPassLbl, lv_color_hex(0xCCD6E0), 0);
+    staPasswordTa = lv_textarea_create(categoryPanels[3]);
+    lv_textarea_set_one_line(staPasswordTa, true);
+    lv_textarea_set_password_mode(staPasswordTa, true);
+    lv_textarea_set_max_length(staPasswordTa, sizeof(cfg.staPassword) - 1);
+    lv_textarea_set_placeholder_text(staPasswordTa, "(unchanged)");
+    if (wifiTabNarrow) {
+        lv_obj_set_pos(staPassLbl, 4, y);
+        lv_obj_set_pos(staPasswordTa, 4, y + 18);
+        lv_obj_set_size(staPasswordTa, lv_obj_get_width(categoryPanels[3]) - 8, 28);
+        y += 50;
+    } else {
+        lv_obj_set_pos(staPassLbl, 4, y + 6);
+        lv_obj_set_pos(staPasswordTa, 140, y);
+        lv_obj_set_size(staPasswordTa, 220, 28);
+        y += 34;
+    }
+    lv_obj_add_event_cb(staPasswordTa, onWifiTaClicked, LV_EVENT_CLICKED, NULL);
+
+    staStatusVal = addWideReadonlyRow(categoryPanels[3], y, "Internet");
+
+    // --- Online data update section ---
+    lv_obj_t *duHdr = lv_label_create(categoryPanels[3]);
+    lv_label_set_text(duHdr, "Cap nhat du lieu ban do");
+    lv_obj_set_style_text_color(duHdr, lv_color_hex(0x6FB4FF), 0);
+    lv_obj_set_pos(duHdr, 4, y + 4);
+    y += 26;
+
+    // Online data update (2026-09-25): pulls new map/warning data from GitHub
+    // (cfg.dataUpdateUrl) over the internet. Needs WiFi station connected.
+    lv_obj_t *duBtn = lv_button_create(categoryPanels[3]);
+    lv_obj_set_pos(duBtn, 0, y);
+    lv_obj_set_size(duBtn, lv_obj_get_width(categoryPanels[3]) - 8, 34);
+    lv_obj_set_style_bg_color(duBtn, lv_color_hex(0x2E5D8A), 0);
+    lv_obj_set_ext_click_area(duBtn, 8);
+    lv_obj_add_event_cb(duBtn, onDataUpdateBtnClicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *duLbl = lv_label_create(duBtn);
+    lv_label_set_text(duLbl, "Cap nhat du lieu online");
+    lv_obj_center(duLbl);
+    y += 42;
+    dataUpdateStatusVal = addWideReadonlyRow(categoryPanels[3], y, "Update");
 
     // NOT called eagerly here: buildSettingsScreen() runs before
     // sharedStateInit() in main_ui_demo.cpp's setup(), so
@@ -1094,6 +1384,9 @@ void buildSettingsScreen() {
     lv_obj_add_flag(wifiKeyboard, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(wifiKeyboard, onWifiKbReadyOrCancel, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(wifiKeyboard, onWifiKbReadyOrCancel, LV_EVENT_CANCEL, NULL);
+
+    buildWifiScanOverlay(settingsScreen); // full-screen "WiFi setup" (scan + password) — see its own comment
+    lv_obj_move_foreground(wifiKeyboard); // keep the keyboard above the overlay when both show
 
     buildConfirmOverlay(settingsScreen); // created last so it covers everything (and now the keyboard too)
     buildRestartConfirmOverlay(settingsScreen);

@@ -26,6 +26,12 @@ struct AppConfig {
     // switch itself (still a plain on/off).
     bool audioEnabled = true;
 
+    // Speaker volume 0-100% (audio/AudioPlayer.cpp audioSetVolume). Defaults to
+    // 100 = loudest the NS4168 + full-scale digital path allow (raised from the
+    // old hard-coded 80% default 2026-09-24). Applied in applyConfig(),
+    // adjustable in Settings > Display and web /config.
+    float audioVolume = 100;
+
     // Real GNSS calibration (gnss/GNSS.cpp reads these directly every tick —
     // cross-task read without a lock is safe here: a single float/bool field
     // has no torn/garbage intermediate value to race on). spec section
@@ -88,6 +94,27 @@ struct AppConfig {
     char wifiSsid[32] = "VietHUD";
     char wifiPassword[64] = "12345678"; // WPA2 needs >=8 chars — see WebPortal.cpp's applyWifiState() fallback
 
+    // Optional STATION credentials (net/WebPortal.cpp, added 2026-09-25): when
+    // staSsid is non-empty the device ALSO joins this network (AP+STA mode) to
+    // get internet — used for NTP time sync (accurate clock without waiting for
+    // a GPS fix), and a base for future online updates. Empty staSsid = AP-only,
+    // as before. Editable in web /config. Never auto-enables anything on its own.
+    char staSsid[32] = "";
+    char staPassword[64] = "";
+
+    // Base URL the online data updater fetches from (net/DataUpdater.cpp, added
+    // 2026-09-25). Points at the Raspberry Pi's public endpoint that serves the
+    // map/warning data + manifest.txt (Pi bridges Google Drive via rclone).
+    // e.g. GitHub raw CDN. Must end with "/". Editable in web /config and
+    // Settings > WiFi. Default = the project's public GitHub release path so OTA
+    // works out of the box (GitHub raw 301/302s to Fastly — DataUpdater follows
+    // redirects). Empty = updater disabled.
+    char dataUpdateUrl[128] = "https://raw.githubusercontent.com/911273/VietHUD/main/speedmap/";
+    // Auto-off the WiFi AP after this many minutes with NO client connected
+    // (0 = never). Saves power/heat/exposure on a windscreen device left with
+    // WiFi on. web /config + Settings; see WebPortal.cpp webTaskFn().
+    float wifiAutoOffMin = 10;
+
     // Display settings (user-requested 2026-09-15). Both are floats used as
     // small enums — no dropdown widget exists in Settings.cpp, only sliders.
     //
@@ -118,7 +145,10 @@ struct AppConfig {
     // fallback if the raster tiles don't load. With showVectorRoads this gives
     // the JPEG-vs-vector choice: both on = raster + roads; raster off = vector
     // only; vector off = raster only.
-    bool showRasterMap = true;
+    // Default flipped to OFF 2026-09-25: the project moved to a VECTOR-ONLY map
+    // (the 448MB maptiles.bin is no longer shipped/updated online — vector roads
+    // + street names + all warnings come from the ~8MB core data instead).
+    bool showRasterMap = false;
     // Heading-up map rotation (2026-09-24). true = the whole map rotates so the
     // travel direction is always at 12 o'clock; false = north-up (map fixed,
     // north up) — the simpler, proven mode, and a fallback if rotation
@@ -148,6 +178,8 @@ inline void clampConfig(AppConfig &c) {
     c.gnssSpeedCalibrationPct = constrain(c.gnssSpeedCalibrationPct, -15.0f, 15.0f);
     c.overspeedOffsetKmh = constrain(c.overspeedOffsetKmh, 0.0f, 10.0f);
     c.defaultLimitKmh = constrain(c.defaultLimitKmh, 0.0f, 120.0f);
+    c.audioVolume = constrain(c.audioVolume, 0.0f, 100.0f);
+    c.wifiAutoOffMin = constrain(c.wifiAutoOffMin, 0.0f, 120.0f);
     c.aheadLimitWarnDistM = constrain(c.aheadLimitWarnDistM, 50.0f, 100.0f);
     c.cameraWarnDistM = constrain(c.cameraWarnDistM, 50.0f, 100.0f);
     c.screenRotation = constrain(c.screenRotation, 0.0f, 3.0f);
@@ -173,6 +205,8 @@ inline void sanitizeConfig(AppConfig &c) {
     if (!isfinite(c.gnssSpeedCalibrationPct)) c.gnssSpeedCalibrationPct = d.gnssSpeedCalibrationPct;
     if (!isfinite(c.overspeedOffsetKmh)) c.overspeedOffsetKmh = d.overspeedOffsetKmh;
     if (!isfinite(c.defaultLimitKmh)) c.defaultLimitKmh = d.defaultLimitKmh;
+    if (!isfinite(c.audioVolume)) c.audioVolume = d.audioVolume;
+    if (!isfinite(c.wifiAutoOffMin)) c.wifiAutoOffMin = d.wifiAutoOffMin;
     if (!isfinite(c.aheadLimitWarnDistM)) c.aheadLimitWarnDistM = d.aheadLimitWarnDistM;
     if (!isfinite(c.cameraWarnDistM)) c.cameraWarnDistM = d.cameraWarnDistM;
     if (!isfinite(c.screenRotation)) c.screenRotation = d.screenRotation;

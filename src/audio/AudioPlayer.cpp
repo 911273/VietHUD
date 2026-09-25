@@ -19,6 +19,13 @@
 #define I2S_LRCK_PIN    2
 #define I2S_DOUT_PIN    41
 
+// Extra digital gain on the decoded VOICE stream, on top of the 0-100% volume.
+// The spoken clips are mastered well below full scale, so at 100% volume they
+// were quiet with plenty of headroom left (user report 2026-09-24: "100% still
+// small, no distortion"). Pushed to 2.0x. If any clip ever sounds harsh/clipped
+// ("rè"), lower this; tones are already at full-scale and unaffected by it.
+#define VOICE_GAIN_BOOST 2.0f
+
 static uint8_t s_volume = 80;
 static bool s_initialized = false;
 // Serializes access to the single I2S_NUM_0 port between the tone generator
@@ -39,8 +46,11 @@ static SemaphoreHandle_t s_i2sMutex = NULL;
 // pressure). Now the UI just enqueues a command and returns immediately.
 #define VOICE_DIR "/speedmap/sounds/vi/"
 #define VOICE_FILENAME_MAX 48
-#define AUDIO_QUEUE_LEN 12
-enum : uint8_t { CMD_VOICE = 0, CMD_TONE_CAMERA, CMD_TONE_OVERSPEED, CMD_TONE_SIGN, CMD_TONE_BEEP };
+#define AUDIO_QUEUE_LEN 20 // 2026-09-24: 12 -> 20, headroom for the audio self-test burst (audioSelfTest)
+enum : uint8_t {
+    CMD_VOICE = 0, CMD_TONE_CAMERA, CMD_TONE_OVERSPEED, CMD_TONE_SIGN, CMD_TONE_BEEP, CMD_TONE_STARTUP,
+    CMD_TONE_GPSREADY, CMD_TONE_GPSLOST
+};
 struct AudioCmd {
     uint8_t kind;
     char file[VOICE_FILENAME_MAX]; // CMD_VOICE: mp3 name; CMD_TONE_BEEP: file[0]=count
@@ -171,6 +181,31 @@ static void toneSign() { audioPlayTone(660, 100); vTaskDelay(pdMS_TO_TICKS(30));
 static void toneBeep(int n) {
     for (int i = 0; i < n; i++) { audioPlayTone(1000, 80); if (i + 1 < n) vTaskDelay(pdMS_TO_TICKS(50)); }
 }
+// Startup jingle (2026-09-24): a cheerful power-on melody — an ascending
+// C-major arpeggio (C5-E5-G5-C6) with a short lift at the end. ~1s, plays on
+// the audio task during the boot splash. Pure tones, so it works even before
+// the SD card's voice files are available (or if none are installed).
+static void toneStartup() {
+    static const struct { uint16_t freq, durMs, gapMs; } kJingle[] = {
+        {523, 110, 25}, {659, 110, 25}, {784, 110, 25}, {1047, 160, 45}, {880, 90, 20}, {1047, 240, 0}};
+    for (const auto &n : kJingle) {
+        audioPlayTone(n.freq, n.durMs);
+        if (n.gapMs) vTaskDelay(pdMS_TO_TICKS(n.gapMs));
+    }
+}
+// GPS ready (first fix): a short, friendly ascending 3-note motif — "device is
+// ready". Deliberately different from the alert chimes (which are 2 notes).
+static void toneGpsReady() {
+    audioPlayTone(784, 90); vTaskDelay(pdMS_TO_TICKS(30));
+    audioPlayTone(1047, 90); vTaskDelay(pdMS_TO_TICKS(30));
+    audioPlayTone(1319, 160);
+}
+// GPS lost while driving: a descending low double-note — reads as "something's
+// wrong / signal dropped", distinct from the cheerful ready motif.
+static void toneGpsLost() {
+    audioPlayTone(660, 150); vTaskDelay(pdMS_TO_TICKS(40));
+    audioPlayTone(440, 260);
+}
 
 static void enqueueCmd(uint8_t kind, const char *file) {
     if (!cfg.audioEnabled || !s_audioQueue) return;
@@ -186,6 +221,28 @@ void audioPlayCameraAlert() { enqueueCmd(CMD_TONE_CAMERA, nullptr); }
 void audioPlayOverspeedAlert() { enqueueCmd(CMD_TONE_OVERSPEED, nullptr); }
 void audioPlaySignNotice() { enqueueCmd(CMD_TONE_SIGN, nullptr); }
 void audioPlayBeep(uint8_t count) { char b[2] = {(char)(count ? count : 1), 0}; enqueueCmd(CMD_TONE_BEEP, b); }
+void audioPlayStartupJingle() { enqueueCmd(CMD_TONE_STARTUP, nullptr); }
+void audioPlayGpsReady() { enqueueCmd(CMD_TONE_GPSREADY, nullptr); }
+void audioPlayGpsLost() { enqueueCmd(CMD_TONE_GPSLOST, nullptr); }
+
+// Diagnostic: enqueue every alert (tone chimes + each Vietnamese voice clip) so
+// they can be heard/verified in one pass. Each voice logs "[audio] playing
+// voice: ..." (or "file not found") as the task reaches it. Serial 'a' triggers
+// it; the audio task drains the burst over ~20s (queue is 20 deep).
+void audioSelfTest() {
+    Serial.println("[audio] SELF-TEST: jingle + all chimes + all voice clips");
+    audioPlayStartupJingle();
+    enqueueCmd(CMD_TONE_CAMERA, nullptr);
+    enqueueCmd(CMD_TONE_OVERSPEED, nullptr);
+    enqueueCmd(CMD_TONE_SIGN, nullptr);
+    enqueueCmd(CMD_TONE_GPSREADY, nullptr);
+    enqueueCmd(CMD_TONE_GPSLOST, nullptr);
+    static const char *kAll[] = {
+        "welcome/voice.mp3", "speedcamera.mp3", "slowdown/voice.mp3", "tocdogioihan.mp3",
+        "batdaukhudancu.mp3", "hetkhudongdancu.mp3", "camvuot.mp3", "hetcamvuot.mp3",
+        "tramthuphi.mp3", "chuydentinhieugiaothong.mp3", "sapdenbienbao.mp3", "speed/50.mp3"};
+    for (auto f : kAll) audioQueueVoice(f);
+}
 
 void audioUpdate() {
     // Optional periodic hook for streaming audio
@@ -211,10 +268,14 @@ static void audioTaskFn(void *) {
         if (c.kind == CMD_TONE_OVERSPEED) { toneOverspeed(); continue; }
         if (c.kind == CMD_TONE_SIGN) { toneSign(); continue; }
         if (c.kind == CMD_TONE_BEEP) { toneBeep(c.file[0] ? (uint8_t)c.file[0] : 1); continue; }
+        if (c.kind == CMD_TONE_STARTUP) { toneStartup(); continue; }
+        if (c.kind == CMD_TONE_GPSREADY) { toneGpsReady(); continue; }
+        if (c.kind == CMD_TONE_GPSLOST) { toneGpsLost(); continue; }
 
         // CMD_VOICE
         char path[VOICE_FILENAME_MAX + sizeof(VOICE_DIR)];
         snprintf(path, sizeof(path), VOICE_DIR "%s", c.file);
+        Serial.printf("[audio] playing voice: %s\n", path);
 
         if (s_i2sMutex) xSemaphoreTake(s_i2sMutex, portMAX_DELAY);
         i2s_driver_uninstall(I2S_PORT);
@@ -224,7 +285,7 @@ static void audioTaskFn(void *) {
         if (source.isOpen()) {
             AudioOutputI2S out;
             out.SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
-            out.SetGain((float)s_volume / 100.0f);
+            out.SetGain((float)s_volume / 100.0f * VOICE_GAIN_BOOST);
             AudioGeneratorMP3 mp3;
             if (mp3.begin(&source, &out)) {
                 while (mp3.isRunning()) {

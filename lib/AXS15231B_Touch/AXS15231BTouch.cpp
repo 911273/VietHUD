@@ -153,6 +153,28 @@ bool AXS15231BTouch::getPoint(uint16_t *x, uint16_t *y) {
             return false;
         }
         if (_repeatCount < 0xFFFF) _repeatCount++;
+        // FAST RELEASE (2026-09-24 V2): this controller emits a FIXED
+        // out-of-range garbage code (e.g. 2923,2923) on finger-up instead of
+        // (0,0). Without this, that garbage repeats and the out-of-range
+        // "hold last point" path below reports a PHANTOM held touch at the last
+        // position for the whole ~500ms wedge window — so every tap felt like a
+        // ~500ms sticky press (and could trip the 1s hold-for-Settings gesture).
+        // A repeated OUT-OF-RANGE value is never a real held touch, so release
+        // after just a few polls (~60ms). The 50-poll resetBus() below stays for
+        // an IN-RANGE wedge (a real coordinate the sensor gets stuck on).
+        {
+            const uint16_t m = 60;
+            bool repOutOfRange = (rawX + m < _xRealMin || rawX > _xRealMax + m ||
+                                  rawY + m < _yRealMin || rawY > _yRealMax + m);
+            if (repOutOfRange && _repeatCount >= 6) { // ~60ms of persistent garbage = finger lifted
+                _hasLastPoint = false;
+                _confirmedStuck = false; // a normal release, not a wedge
+                _repeatCount = 0;
+                _lastRawX = 0;
+                _lastRawY = 0; // clear so a next touch on the same garbage code re-detects fresh
+                return false;
+            }
+        }
         if (_repeatCount == 50) { // ~500ms at the 10ms indev poll period
             Serial.printf("[touch] stuck: rawX=%u rawY=%u repeated %u times -> resetBus()\n", rawX, rawY,
                           _repeatCount);

@@ -242,18 +242,42 @@ void mapRendererComputeFromSegments(const GnssSnapshot &gnss, const RoadSegment 
     mapViewPublish(v);
 }
 
-// Throttle gate: recalculate only on movement >= 3m or turn >= 3 deg
+// Throttle gate: recalculate only on movement >= 3m or turn >= 3 deg.
+// kHeadingMinSpeedKmh (2026-09-24 V2): below this speed u-blox heading is pure
+// noise — at a standstill it swings randomly, which used to fire the turn gate
+// every tick, forcing a full-screen map redraw + full 33ms QSPI flush (and a
+// visibly spinning map) while the car sat still. Ignore heading below it so a
+// stopped/crawling car keeps a static map; the partial flush then makes those
+// frames nearly free. Position movement still updates the map normally.
 static const float kMinMoveM = 3.0f;
 static const float kMinTurnDeg = 3.0f;
+static const float kHeadingMinSpeedKmh = 8.0f;
+// Near a standstill, GPS position also wanders (multipath) by several metres,
+// which kept re-firing the move gate and redrawing the whole map (full 33ms
+// flush) while the car was parked. Below kStopSpeedKmh require a much larger
+// jump before redrawing, so a stopped car holds a static map. A genuine
+// reposition (tunnel exit, GPS re-lock) still exceeds kStopMoveM and updates.
+static const float kStopSpeedKmh = 3.0f;
+static const float kStopMoveM = 12.0f;
 
 static bool gHaveLast = false, gHaveLastHeading = false;
 static float gLastLat = 0, gLastLon = 0, gLastHeading = 0;
+static bool gNoFixHandled = false; // latch: no-fix state already drawn once (see mapRendererUpdate)
 
 void mapRendererUpdate(const GnssSnapshot &gnss) {
     if (!gnss.fix) {
-        mapRendererComputeFromSegments(gnss, nullptr, 0);
+        // Recompute/republish only ONCE when the fix is first lost, not every
+        // tick (2026-09-24 V2). The old code bumped the map generation on every
+        // no-fix call, so with no GPS the whole map redrew + full-flushed every
+        // frame (wasted power on the desk, and thrash if GPS drops mid-drive).
+        // A regained fix falls through to the normal moved-gate below.
+        if (!gNoFixHandled) {
+            gNoFixHandled = true;
+            mapRendererComputeFromSegments(gnss, nullptr, 0);
+        }
         return;
     }
+    gNoFixHandled = false; // valid fix: re-arm so the next loss redraws once more
 
     bool moved = !gHaveLast;
     if (!moved) {
@@ -261,11 +285,12 @@ void mapRendererUpdate(const GnssSnapshot &gnss) {
         float dy = (gnss.latDeg - gLastLat) * 110540.0f;
         float distM = sqrtf(dx * dx + dy * dy);
         float headErr = 0;
-        if (gnss.headingValid && gHaveLastHeading) {
+        if (gnss.headingValid && gHaveLastHeading && gnss.egoSpeedKmh >= kHeadingMinSpeedKmh) {
             float d = fmodf(fabsf(gnss.headingDeg - gLastHeading), 360.0f);
             headErr = d > 180.0f ? 360.0f - d : d;
         }
-        moved = distM >= kMinMoveM || headErr >= kMinTurnDeg;
+        float moveThresh = (gnss.egoSpeedKmh < kStopSpeedKmh) ? kStopMoveM : kMinMoveM;
+        moved = distM >= moveThresh || headErr >= kMinTurnDeg;
     }
     if (!moved) return;
 
@@ -287,6 +312,7 @@ void mapRendererUpdate(const GnssSnapshot &gnss) {
 void mapRendererReset() {
     gHaveLast = false;
     gHaveLastHeading = false;
+    gNoFixHandled = false;
     MapViewSnapshot blank;
     mapViewPublish(blank);
 }

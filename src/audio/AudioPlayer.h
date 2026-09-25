@@ -20,6 +20,16 @@ void audioPlayCameraAlert();
 void audioPlayOverspeedAlert();
 void audioPlaySignNotice();
 void audioPlayBeep(uint8_t count);
+// Cheerful ~1s power-on melody (ascending C-major arpeggio). Plays on the audio
+// task during the boot splash. Pure tones — works with no SD voice files.
+void audioPlayStartupJingle();
+// GPS status chimes: a friendly ascending motif when the first fix is acquired
+// ("ready"), and a descending low tone when the fix is lost while driving.
+void audioPlayGpsReady();
+void audioPlayGpsLost();
+// Diagnostic: play every alert (all chimes + all voice clips) once, in sequence,
+// logging each. Triggered by serial 'a'. For bench verification of the speaker.
+void audioSelfTest();
 void audioUpdate();
 
 // Enqueues one Vietnamese voice clip for sequential playback on its own

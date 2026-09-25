@@ -227,6 +227,12 @@ struct MapViewSnapshot {
 // and map/MapRenderer.cpp publish; the UI task only ever reads a copy,
 // never a pointer into live data, so a render can never race a mid-update
 // struct.
+// Latest ESP32-S3 die temperature (°C), published by ui/Dashboard.cpp's thermal
+// block every ~2s and read by net/WebPortal.cpp for the web telemetry. A single
+// float write/read is atomic on this MCU, so no mutex is needed. 0 until the
+// first reading.
+extern volatile float g_boardTempC;
+
 void sharedStateInit();
 
 void gnssPublish(const GnssSnapshot &s);

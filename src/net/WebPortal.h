@@ -69,3 +69,27 @@ bool webPortalIsEnabled();
 // "callers get a plain data copy, not the live object" reasoning
 // core/SharedState.h's snapshot structs are built on).
 void webPortalStatusText(char *buf, size_t cap);
+
+// STA (internet/station) connection info line, decoded for display on the
+// on-screen Settings WiFi tab and the web. Shows the joined network + IP + RSSI
+// + NTP when connected, or a plain-language reason when not (incl. the iPhone
+// 5 GHz-hotspot case). Added 2026-09-25.
+void webPortalStaInfo(char *buf, size_t cap);
+
+// --- WiFi scan + STA reconnect (2026-09-25), for the on-screen "WiFi setup"
+// overlay. All WiFi.* calls stay on the web task, so the UI (Core 1) only sets
+// requests / reads cached results — never touches the radio directly. ---
+void webPortalStartScan();          // request an async scan of nearby 2.4GHz APs
+int  webPortalScanState();          // -1 idle, -2 scanning, >=0 = number of results ready
+// Reads result i (0..state-1): fills ssid, rssi (dBm), locked (needs password). Returns 1 if valid.
+int  webPortalScanResult(int i, char *ssid, size_t cap, int *rssi, bool *locked);
+// Apply new STA creds (already written into cfg by the caller): reconnect the
+// station with them (turns WiFi on if it was off). Runs on the web task.
+void webPortalReconnectSta();
+
+// NTP-synced local time (feature F, 2026-09-25). Returns true and fills
+// hour/minute (local, VN UTC+7) once the device has joined a station network
+// (AppConfig staSsid) and NTP has delivered a plausible time — lets the
+// Dashboard clock show the right time without waiting for a GPS fix. Returns
+// false when not yet synced, so the caller keeps using GPS time as before.
+bool webPortalLocalTime(int *hour, int *minute);
