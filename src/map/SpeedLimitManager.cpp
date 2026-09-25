@@ -312,17 +312,62 @@ bool speedLimitManagerGetNearbySegments(float lat, float lon, float radiusM, Roa
     int32_t latCell = (int32_t)((lat + 90.0f) / gMetadata.tileSizeDeg);
     int32_t lonCell = (int32_t)((lon + 180.0f) / gMetadata.tileSizeDeg);
 
+    // BEST-N selection (2026-09-25). This used to keep the FIRST maxOut segments
+    // in tile-scan order and stop. That was fine on the old sparse regional data
+    // (a 3x3 tile window rarely held more than maxOut=180 segments), but on the
+    // full-VN dataset a dense-city window holds far more, and "first 180 in scan
+    // order" would drop major roads — and even the road the car is on — in favour
+    // of whichever alleys happened to sort first. So instead we score EVERY
+    // candidate in range and keep the best maxOut. This only feeds the visual map
+    // (MapRenderer); the speed/warning matcher scans all segments directly, so it
+    // is unaffected. Lower score = better:
+    //   * the current road (seg.id == currentRoadId) is forced in (score -1e6),
+    //   * then nearest-first (distance in metres),
+    //   * with a small road-class penalty so, when the window is crowded and the
+    //     nearest-N would otherwise be all alleys, major roads still make the cut.
+    auto classPenaltyM = [](uint8_t roadClass) -> float {
+        switch (roadClass) {
+            case 1: return 0.0f;    // motorway/trunk/primary
+            case 2: return 15.0f;   // secondary/tertiary
+            case 3: return 40.0f;   // residential/service/alley
+            default: return 60.0f;  // unclassified/other
+        }
+    };
+    // Bounded top-N by score, kept in out[] with a parallel score[] scratch.
+    // maxOut is kMaxLines (180) from the map caller; cap the scratch defensively.
+    static const int kSelCap = 200;
+    if (maxOut > kSelCap) maxOut = kSelCap;
+    float score[kSelCap];
     int n = 0;
-    for (int dLat = -span; dLat <= span && n < maxOut; dLat++) {
-        for (int dLon = -span; dLon <= span && n < maxOut; dLon++) {
+    int worstIdx = -1;      // index of the current worst (largest score) kept, once full
+    float worstScore = -1e30f;
+    for (int dLat = -span; dLat <= span; dLat++) {
+        for (int dLon = -span; dLon <= span; dLon++) {
             const CachedTile *tile = getOrLoadTile(packTile(latCell + dLat, lonCell + dLon));
             if (!tile) continue; // most candidate tiles legitimately don't exist in the database — not an error
-            for (int s = 0; s < tile->segCount && n < maxOut; s++) {
+            for (int s = 0; s < tile->segCount; s++) {
                 const RoadSegment &seg = tile->segments[s];
                 float startLat = seg.startLatE7 / 1e7f, startLon = seg.startLonE7 / 1e7f;
                 float endLat = seg.endLatE7 / 1e7f, endLon = seg.endLonE7 / 1e7f;
-                if (pointSegmentDistanceM(lat, lon, startLat, startLon, endLat, endLon) > radiusM) continue;
-                out[n++] = seg;
+                float d = pointSegmentDistanceM(lat, lon, startLat, startLon, endLat, endLon);
+                if (d > radiusM) continue;
+                float sc = (currentRoadId != 0 && seg.id == currentRoadId) ? -1e6f
+                                                                           : d + classPenaltyM(seg.roadClass);
+                if (n < maxOut) {
+                    out[n] = seg;
+                    score[n] = sc;
+                    n++;
+                    if (n == maxOut) { // now full — find the worst kept
+                        worstIdx = 0; worstScore = score[0];
+                        for (int k = 1; k < n; k++) if (score[k] > worstScore) { worstScore = score[k]; worstIdx = k; }
+                    }
+                } else if (sc < worstScore) {
+                    out[worstIdx] = seg;
+                    score[worstIdx] = sc;
+                    // recompute the worst kept
+                    worstIdx = 0; worstScore = score[0];
+                    for (int k = 1; k < n; k++) if (score[k] > worstScore) { worstScore = score[k]; worstIdx = k; }
+                }
             }
         }
     }
@@ -373,8 +418,12 @@ static int routeSegmentProvider(int32_t nodeLatE7, int32_t nodeLonE7, RoadSegmen
             if (!tile) continue;
             for (int s = 0; s < tile->segCount && n < maxOut; s++) {
                 const RoadSegment &c = tile->segments[s];
-                bool startsHere = (c.startLatE7 == nodeLatE7 && c.startLonE7 == nodeLonE7);
-                bool endsHere = (c.endLatE7 == nodeLatE7 && c.endLonE7 == nodeLonE7);
+                // Tolerant node match (see segNodesCoincide in SpeedMapFormat.h):
+                // returns candidates incident to the node even when tile-clipped
+                // vector data leaves border endpoints off by a sub-meter amount,
+                // so RoutePredictor can stitch across tile boundaries.
+                bool startsHere = segNodesCoincide(c.startLatE7, c.startLonE7, nodeLatE7, nodeLonE7);
+                bool endsHere = segNodesCoincide(c.endLatE7, c.endLonE7, nodeLatE7, nodeLonE7);
                 if (!startsHere && !endsHere) continue;
                 bool dup = false;
                 for (int k = 0; k < n; k++) {

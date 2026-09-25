@@ -114,8 +114,11 @@ int Route::build(const RoadSegment &startSeg, float startHeadingDeg, float ahead
                 }
                 if (seen) continue;
 
-                bool startsHere = (seg.startLatE7 == nodeLat && seg.startLonE7 == nodeLon);
-                bool endsHere = (seg.endLatE7 == nodeLat && seg.endLonE7 == nodeLon);
+                // Tolerant node match (not exact ==) so a route stitches across
+                // tile boundaries when the map is built from tile-clipped vector
+                // data — see segNodesCoincide() in SpeedMapFormat.h.
+                bool startsHere = segNodesCoincide(seg.startLatE7, seg.startLonE7, nodeLat, nodeLon);
+                bool endsHere = segNodesCoincide(seg.endLatE7, seg.endLonE7, nodeLat, nodeLon);
                 if (!startsHere && !endsHere) continue;
 
                 // Determine the orientation we'd travel this candidate, and
@@ -139,9 +142,10 @@ int Route::build(const RoadSegment &startSeg, float startHeadingDeg, float ahead
                     cHeading = fmodf((float)seg.headingDeg + 180.0f, 360.0f);
                 }
                 // The chosen orientation must actually leave from the shared
-                // node (cStart == node). If a one-way forces an orientation
-                // that doesn't, this candidate is unusable here.
-                if (cStartLat != nodeLat || cStartLon != nodeLon) continue;
+                // node (cStart ~= node). If a one-way forces an orientation
+                // that doesn't, this candidate is unusable here. Tolerant match,
+                // same reason as startsHere/endsHere above.
+                if (!segNodesCoincide(cStartLat, cStartLon, nodeLat, nodeLon)) continue;
 
                 float turn = angDiff(incomingHeading, cHeading);
                 if (turn < bestTurn) {

@@ -62,7 +62,7 @@ bool sdMgrGetSigns(const TrafficSignPoint **out, int *outCount);
 const char *sdMgrGetSegmentRoadName(uint32_t segId);
 
 // Returns the street name for a given nameId (1-based index)
-const char *sdMgrGetRoadName(uint16_t nameId);
+const char *sdMgrGetRoadName(uint32_t nameId);
 
 // Reads one tile's segments out of the single packed /speedmap/tiles.bin
 // blob (format V2, 2026-09-16 — see SpeedMapFormat.h's own history note on

@@ -87,11 +87,17 @@ static int cameraPointCount = 0;
 static TrafficSignPoint *trafficSigns = NULL;
 static int trafficSignCount = 0;
 
-// Road Names Database in PSRAM
-static uint16_t roadNameCount = 0;
+// Road Names Database in PSRAM. roadNameCount is uint32 (was uint16): the full-VN
+// dataset can exceed 65 535 unique street names (nationwide is already ~52 175),
+// so names.bin format v2 carries a 32-bit count + 32-bit per-segment name ids.
+// segNameWidth records how wide each seg_names.bin entry is (2 for legacy v1
+// cards, 4 for v2), so an old card still reads correctly. See the names.bin
+// loader for the exact v1/v2 header layouts.
+static uint32_t roadNameCount = 0;
 static uint32_t *roadNameOffsets = NULL;
 static char *roadNamePool = NULL;
 static size_t roadNamePoolSize = 0;
+static uint8_t segNameWidth = 2; // bytes per seg_names.bin entry: v1=2, v2=4
 
 bool sdMgrIsAvailable() { return mounted; }
 
@@ -348,18 +354,40 @@ bool sdMgrMount() {
     roadNameCount = 0;
     roadNamePoolSize = 0;
 
+    segNameWidth = 2;
     File nameFile = SD_MMC.open("/speedmap/names.bin");
     if (nameFile) {
         char magic[4];
-        uint16_t version = 0, count = 0;
-        uint32_t totalBytes = 0, reserved = 0;
+        uint16_t version = 0;
+        uint32_t count = 0, totalBytes = 0;
         if (nameFile.read((uint8_t *)magic, 4) == 4 && memcmp(magic, "VNNM", 4) == 0) {
             nameFile.read((uint8_t *)&version, 2);
-            nameFile.read((uint8_t *)&count, 2);
-            nameFile.read((uint8_t *)&totalBytes, 4);
-            nameFile.read((uint8_t *)&reserved, 4);
+            // Header layouts, both 16 bytes total after magic+version:
+            //   v1: count(u16) totalBytes(u32) reserved(u32)   — seg_names entries are u16
+            //   v2: count(u32) totalBytes(u32) reserved(u16)   — seg_names entries are u32
+            // v2 lifts the 65 535-name ceiling for the full-VN dataset. Old v1
+            // cards keep working unchanged.
+            if (version >= 2) {
+                uint16_t reserved16 = 0;
+                nameFile.read((uint8_t *)&count, 4);
+                nameFile.read((uint8_t *)&totalBytes, 4);
+                nameFile.read((uint8_t *)&reserved16, 2);
+                segNameWidth = 4;
+            } else {
+                uint16_t count16 = 0;
+                uint32_t reserved32 = 0;
+                nameFile.read((uint8_t *)&count16, 2);
+                nameFile.read((uint8_t *)&totalBytes, 4);
+                nameFile.read((uint8_t *)&reserved32, 4);
+                count = count16;
+                segNameWidth = 2;
+            }
 
-            if (count > 0 && totalBytes > 0 && count < 65535 && totalBytes < 2000000) {
+            // Sanity ceilings (raised for v2): a corrupt header must not trigger a
+            // wild allocation. Real full-VN data stays far below these; if it ever
+            // legitimately exceeds PSRAM the heap_caps_malloc NULL-check below
+            // fails gracefully (names simply don't load) rather than crashing.
+            if (count > 0 && totalBytes > 0 && count < 5000000u && totalBytes < 16000000u) {
                 roadNameOffsets = (uint32_t *)heap_caps_malloc(count * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
                 roadNamePool = (char *)heap_caps_malloc(totalBytes, MALLOC_CAP_SPIRAM);
                 if (roadNameOffsets && roadNamePool) {
@@ -376,8 +404,9 @@ bool sdMgrMount() {
                     roadNamePool[totalBytes - 1] = '\0';
                     roadNameCount = count;
                     roadNamePoolSize = totalBytes;
-                    Serial.printf("[sdmgr] names.bin: %d street names loaded (%u bytes string pool)\n",
-                                  roadNameCount, (unsigned int)roadNamePoolSize);
+                    Serial.printf("[sdmgr] names.bin v%u: %u street names loaded (%u bytes string pool, seg id width %uB)\n",
+                                  (unsigned)version, (unsigned)roadNameCount, (unsigned int)roadNamePoolSize,
+                                  (unsigned)segNameWidth);
                 } else {
                     if (roadNameOffsets) { heap_caps_free(roadNameOffsets); roadNameOffsets = NULL; }
                     if (roadNamePool) { heap_caps_free(roadNamePool); roadNamePool = NULL; }
@@ -736,7 +765,7 @@ bool sdMgrFindTileEntry(uint32_t tileId, TileIndexEntry *outEntry) {
     return found;
 }
 
-const char *sdMgrGetRoadName(uint16_t nameId) {
+const char *sdMgrGetRoadName(uint32_t nameId) {
     if (nameId == 0 || nameId > roadNameCount || !roadNameOffsets || !roadNamePool) {
         return "";
     }
@@ -747,6 +776,25 @@ const char *sdMgrGetRoadName(uint16_t nameId) {
     return "";
 }
 
+// Copy up to dstCap-1 bytes of a UTF-8 string, but never split a multi-byte
+// sequence: if the byte at the cut point is a UTF-8 continuation byte (10xxxxxx),
+// back up to the start of that character. Vietnamese letters are 2-3 UTF-8 bytes,
+// so a naive strncpy at a fixed byte length can leave a half character that
+// renders as a tofu/garbage glyph (or upsets LVGL's UTF-8 decoder). Always
+// NUL-terminates.
+static void utf8SafeCopy(char *dst, size_t dstCap, const char *src) {
+    if (dstCap == 0) return;
+    size_t max = dstCap - 1;
+    size_t len = 0;
+    while (src[len] != '\0' && len < max) len++;
+    if (src[len] != '\0') {
+        // We stopped at the cap, not the string end — don't cut mid-character.
+        while (len > 0 && ((unsigned char)src[len] & 0xC0) == 0x80) len--;
+    }
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
 const char *sdMgrGetSegmentRoadName(uint32_t segId) {
     static uint32_t sLastSegId = 0xFFFFFFFFu;
     static char sLastRoadName[64] = {0};
@@ -754,14 +802,17 @@ const char *sdMgrGetSegmentRoadName(uint32_t segId) {
     if (segId == 0) return "";
     if (segId == sLastSegId) return sLastRoadName;
 
-    uint16_t nameId = 0;
-    bool ok = sdMgrReadBytes("/speedmap/seg_names.bin", segId * sizeof(uint16_t), (uint8_t *)&nameId, sizeof(nameId));
+    // seg_names.bin is a headerless array indexed by segId; each entry is
+    // segNameWidth bytes (2 on legacy v1 cards, 4 on v2 — see the names.bin
+    // loader). Read exactly that width into a uint32 name id.
+    uint32_t nameId = 0;
+    bool ok = sdMgrReadBytes("/speedmap/seg_names.bin", (uint32_t)(segId * segNameWidth),
+                             (uint8_t *)&nameId, segNameWidth);
     if (ok && nameId > 0) {
         const char *name = sdMgrGetRoadName(nameId);
         if (name && name[0]) {
             sLastSegId = segId;
-            strncpy(sLastRoadName, name, sizeof(sLastRoadName) - 1);
-            sLastRoadName[sizeof(sLastRoadName) - 1] = '\0';
+            utf8SafeCopy(sLastRoadName, sizeof(sLastRoadName), name);
             return sLastRoadName;
         }
     }
