@@ -957,6 +957,8 @@ def main():
 
     # Nguồn 3: Dữ liệu thẻ nhớ / backup WYN gốc
     sd_bak_paths = [
+        os.path.join(input_dir, 'WYN_SpeedMap_Ready', 'speedmap', 'signs.bin'),
+        r'C:\Users\phamq\radar_car\tools\map_builder\output\speedmap\signs.bin',
         r'E:\speedmap\signs.bin.bak',
         r'E:\speedmap\signs.bin',
         os.path.join(input_dir, 'output_viethud', 'speedmap', 'signs.bin'),
