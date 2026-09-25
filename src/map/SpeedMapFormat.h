@@ -210,6 +210,26 @@ struct TrafficSignPoint {
 
 #pragma pack(pop)
 
+// Node-coincidence tolerance for chaining RoadSegments into a route
+// (map/RoutePredictor.cpp + map/SpeedLimitManager.cpp's routeSegmentProvider).
+// Two segment endpoints that represent the SAME junction node should compare
+// equal, but when the map is compiled from a tile-clipped vector source (e.g.
+// MBTiles, which cuts geometry at tile borders), the two sides of a border node
+// can differ by a sub-meter amount. Exact E7 equality would then fail to stitch
+// segments across tile boundaries and RoutePredictor's forward route would break
+// at every tile edge. So match within a small tolerance instead. 1 E7 latitude
+// unit is ~1.11 cm, so 180 E7 ~= 2 m — large enough to absorb clip rounding,
+// small enough never to merge two genuinely distinct road nodes (which are
+// metres apart). Longitude uses the same bound; at VN latitudes 1 E7 lon unit is
+// ~1.05 cm, so the effective lon tolerance is ~1.9 m, comparable. Added
+// 2026-09-25 ahead of the full-VN MBTiles-sourced dataset.
+#define SEG_NODE_MATCH_EPS_E7 180
+static inline bool segNodesCoincide(int32_t latA, int32_t lonA, int32_t latB, int32_t lonB) {
+    int32_t dLat = latA > latB ? latA - latB : latB - latA;
+    int32_t dLon = lonA > lonB ? lonA - lonB : lonB - lonA;
+    return dLat <= SEG_NODE_MATCH_EPS_E7 && dLon <= SEG_NODE_MATCH_EPS_E7;
+}
+
 // Tile grid: lat/lon are bucketed into tileSizeDeg x tileSizeDeg cells, ID
 // = a Cantor-pairing-style encode of the two cell indices so it fits one
 // uint32_t and is trivially reversible for logging. Shared math (both this
