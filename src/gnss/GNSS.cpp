@@ -277,7 +277,11 @@ static void gnssTaskFn(void *) {
         bool linkAlive = lastValidSentenceMs != 0 && (millis() - lastValidSentenceMs) < kLinkTimeoutMs;
 
         bool freshFix = gps.location.isValid() && gps.location.isUpdated();
-        if (freshFix) lastFixMs = millis();
+        static uint32_t sFixSeq = 0;
+        if (freshFix) {
+            lastFixMs = millis();
+            sFixSeq++;
+        }
         // GNSS considered "lost" if no fresh fix for this long — spec
         // section 23: never hold/assume a stale speed once lost, disable
         // the audio gate, show fault. Tunable from Settings > Sensors.
@@ -301,6 +305,8 @@ static void gnssTaskFn(void *) {
             snap.egoSpeedKmh = 0; // consumers must gate on .fix, never trust this while !fix
         }
         snap.satCount = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+        snap.hdop = gps.hdop.isValid() ? (float)gps.hdop.hdop() : 0.0f;
+        snap.fixSeq = sFixSeq;
 
         // Position, independent of time/date validity — map/SpeedLimitMap.cpp
         // (added 2026-09-15) needs lat/lon whenever there's a fix at all, not
@@ -316,6 +322,10 @@ static void gnssTaskFn(void *) {
         if (haveRecentFix && gps.location.isValid()) {
             snap.lonDeg = (float)gps.location.lng();
             snap.latDeg = (float)gps.location.lat();
+        }
+        if (haveRecentFix && gps.altitude.isValid()) {
+            snap.altitudeM = (float)gps.altitude.meters();
+            snap.altitudeValid = true;
         }
 
         // Course over ground (spec architecture note: "M10N xác định vị trí,

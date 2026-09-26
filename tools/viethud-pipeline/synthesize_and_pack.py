@@ -154,7 +154,7 @@ if osmium is not None:
             oneway = t.get("oneway") in ("yes", "true", "1")
             has_cond = "maxspeed:conditional" in t
             fwd, bwd, plain = t.get("maxspeed:forward"), t.get("maxspeed:backward"), t.get("maxspeed")
-            base_flags = F.SEGFLAG_HAS_CONDITIONAL if has_cond else 0
+            base_flags = (F.SEGFLAG_HAS_CONDITIONAL if has_cond else 0) | F.grade_flags(t)
 
             for i in range(len(coords) - 1):
                 a, b = coords[i], coords[i + 1]
