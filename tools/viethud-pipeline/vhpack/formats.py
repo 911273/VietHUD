@@ -42,6 +42,30 @@ NAME_HEADER_FMT = "<4sHIIH"    # magic, version=2, count(u32), poolBytes(u32), r
 DIR_BIDIRECTIONAL, DIR_FORWARD, DIR_BACKWARD, DIR_UNKNOWN = 0, 1, 2, 3
 SEGFLAG_HAS_CONDITIONAL = 0x01
 SEGFLAG_ONEWAY = 0x02
+
+# Grade separation (firmware src/map/TrackContinuity.h — elevated vs surface
+# road matching). Must match SEGFLAG_BRIDGE/TUNNEL/LINK in SpeedMapFormat.h.
+SEGFLAG_BRIDGE = 0x04  # bridge / viaduct / flyover (bridge=* other than "no", or layer >= 1)
+SEGFLAG_TUNNEL = 0x08  # tunnel / underpass (tunnel=* other than "no"/"building_passage", or layer <= -1)
+SEGFLAG_LINK = 0x10    # ramp / slip road (highway=*_link)
+
+
+def grade_flags(tags):
+    """SEGFLAG_BRIDGE/TUNNEL/LINK bits for an OSM way's tags."""
+    f = 0
+    try:
+        layer = int(str(tags.get("layer", "0")).split(";")[0].strip())
+    except ValueError:
+        layer = 0
+    bridge = tags.get("bridge")
+    tunnel = tags.get("tunnel")
+    if (bridge and bridge != "no") or layer >= 1:
+        f |= SEGFLAG_BRIDGE
+    if (tunnel and tunnel not in ("no", "building_passage")) or layer <= -1:
+        f |= SEGFLAG_TUNNEL
+    if str(tags.get("highway", "")).endswith("_link"):
+        f |= SEGFLAG_LINK
+    return f
 (SPEED_SOURCE_UNKNOWN, SPEED_SOURCE_OSM_MAXSPEED, SPEED_SOURCE_OSM_FORWARD,
  SPEED_SOURCE_OSM_BACKWARD, SPEED_SOURCE_DEFAULT, SPEED_SOURCE_CONDITIONAL) = range(6)
 

@@ -1,6 +1,7 @@
 #include "SpeedLimitManager.h"
 #include "SdCardManager.h"
-#include "RoutePredictor.h" // Route — the forward-route engine (SD-free, unit-testable); see that header for why it's separate
+#include "RoutePredictor.h"
+#include "TrackContinuity.h" // HMM layer/continuity tracking (elevated vs surface roads) // Route — the forward-route engine (SD-free, unit-testable); see that header for why it's separate
 #include "core/AppConfig.h" // cfg.aheadLimitWarnDistM / cfg.cameraWarnDistM — user-tunable, see that file's own comment
 #include "core/SharedState.h"
 #include "demo/DemoMode.h" // demoModeIsEnabled() — the demo publishes instead of this task while on
@@ -153,6 +154,7 @@ static float angularDiffDeg(float a, float b) {
 struct MatchCandidate {
     uint32_t roadId;
     float distanceM;
+    float headErrDeg; // heading error vs the segment's allowed direction(s) (0 if heading invalid)
     float confidence;
     int16_t speedLimitKmh;
     uint8_t source;
@@ -206,6 +208,7 @@ static bool evaluateSegment(const RoadSegment &seg, float fixLat, float fixLon, 
 
     outCand.roadId = seg.id;
     outCand.distanceM = dist;
+    outCand.headErrDeg = headingErr;
     outCand.confidence = confidence;
     outCand.speedLimitKmh = seg.speedLimitKmh;
     outCand.source = seg.speedSource;
@@ -487,6 +490,98 @@ static void resetRouteState() {
 
 
 // ---------------------------------------------------------------------
+// Elevated/surface road disambiguation (2026-09-26) — see map/TrackContinuity.h.
+// Each NEW GNSS fix, every segment within kMaxMatchDistanceM becomes an HMM
+// candidate; the tracker keeps several topologically-consistent hypotheses and
+// reports the cheapest, so a car on a flyover stays on the flyover (and one
+// under it stays below) instead of flipping on every GPS wobble.
+// ---------------------------------------------------------------------
+static const int kMaxCands = 64;
+static TrackContinuity gTrack;
+static RoadSegment gCandSeg[2][kMaxCands]; // this fix's and the previous fix's candidate geometry
+static int gCandN[2] = {0, 0};
+static int gCandCur = 0;
+static uint32_t gLastFixSeq = 0;
+static float gLastFixLat = 0, gLastFixLon = 0;
+static uint32_t gTrackReportedId = 0;
+static const char *gTrackReason = "";
+
+static const RoadSegment *findCandSeg(uint32_t id) {
+    for (int b = 0; b < 2; b++) {
+        int buf = (gCandCur + b) % 2;
+        for (int i = 0; i < gCandN[buf]; i++)
+            if (gCandSeg[buf][i].id == id) return &gCandSeg[buf][i];
+    }
+    return NULL;
+}
+
+// Segments connected to `segId`: sharing a node, up to two hops, plus the next
+// stretch of the forward route when segId is on it (fast cars cover >2 short
+// segments between fixes). Cached per id inside TrackContinuity.
+static int trackNeighbors(uint32_t segId, uint32_t *out, int maxOut, void *) {
+    const RoadSegment *s = findCandSeg(segId);
+    if (!s) return 0;
+    int n = 0;
+    auto add = [&](uint32_t id) {
+        if (id == segId || n >= maxOut) return;
+        for (int k = 0; k < n; k++)
+            if (out[k] == id) return;
+        out[n++] = id;
+    };
+    static RoadSegment nb1[Route::kMaxNodeCandidates], nb2[Route::kMaxNodeCandidates];
+    const int32_t nodes[2][2] = {{s->startLatE7, s->startLonE7}, {s->endLatE7, s->endLonE7}};
+    for (int e = 0; e < 2; e++) {
+        int k1 = routeSegmentProvider(nodes[e][0], nodes[e][1], nb1, Route::kMaxNodeCandidates, NULL);
+        for (int j = 0; j < k1; j++) {
+            add(nb1[j].id);
+            bool startsHere = segNodesCoincide(nb1[j].startLatE7, nb1[j].startLonE7, nodes[e][0], nodes[e][1]);
+            int32_t farLat = startsHere ? nb1[j].endLatE7 : nb1[j].startLatE7;
+            int32_t farLon = startsHere ? nb1[j].endLonE7 : nb1[j].startLonE7;
+            int k2 = routeSegmentProvider(farLat, farLon, nb2, Route::kMaxNodeCandidates, NULL);
+            for (int q = 0; q < k2; q++) add(nb2[q].id);
+        }
+    }
+    for (int i = 0; i < gRouteCount; i++) {
+        if (gRoute.seg(i).id != segId) continue;
+        for (int j = i + 1; j < gRouteCount && j <= i + 10; j++) add(gRoute.seg(j).id);
+        break;
+    }
+    return n;
+}
+
+// Layer evidence: GNSS altitude change over ~40 s of driving, and a sudden
+// sky-view loss (HDOP well above the recent open-sky baseline).
+static TrackEvidence updateTrackEvidence(const GnssSnapshot &gnss) {
+    static float altHist[64];
+    static uint32_t altMs[64];
+    static int altN = 0, altHead = 0;
+    static float hdopBase = 0;
+    TrackEvidence ev;
+    uint32_t now = millis();
+    if (gnss.altitudeValid) {
+        altHist[altHead] = gnss.altitudeM;
+        altMs[altHead] = now;
+        altHead = (altHead + 1) % 64;
+        if (altN < 64) altN++;
+        // oldest sample that is 35..60 s old
+        for (int k = 0; k < altN; k++) {
+            int i = (altHead - altN + k + 64) % 64;
+            uint32_t age = now - altMs[i];
+            if (age <= 60000 && age >= 35000) {
+                ev.altValid = gnss.egoSpeedKmh > 15.0f; // only meaningful while actually driving
+                ev.climbM = gnss.altitudeM - altHist[i];
+                break;
+            }
+        }
+    }
+    if (gnss.hdop > 0) {
+        if (gnss.hdop < 2.0f) hdopBase = hdopBase == 0 ? gnss.hdop : 0.98f * hdopBase + 0.02f * gnss.hdop;
+        ev.skyBlocked = hdopBase > 0 && gnss.hdop > 2.0f && gnss.hdop > 1.8f * hdopBase;
+    }
+    return ev;
+}
+
+// ---------------------------------------------------------------------
 // Top-level match — reads lastPublished (previous tick's result) for the
 // hold-on-low-confidence behavior but never writes it; the caller (the task
 // loop, or runSelfTest()) owns updating lastPublished after each call. See
@@ -557,6 +652,9 @@ static void runMatch(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
     if (!gnss.fix) {
         uint32_t nowMs = millis();
         if (gFixLostMs == 0) gFixLostMs = nowMs; // mark the start of this gap
+        // After a long gap (tunnel, parking garage) the old hypotheses are stale:
+        // start fresh so re-acquisition isn't biased by where we were.
+        if (nowMs - gFixLostMs > 20000 && gTrack.hypothesisCount() > 0) gTrack.reset();
         // Try to keep the limit alive from the route (dead-reckoned forward);
         // fall back to the short hold only if there's no usable route.
         bool drOk = deadReckonAlongRoute(nowMs);
@@ -592,15 +690,14 @@ static void runMatch(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
 
     MatchCandidate best = {};
     bool haveBest = false;
-    MatchCandidate bestForCurrentRoad = {};
-    bool haveCurrentRoad = false;
-    // Capture the full RoadSegment behind whichever candidate wins, so the
-    // forward-route engine below can chain ahead from it (MatchCandidate only
-    // keeps the id/limit, not the geometry). These are copies out of the tile
-    // cache, which stays valid for the whole tick.
-    RoadSegment bestSeg = {};
-    RoadSegment bestForCurrentRoadSeg = {};
 
+    // Collect every candidate of this fix (geometry kept for the forward route
+    // and the tracker's neighbour lookups). Over kMaxCands (very dense junction
+    // areas) the farthest ones are dropped.
+    static MatchCandidate cands[kMaxCands];
+    int nextBuf = 1 - gCandCur;
+    RoadSegment *segBuf = gCandSeg[nextBuf];
+    int nc = 0;
     for (int i = 0; i < 5; i++) {
         const CachedTile *tile = getOrLoadTile(tileIds[i]);
         if (!tile) continue;
@@ -609,39 +706,58 @@ static void runMatch(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
             if (!evaluateSegment(tile->segments[s], gnss.latDeg, gnss.lonDeg, gnss.headingValid, gnss.headingDeg,
                                   gnss.headingPredicted, cand))
                 continue;
-            if (cand.roadId == currentRoadId) {
-                bestForCurrentRoad = cand;
-                bestForCurrentRoadSeg = tile->segments[s];
-                haveCurrentRoad = true;
-            }
             if (!haveBest || cand.confidence > best.confidence) {
                 best = cand;
-                bestSeg = tile->segments[s];
                 haveBest = true;
             }
+            int slot = nc;
+            if (nc >= kMaxCands) {
+                int far = 0;
+                for (int k = 1; k < nc; k++)
+                    if (cands[k].distanceM > cands[far].distanceM) far = k;
+                if (cand.distanceM >= cands[far].distanceM) continue;
+                slot = far;
+            } else {
+                nc++;
+            }
+            cands[slot] = cand;
+            segBuf[slot] = tile->segments[s];
+        }
+    }
+    gCandN[nextBuf] = nc;
+    gCandCur = nextBuf;
+
+    // HMM step — only on a NEW fix (this task runs faster than the GNSS rate;
+    // feeding the same fix twice would double-count its evidence).
+    bool newFix = gnss.fixSeq != gLastFixSeq || gnss.latDeg != gLastFixLat || gnss.lonDeg != gLastFixLon;
+    int pick = -1;
+    if (nc > 0 && newFix) {
+        gLastFixSeq = gnss.fixSeq;
+        gLastFixLat = gnss.latDeg;
+        gLastFixLon = gnss.lonDeg;
+        static TrackCand tc[kMaxCands];
+        for (int i = 0; i < nc; i++)
+            tc[i] = {cands[i].roadId, cands[i].distanceM, cands[i].headErrDeg, gnss.headingValid, segBuf[i].flags};
+        TrackEvidence ev = updateTrackEvidence(gnss);
+        pick = gTrack.step(tc, nc, ev, trackNeighbors, NULL, &gTrackReason);
+        if (pick >= 0) gTrackReportedId = cands[pick].roadId;
+    } else if (nc > 0) {
+        for (int i = 0; i < nc; i++)
+            if (cands[i].roadId == gTrackReportedId) { pick = i; break; }
+        if (pick < 0) { // reported segment fell out of range between fixes: take the tracker's view next fix
+            int bi = 0;
+            for (int i = 1; i < nc; i++)
+                if (cands[i].confidence > cands[bi].confidence) bi = i;
+            pick = bi;
         }
     }
 
     MatchCandidate chosen;
     RoadSegment chosenSeg = {};
     bool haveChosen = false;
-    if (haveBest) {
-        // Check if vehicle is actively turning onto a different road
-        bool turningOntoNewRoad = false;
-        if (haveCurrentRoad && best.roadId != currentRoadId) {
-            // If competitor road has much better heading alignment or current road confidence is failing
-            if (best.confidence > bestForCurrentRoad.confidence + 0.08f || bestForCurrentRoad.confidence < 0.40f) {
-                turningOntoNewRoad = true;
-            }
-        }
-
-        if (haveCurrentRoad && !turningOntoNewRoad && (bestForCurrentRoad.confidence + kContinuityBonus) >= (best.confidence - kSwitchMargin)) {
-            chosen = bestForCurrentRoad;
-            chosenSeg = bestForCurrentRoadSeg;
-        } else {
-            chosen = best;
-            chosenSeg = bestSeg;
-        }
+    if (pick >= 0) {
+        chosen = cands[pick];
+        chosenSeg = segBuf[pick];
         haveChosen = true;
     }
 
@@ -1375,10 +1491,11 @@ static void speedLimitTaskFn(void *) {
             if (now - lastDebugMs > 3000) {
                 lastDebugMs = now;
                 Serial.printf("[map] fix=%d lat=%.6f lon=%.6f valid=%d roadId=%lu conf=%.2f distM=%.1f "
-                              "limit=%.0f source=%s\n",
+                              "limit=%.0f source=%s track=%s hyp=%d margin=%.1f\n",
                               gnss.fix, (double)gnss.latDeg, (double)gnss.lonDeg, out.valid,
                               (unsigned long)out.roadId, (double)out.confidence, (double)out.matchDistanceM,
-                              (double)out.speedLimitKmh, speedSourceStr(out.source));
+                              (double)out.speedLimitKmh, speedSourceStr(out.source), gTrackReason,
+                              gTrack.hypothesisCount(), (double)gTrack.margin());
             }
         }
         esp_task_wdt_reset();
