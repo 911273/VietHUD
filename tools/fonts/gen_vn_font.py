@@ -23,19 +23,20 @@ Format constraints (verified against this project's pinned lvgl 9.2.2):
 Re-run to change size/subset. Output is checked in; do not hand-edit the .c.
 """
 import os
+import sys
 from PIL import Image, ImageDraw, ImageFont
 
 # --- config ---------------------------------------------------------------
 TTF   = r"C:\Windows\Fonts\arial.ttf"   # Arial ships Vietnamese and reads well small
-PPEM  = 14                              # match montserrat_14 -> drop-in replacement
+PPEM  = int(sys.argv[1]) if len(sys.argv) > 1 else 14  # 14 = drop-in for montserrat_14; e.g. 20 for the top bar
 BPP   = 4
-NAME  = "lv_font_vn_14"
+NAME  = "lv_font_vn_%d" % PPEM
 # Fallback font for glyphs we don't carry -- crucially the LVGL FontAwesome
 # SYMBOLS (LV_SYMBOL_GPS U+F124, LV_SYMBOL_SETTINGS U+F013, LV_SYMBOL_RIGHT,
 # wifi, etc.) that live in the built-in Montserrat. Without this, making our
 # font the default made every icon a "glyph not found" (screen looked crashed).
 # LVGL 9's lv_font_get_glyph_dsc() walks .fallback recursively.
-FALLBACK = "&lv_font_montserrat_14"   # or "NULL"
+FALLBACK = "&lv_font_montserrat_%d" % PPEM   # same-size Montserrat (must be enabled in lv_conf.h), or "NULL"
 OUT   = os.path.join(os.path.dirname(__file__), "..", "..", "src", "ui", "fonts", NAME + ".c")
 
 # ASCII printable, contiguous 0x20..0x7E

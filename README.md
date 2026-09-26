@@ -50,9 +50,9 @@ No radar, no cellular/SIM card, no cloud dependency needed while driving — eve
 ### Cách cập nhật dữ liệu trên thiết bị (firmware 2.1.0+)
 
 **Cách chính — qua điện thoại, không cần Wi-Fi nhà (Phone Update Bridge):**
-1. Trên VietHUD: **Settings → WiFi**. Màn hình hiện 2 mã QR.
-2. Quét **QR 1** bằng Camera để vào Wi-Fi `VietHUD-XXXX` (mật khẩu riêng của từng máy, đã nằm trong QR).
-3. Quét **QR 2** để mở `http://192.168.4.1` bằng **Safari/Chrome** (không dùng cửa sổ "Captive Wi-Fi" tự bật — cửa sổ đó không có 4G).
+1. Trên VietHUD: **Settings → WiFi**. Màn hình hiện mã QR Wi-Fi.
+2. Quét mã QR bằng Camera để vào Wi-Fi `VietHUD-XXXX` (mật khẩu riêng của từng máy, đã nằm trong QR).
+3. Mở `http://192.168.4.1` bằng **Safari/Chrome** (không dùng cửa sổ "Captive Wi-Fi" tự bật — cửa sổ đó không có 4G).
 4. Trang tự kiểm tra bản mới; bấm **Cập nhật**. Điện thoại tải dữ liệu từ GitHub bằng 4G/5G, kiểm tra SHA-256, truyền sang VietHUD; VietHUD kiểm tra chữ ký + SHA-256 rồi khởi động lại để cài.
 
 Không có Internet trên điện thoại: **Hệ thống → Cài dữ liệu từ tệp** (chọn `manifest.txt`, `manifest.txt.sig` và các `.bin`).

@@ -15,6 +15,7 @@
 
 LV_FONT_DECLARE(lv_font_montserrat_speed); // webPortalIsEnabled()/webPortalRequestEnable() — the 4s hold gesture toggles WiFi
 LV_FONT_DECLARE(lv_font_vn_14); // Vietnamese-capable text font (Arial 14px, ASCII+VN); drop-in for montserrat_14
+LV_FONT_DECLARE(lv_font_vn_20); // same at 20px — landscape top bar (matches the 20px bottom-corner readouts)
 
 // Copies a UTF-8 road name into `out`, abbreviating a leading Vietnamese
 // "Đường " to "Đ. " (user-requested 2026-09-24 — street names from the OSM DB
@@ -181,6 +182,11 @@ static uint32_t lastDrawnMapGeneration = 0xFFFFFFFFu;
 static bool mapDimmed = false;
 static int egoAnchorX = 240, egoAnchorY = 213;
 static int gCanvasW = 480, gCanvasH = 320;
+// Landscape status bars: top (GNSS / street / clock / WiFi / settings) and the
+// bottom one holding the heading letter + board temperature — both 20px text,
+// both marked by the same 1px line.
+static const int kTopBarH = 40;
+static const int kBottomBarH = 40;
 static int gMapSideS = 578, gMapCenter = 289; // oversized heading-up canvas: square side + its center (rotation pivot)
 static int gRefMinDim = 160;                  // on-screen minDim framing the zoom (see buildMapCanvas)
 static float gMapZoomScale = 1.0f; // Default 2.0x digital zoom (~2.2m/px)
@@ -602,7 +608,7 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
     // current travel direction as a compass letter (N/NE/E/SE/S/SW/W/NW),
     // updated from GNSS heading in refreshDashboard().
     northCx = 34;
-    northCy = gCanvasH - 34;
+    northCy = gCanvasH - kBottomBarH / 2; // centred in the bottom bar (line at gCanvasH - kBottomBarH)
     compassLabel = lv_label_create(parent);
     lv_label_set_text(compassLabel, "N");
     lv_obj_set_style_text_font(compassLabel, &lv_font_montserrat_20, 0); // bigger heading letter (2026-09-25)
@@ -612,7 +618,7 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
 
     // Board temperature readout, bottom-right corner (mirror of the compass).
     tempCx = gCanvasW - 34;
-    tempCy = gCanvasH - 34;
+    tempCy = gCanvasH - kBottomBarH / 2;
     tempLabel = lv_label_create(parent);
     lv_label_set_text(tempLabel, "--\xC2\xB0" "C"); // "--°C" until the first reading (°=U+00B0, UTF-8 C2 B0)
     lv_obj_set_style_text_font(tempLabel, &lv_font_montserrat_20, 0);
@@ -908,7 +914,7 @@ static lv_obj_t *makeIcon(lv_obj_t *parent, const lv_image_dsc_t *src) {
 // ---------------------------------------------------------------------
 static void buildDashboardLandscape(lv_obj_t *scr) {
     const int scrW = 480, scrH = 320;
-    const int topH = 34;
+    const int topH = kTopBarH;
 
     // ---------------- Top status bar (Full width 480, Glassmorphism) ----------------
     lv_obj_t *topBar = makePane(scr, 0, 0, scrW, topH);
@@ -919,32 +925,35 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 
     // Left: GNSS status
     gnssIcon = lv_label_create(topBar);
+    lv_obj_set_style_text_font(gnssIcon, &lv_font_montserrat_20, 0);
     lv_label_set_text(gnssIcon, LV_SYMBOL_GPS);
     lv_obj_align(gnssIcon, LV_ALIGN_LEFT_MID, 12, 0);
 
     gnssCaption = lv_label_create(topBar);
-    lv_obj_set_style_text_font(gnssCaption, &lv_font_vn_14, 0);
+    lv_obj_set_style_text_font(gnssCaption, &lv_font_vn_20, 0);
     lv_label_set_text(gnssCaption, "--");
     lv_obj_align_to(gnssCaption, gnssIcon, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
 
     // Right: time & settings
     gearIcon = lv_label_create(topBar);
+    lv_obj_set_style_text_font(gearIcon, &lv_font_montserrat_20, 0);
     lv_label_set_text(gearIcon, LV_SYMBOL_SETTINGS);
     lv_obj_align(gearIcon, LV_ALIGN_RIGHT_MID, -12, 0);
 
     wifiTopIcon = lv_label_create(topBar);
+    lv_obj_set_style_text_font(wifiTopIcon, &lv_font_montserrat_20, 0);
     lv_label_set_text(wifiTopIcon, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x7C8A9A), 0);
     // Fixed width, right-aligned: the text grows to "WiFi ✓" when a phone joins,
     // and the clock is aligned to this box once at build time.
-    lv_obj_set_width(wifiTopIcon, 44);
+    lv_obj_set_width(wifiTopIcon, 52);
     lv_obj_set_style_text_align(wifiTopIcon, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_align_to(wifiTopIcon, gearIcon, LV_ALIGN_OUT_LEFT_MID, -10, 0);
     lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
 
     clockLabel = lv_label_create(topBar);
-    lv_obj_set_style_text_font(clockLabel, &lv_font_vn_14, 0);
+    lv_obj_set_style_text_font(clockLabel, &lv_font_vn_20, 0);
     lv_obj_align_to(clockLabel, wifiTopIcon, LV_ALIGN_OUT_LEFT_MID, -12, 0);
     lv_label_set_text(clockLabel, "--:--");
 
@@ -953,27 +962,28 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 
     // Center: Street Name Badge (Glassmorphism Pill)
     streetNameBadge = lv_obj_create(topBar);
-    lv_obj_set_size(streetNameBadge, 220, 24);
-    lv_obj_align(streetNameBadge, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_size(streetNameBadge, 206, 30);
+    lv_obj_align(streetNameBadge, LV_ALIGN_LEFT_MID, 80, 0); // gap between GNSS (left) and sun/clock (right)
     lv_obj_set_style_bg_color(streetNameBadge, lv_color_hex(0x0C1522), 0);
     lv_obj_set_style_bg_opa(streetNameBadge, LV_OPA_80, 0);
     lv_obj_set_style_border_color(streetNameBadge, lv_color_hex(0x1F314A), 0);
     lv_obj_set_style_border_width(streetNameBadge, 1, 0);
-    lv_obj_set_style_radius(streetNameBadge, 12, 0);
+    lv_obj_set_style_radius(streetNameBadge, 15, 0);
     lv_obj_set_style_pad_all(streetNameBadge, 0, 0);
     lv_obj_clear_flag(streetNameBadge, LV_OBJ_FLAG_SCROLLABLE);
 
     streetNameIcon = lv_label_create(streetNameBadge);
+    lv_obj_set_style_text_font(streetNameIcon, &lv_font_montserrat_20, 0);
     lv_label_set_text(streetNameIcon, LV_SYMBOL_RIGHT);
     lv_obj_set_style_text_color(streetNameIcon, lv_color_hex(0x00E5FF), 0);
     lv_obj_align(streetNameIcon, LV_ALIGN_LEFT_MID, 8, 0);
 
     streetNameLabel = lv_label_create(streetNameBadge);
-    lv_obj_set_style_text_font(streetNameLabel, &lv_font_vn_14, 0);
+    lv_obj_set_style_text_font(streetNameLabel, &lv_font_vn_20, 0);
     lv_obj_set_style_text_color(streetNameLabel, lv_color_hex(0xF0F4F8), 0);
     lv_label_set_long_mode(streetNameLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(streetNameLabel, 180);
-    lv_obj_align(streetNameLabel, LV_ALIGN_LEFT_MID, 24, 0);
+    lv_obj_set_width(streetNameLabel, 170);
+    lv_obj_align(streetNameLabel, LV_ALIGN_LEFT_MID, 30, 0);
     lv_label_set_text(streetNameLabel, "");
     lv_obj_add_flag(streetNameBadge, LV_OBJ_FLAG_HIDDEN);
 
@@ -1037,7 +1047,12 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     // (legacy floating warning banners removed — see comment near the top of this file)
 
     // ---------------- Bottom row: Cảnh báo phụ (Traffic Card) ----------------
-    midCol = makePane(scr, (scrW - 270) / 2, 246, 270, 60);
+    lv_obj_t *bottomBar = makePane(scr, 0, scrH - kBottomBarH, scrW, kBottomBarH);
+    lv_obj_set_style_border_color(bottomBar, lv_color_hex(0x182232), 0); // same line as the top bar
+    lv_obj_set_style_border_width(bottomBar, 1, 0);
+    lv_obj_set_style_border_side(bottomBar, LV_BORDER_SIDE_TOP, 0);
+
+    midCol = makePane(scr, (scrW - 270) / 2, scrH - kBottomBarH - 6 - 60, 270, 60);
     buildTrafficCard(midCol, 270, 60);
 
     // Bottom info bar (hidden)

@@ -46,7 +46,7 @@ h3{font-size:14px;margin:16px 0 4px;color:var(--m);font-weight:600}
  <div id="uS">Đang kiểm tra…</div><div class="s" id="uD"></div>
  <div class="bar hide" id="uB"><i></i></div><div class="s" id="uP"></div>
  <button id="uBtn" onclick="uClick()" disabled>Kiểm tra cập nhật</button>
- <div class="s hide" id="uH" style="margin-top:10px">Điện thoại chưa ra được Internet.<br>• iPhone: mở trang bằng <b>Safari</b> (quét mã QR thứ 2 trên VietHUD), không dùng cửa sổ “Captive Wi-Fi”; bật Dữ liệu di động cho Safari.<br>• Android: chọn “Giữ kết nối” khi được hỏi và bật dữ liệu di động.</div>
+ <div class="s hide" id="uH" style="margin-top:10px">Điện thoại chưa ra được Internet.<br>• iPhone: mở <b>Safari</b> và vào <b>192.168.4.1</b>, không dùng cửa sổ “Captive Wi-Fi”; bật Dữ liệu di động cho Safari.<br>• Android: chọn “Giữ kết nối” khi được hỏi và bật dữ liệu di động.</div>
 </section>
 
 <section class="card"><h2>Trạng thái</h2><div class="grid" id="st"></div></section>
