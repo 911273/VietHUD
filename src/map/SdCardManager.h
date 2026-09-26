@@ -33,12 +33,6 @@ bool sdMgrIsAvailable(); // true only after a successful sdMgrMount()
 // already read it into a static buffer). Returns false if !sdMgrIsAvailable().
 bool sdMgrGetMetadata(SpeedMapMetadata &out);
 
-// Points `*out` at the in-RAM TileIndexEntry array loaded once at
-// sdMgrMount() time (spec's own tile_count for a single test region is
-// small — see SpeedLimitManager.cpp for the actual cap) and sets *outCount.
-// Returns false if !sdMgrIsAvailable().
-bool sdMgrGetIndex(const TileIndexEntry **out, int *outCount);
-
 // Finds a TileIndexEntry by tileId, supporting both PSRAM array and on-demand file index.
 bool sdMgrFindTileEntry(uint32_t tileId, TileIndexEntry *outEntry);
 
@@ -47,15 +41,51 @@ bool sdMgrFindTileEntry(uint32_t tileId, TileIndexEntry *outEntry);
 // /speedmap/cameras.bin is missing or empty, since camera data is OPTIONAL
 // (see CameraPoint's own SpeedMapFormat.h comment): an older card built
 // before this feature existed still works for everything else. Unlike
-// sdMgrGetIndex()'s TileIndexEntry array, this doesn't require
+// the tile index, this doesn't require
 // sdMgrIsAvailable() (a full, validated speedmap) — cameras.bin is loaded
 // independently of metadata.bin/index.bin's own validation, so a region
 // extract that for whatever reason has cameras but no tiles (or vice
 // versa) still gets whatever it does have.
-bool sdMgrGetCameras(const CameraPoint **out, int *outCount);
+//
+// In-RAM form (2026-09-26): the nationwide data grew to ~100k cameras + ~135k
+// signs (4.7 MB as file records), which exhausted PSRAM — the map canvas then
+// failed to allocate and the device boot-looped on an LVGL assert. The loader
+// keeps only the fields the firmware reads, in compact records, drops signs.bin's
+// duplicate camera rows (type 4, already in cameras.bin), and SORTS both arrays
+// by latitude so lookups scan a narrow band (pointsLatBegin) instead of every
+// point every tick.
+#pragma pack(push, 1)
+struct CamPt {
+    int32_t latE7;
+    int32_t lonE7;
+    int16_t speedLimitKmh; // -1 = unknown
+    uint16_t directionDeg; // 0xFFFF = unknown
+};
+struct SignPt {
+    int32_t latE7;
+    int32_t lonE7;
+    uint16_t directionDeg; // 0xFFFF = omnidirectional
+    uint8_t signType;      // TrafficSignType
+    uint8_t speedLimitKmh; // 0 = none
+    uint8_t subType;       // 0 = start, 1 = end
+};
+#pragma pack(pop)
 
-// Points `*out` at the in-RAM TrafficSignPoint array loaded at boot from /speedmap/signs.bin
-bool sdMgrGetSigns(const TrafficSignPoint **out, int *outCount);
+bool sdMgrGetCameras(const CamPt **out, int *outCount);
+
+// Points `*out` at the in-RAM sign array loaded at boot from /speedmap/signs.bin
+bool sdMgrGetSigns(const SignPt **out, int *outCount);
+
+// First index whose latE7 >= latE7 in a latitude-sorted point array.
+template <class T> inline int pointsLatBegin(const T *a, int n, int32_t latE7) {
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (a[mid].latE7 < latE7) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
 
 // Returns the street name for a given segment id (e.g. "Đ. Nguyễn Trãi", "QL 1A")
 // or empty string if not available.

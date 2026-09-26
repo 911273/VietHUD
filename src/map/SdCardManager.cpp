@@ -26,7 +26,8 @@
 // needing the other's library. Hand-rolled rather than an ESP-IDF ROM CRC
 // API: this project doesn't otherwise depend on ROM-level APIs, and a
 // ~20-line table-based implementation is cheap enough not to need one.
-static uint32_t crc32(const uint8_t *data, size_t len) {
+// Incremental form: start with crc = 0xFFFFFFFF, feed chunks, final ^ 0xFFFFFFFF.
+static uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t len) {
     static uint32_t table[256];
     static bool tableInit = false;
     if (!tableInit) {
@@ -37,9 +38,8 @@ static uint32_t crc32(const uint8_t *data, size_t len) {
         }
         tableInit = true;
     }
-    uint32_t crc = 0xFFFFFFFFu;
     for (size_t i = 0; i < len; i++) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
-    return crc ^ 0xFFFFFFFFu;
+    return crc;
 }
 
 // Serializes every function below against the other (log/TripLogger.cpp's
@@ -74,7 +74,16 @@ static SpeedMapMetadata metadata;
 // metadata.tileCount says, so the only real ceiling is PSRAM capacity
 // itself (~285000 tiles at 8MB, far beyond any realistic single-country
 // extract).
-static TileIndexEntry *tileIndex = NULL;
+// In-RAM tile index (2026-09-26): only what the lookup + tile read use. The
+// file's 28-byte TileIndexEntry also carries a per-tile bbox nothing reads; for
+// the nationwide card (175k tiles) that was 4.9 MB of PSRAM — the single
+// biggest reason PSRAM ran out (map canvas alloc failed -> boot loop).
+struct TileIdx {
+    uint32_t tileId;
+    uint32_t fileOffset;
+    uint32_t fileSize;
+};
+static TileIdx *tileIndex = NULL;
 static int tileIndexCount = 0;
 
 // Loaded once, independently of sdMgrMount()'s own tile-index loading (see
@@ -83,10 +92,29 @@ static int tileIndexCount = 0;
 // bytes/entry) that PSRAM vs. internal RAM doesn't matter the way it does
 // for tileIndex above; PSRAM chosen anyway for consistency with everything
 // else this module keeps resident.
-static CameraPoint *cameraPoints = NULL;
+static CamPt *cameraPoints = NULL;
 static int cameraPointCount = 0;
-static TrafficSignPoint *trafficSigns = NULL;
+static SignPt *trafficSigns = NULL;
 static int trafficSignCount = 0;
+
+// PSRAM that must stay free after the camera/sign arrays are loaded, for the
+// map canvas, LVGL heap growth, WiFi/TLS buffers and the tile cache.
+static const size_t kPsramReserveBytes = 1536 * 1024;
+static size_t psramRoomFor(size_t want) {
+    size_t freeB = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t big = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    size_t room = freeB > kPsramReserveBytes ? freeB - kPsramReserveBytes : 0;
+    if (room > big) room = big;
+    return want < room ? want : room;
+}
+static int cmpCamLat(const void *a, const void *b) {
+    int32_t x = ((const CamPt *)a)->latE7, y = ((const CamPt *)b)->latE7;
+    return (x > y) - (x < y);
+}
+static int cmpSignLat(const void *a, const void *b) {
+    int32_t x = ((const SignPt *)a)->latE7, y = ((const SignPt *)b)->latE7;
+    return (x > y) - (x < y);
+}
 
 // Road Names Database in PSRAM. roadNameCount is uint32 (was uint16): the full-VN
 // dataset can exceed 65 535 unique street names (nationwide is already ~52 175),
@@ -276,28 +304,44 @@ bool sdMgrMount() {
         heap_caps_free(tileIndex);
         tileIndex = NULL;
     }
-    tileIndex = (TileIndexEntry *)heap_caps_malloc(idxSize, MALLOC_CAP_SPIRAM);
-    if (!tileIndex) {
-        Serial.printf("[sdmgr] PSRAM allocation for %u tile index entries (%u bytes) skipped - using on-demand file index (0 KB PSRAM)\n",
-                      (unsigned)metadata.tileCount, (unsigned)idxSize);
+    tileIndex = (TileIdx *)heap_caps_malloc((size_t)metadata.tileCount * sizeof(TileIdx), MALLOC_CAP_SPIRAM);
+    TileIndexEntry *idxChunk = tileIndex ? (TileIndexEntry *)malloc(256 * sizeof(TileIndexEntry)) : NULL;
+    tileIndexCount = (int)metadata.tileCount;
+    if (!idxChunk) {
+        if (tileIndex) { heap_caps_free(tileIndex); tileIndex = NULL; }
+        Serial.printf("[sdmgr] PSRAM allocation for %u tile index entries skipped - using on-demand file index (0 KB PSRAM)\n",
+                      (unsigned)metadata.tileCount);
         idxFile.close();
-        tileIndexCount = (int)metadata.tileCount;
     } else {
-        tileIndexCount = (int)metadata.tileCount;
-        size_t idxGot = idxFile.read((uint8_t *)tileIndex, idxSize);
+        uint32_t crc = 0xFFFFFFFFu;
+        int done = 0;
+        while (done < tileIndexCount) {
+            int want = tileIndexCount - done < 256 ? tileIndexCount - done : 256;
+            size_t got = idxFile.read((uint8_t *)idxChunk, want * sizeof(TileIndexEntry));
+            if (got != want * sizeof(TileIndexEntry)) break;
+            crc = crc32Update(crc, (const uint8_t *)idxChunk, got);
+            for (int i = 0; i < want; i++) {
+                tileIndex[done + i].tileId = idxChunk[i].tileId;
+                tileIndex[done + i].fileOffset = idxChunk[i].fileOffset;
+                tileIndex[done + i].fileSize = idxChunk[i].fileSize;
+            }
+            done += want;
+        }
+        free(idxChunk);
         idxFile.close();
-        if (idxGot != idxSize) {
+        uint32_t computedCrc = crc ^ 0xFFFFFFFFu;
+        if (done != tileIndexCount) {
             Serial.println("[sdmgr] short read on index.bin - falling back to file index");
             heap_caps_free(tileIndex);
             tileIndex = NULL;
+        } else if (computedCrc != metadata.crc32) {
+            Serial.printf("[sdmgr] index.bin CRC mismatch (computed 0x%08lX, expected 0x%08lX) - falling back to file index\n",
+                          (unsigned long)computedCrc, (unsigned long)metadata.crc32);
+            heap_caps_free(tileIndex);
+            tileIndex = NULL;
         } else {
-            uint32_t computedCrc = crc32((const uint8_t *)tileIndex, idxSize);
-            if (computedCrc != metadata.crc32) {
-                Serial.printf("[sdmgr] index.bin CRC mismatch (computed 0x%08lX, expected 0x%08lX) - falling back to file index\n",
-                              (unsigned long)computedCrc, (unsigned long)metadata.crc32);
-                heap_caps_free(tileIndex);
-                tileIndex = NULL;
-            }
+            Serial.printf("[sdmgr] tile index in PSRAM: %u KB (compact)\n",
+                          (unsigned)((size_t)tileIndexCount * sizeof(TileIdx) / 1024));
         }
     }
 
@@ -310,30 +354,72 @@ bool sdMgrMount() {
     // extra (see CameraPoint's own SpeedMapFormat.h comment), so a card
     // built before it existed, or a region export with genuinely zero
     // speed cameras, both correctly end up with cameraPointCount==0
-    // rather than a MAP ERROR.
+    // rather than a MAP ERROR. Streamed in chunks into compact CamPt records
+    // (see SdCardManager.h), never more than psramRoomFor() allows.
     if (cameraPoints) {
         heap_caps_free(cameraPoints);
         cameraPoints = NULL;
         cameraPointCount = 0;
     }
+    static const int kChunk = 256;
     File camFile = SD_MMC.open("/speedmap/cameras.bin");
     if (camFile) {
-        size_t camSize = camFile.size();
-        int n = (int)(camSize / sizeof(CameraPoint));
-        if (n > 0) {
-            cameraPoints = (CameraPoint *)heap_caps_malloc(n * sizeof(CameraPoint), MALLOC_CAP_SPIRAM);
-            if (cameraPoints) {
-                size_t got = camFile.read((uint8_t *)cameraPoints, n * sizeof(CameraPoint));
-                cameraPointCount = (int)(got / sizeof(CameraPoint));
-            } else {
-                Serial.println("[sdmgr] PSRAM allocation for camera points failed — continuing with zero cameras");
+        int n = (int)(camFile.size() / sizeof(CameraPoint));
+        int cap = (int)(psramRoomFor((size_t)n * sizeof(CamPt)) / sizeof(CamPt));
+        if (cap < n) Serial.printf("[sdmgr] WARN: PSRAM room for only %d of %d cameras\n", cap, n);
+        if (cap > 0) cameraPoints = (CamPt *)heap_caps_malloc((size_t)cap * sizeof(CamPt), MALLOC_CAP_SPIRAM);
+        CameraPoint *chunk = cameraPoints ? (CameraPoint *)malloc(kChunk * sizeof(CameraPoint)) : NULL;
+        if (chunk) {
+            // Field-order repair (2026-09-26, "bieu tuong canh bao toc do bi sai"):
+            // tools/viethud_builder.py and merge_vietmap_papago.py packed cameras
+            // as (heading, speed) instead of (speedLimitKmh, directionDeg), so the
+            // camera card showed the camera's compass bearing (135, 178, ...) as
+            // its limit. Detected on the file's first chunk: a real share of
+            // impossible limits (>150) means the two fields are swapped.
+            int swappedState = -1, cleared = 0;
+            while (cameraPointCount < cap) {
+                int want = cap - cameraPointCount < kChunk ? cap - cameraPointCount : kChunk;
+                int got = (int)(camFile.read((uint8_t *)chunk, want * sizeof(CameraPoint)) / sizeof(CameraPoint));
+                if (got <= 0) break;
+                if (swappedState < 0) {
+                    int impossible = 0;
+                    for (int i = 0; i < got; i++)
+                        if (chunk[i].speedLimitKmh > 150) impossible++;
+                    swappedState = impossible * 20 > got ? 1 : 0;
+                }
+                for (int i = 0; i < got; i++) {
+                    int sp = chunk[i].speedLimitKmh, hd = chunk[i].directionDeg;
+                    if (swappedState == 1) {
+                        int t = sp;
+                        sp = hd;
+                        hd = (t >= 0 && t < 360) ? t : 0xFFFF;
+                    }
+                    if (sp != -1 && (sp < 5 || sp > 150 || sp % 5 != 0)) {
+                        sp = -1;
+                        cleared++;
+                    }
+                    CamPt &o = cameraPoints[cameraPointCount++];
+                    o.latE7 = chunk[i].latE7;
+                    o.lonE7 = chunk[i].lonE7;
+                    o.speedLimitKmh = (int16_t)sp;
+                    o.directionDeg = (uint16_t)hd;
+                }
             }
+            free(chunk);
+            qsort(cameraPoints, cameraPointCount, sizeof(CamPt), cmpCamLat);
+            Serial.printf("[sdmgr] cameras.bin: %s, %d invalid limit(s) -> unknown\n",
+                          swappedState == 1 ? "speed/direction fields were SWAPPED (old builder) — repaired"
+                                            : "field order OK",
+                          cleared);
+        } else if (n > 0) {
+            Serial.println("[sdmgr] PSRAM allocation for camera points failed — continuing with zero cameras");
         }
         camFile.close();
     }
     Serial.printf("[sdmgr] cameras.bin: %d speed camera(s) loaded\n", cameraPointCount);
 
-    // signs.bin — loaded into PSRAM for instant offline query
+    // signs.bin — compact SignPt records; camera rows (type 4) are skipped,
+    // they duplicate cameras.bin. Allocated for the header count, then shrunk.
     if (trafficSigns) {
         heap_caps_free(trafficSigns);
         trafficSigns = NULL;
@@ -344,10 +430,37 @@ bool sdMgrMount() {
         TrafficSignHeader hdr;
         if (signFile.read((uint8_t *)&hdr, sizeof(hdr)) == sizeof(hdr) &&
             memcmp(hdr.magic, SIGN_MAGIC, 4) == 0 && hdr.signCount > 0) {
-            trafficSigns = (TrafficSignPoint *)heap_caps_malloc(hdr.signCount * sizeof(TrafficSignPoint), MALLOC_CAP_SPIRAM);
-            if (trafficSigns) {
-                size_t got = signFile.read((uint8_t *)trafficSigns, hdr.signCount * sizeof(TrafficSignPoint));
-                trafficSignCount = (int)(got / sizeof(TrafficSignPoint));
+            int n = (int)hdr.signCount;
+            int cap = (int)(psramRoomFor((size_t)n * sizeof(SignPt)) / sizeof(SignPt));
+            if (cap > 0) trafficSigns = (SignPt *)heap_caps_malloc((size_t)cap * sizeof(SignPt), MALLOC_CAP_SPIRAM);
+            TrafficSignPoint *chunk = trafficSigns ? (TrafficSignPoint *)malloc(kChunk * sizeof(TrafficSignPoint)) : NULL;
+            if (chunk) {
+                int readTotal = 0, skippedCam = 0;
+                while (readTotal < n && trafficSignCount < cap) {
+                    int want = n - readTotal < kChunk ? n - readTotal : kChunk;
+                    int got = (int)(signFile.read((uint8_t *)chunk, want * sizeof(TrafficSignPoint)) /
+                                    sizeof(TrafficSignPoint));
+                    if (got <= 0) break;
+                    readTotal += got;
+                    for (int i = 0; i < got && trafficSignCount < cap; i++) {
+                        if (chunk[i].signType == SIGN_TYPE_CAMERA) { skippedCam++; continue; }
+                        SignPt &o = trafficSigns[trafficSignCount++];
+                        o.latE7 = chunk[i].latE7;
+                        o.lonE7 = chunk[i].lonE7;
+                        o.directionDeg = chunk[i].directionDeg;
+                        o.signType = chunk[i].signType;
+                        o.speedLimitKmh = chunk[i].speedLimitKmh;
+                        o.subType = chunk[i].subType;
+                    }
+                }
+                free(chunk);
+                if (readTotal < n) Serial.printf("[sdmgr] WARN: PSRAM room for only part of signs.bin (%d of %d read)\n", readTotal, n);
+                if (trafficSignCount > 0 && trafficSignCount < cap) {
+                    void *shrunk = heap_caps_realloc(trafficSigns, (size_t)trafficSignCount * sizeof(SignPt), MALLOC_CAP_SPIRAM);
+                    if (shrunk) trafficSigns = (SignPt *)shrunk;
+                }
+                qsort(trafficSigns, trafficSignCount, sizeof(SignPt), cmpSignLat);
+                Serial.printf("[sdmgr] signs.bin: %d camera row(s) skipped (in cameras.bin)\n", skippedCam);
             } else {
                 Serial.println("[sdmgr] PSRAM allocation for traffic signs failed");
             }
@@ -355,6 +468,9 @@ bool sdMgrMount() {
         signFile.close();
     }
     Serial.printf("[sdmgr] signs.bin: %d traffic sign(s) loaded\n", trafficSignCount);
+    Serial.printf("[sdmgr] PSRAM after points: %u KB free, largest block %u KB\n",
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
 
     // names.bin — header only; names are read on demand (sdMgrGetRoadName).
     roadNameCount = 0;
@@ -416,27 +532,20 @@ bool sdMgrGetMetadata(SpeedMapMetadata &out) {
     return true;
 }
 
-bool sdMgrGetCameras(const CameraPoint **out, int *outCount) {
+bool sdMgrGetCameras(const CamPt **out, int *outCount) {
     SdLock lock;
     *out = cameraPoints;
     *outCount = cameraPointCount;
     return true; // 0 cameras is a normal, successful result — see this array's own comment
 }
 
-bool sdMgrGetSigns(const TrafficSignPoint **out, int *outCount) {
+bool sdMgrGetSigns(const SignPt **out, int *outCount) {
     SdLock lock;
     *out = trafficSigns;
     *outCount = trafficSignCount;
     return true;
 }
 
-bool sdMgrGetIndex(const TileIndexEntry **out, int *outCount) {
-    SdLock lock;
-    if (!mounted) return false;
-    *out = tileIndex;
-    *outCount = tileIndexCount;
-    return true;
-}
 
 
 bool sdMgrReadBytes(const char *path, uint32_t offset, uint8_t *outBuf, size_t len) {
@@ -717,7 +826,10 @@ bool sdMgrFindTileEntry(uint32_t tileId, TileIndexEntry *outEntry) {
         while (lo <= hi) {
             int mid = lo + (hi - lo) / 2;
             if (tileIndex[mid].tileId == tileId) {
-                *outEntry = tileIndex[mid];
+                memset(outEntry, 0, sizeof(*outEntry));
+                outEntry->tileId = tileIndex[mid].tileId;
+                outEntry->fileOffset = tileIndex[mid].fileOffset;
+                outEntry->fileSize = tileIndex[mid].fileSize;
                 return true;
             } else if (tileIndex[mid].tileId < tileId) {
                 lo = mid + 1;

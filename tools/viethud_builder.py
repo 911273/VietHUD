@@ -423,8 +423,8 @@ def export_viethud_package(clean_points, ref_map_dir, target_dirs, mode='vector'
                 cam_id_counter,
                 lat_e7,
                 lon_e7,
-                heading_deg,
-                speed
+                speed if speed > 0 else -1,   # int16 speedLimitKmh FIRST (SpeedMapFormat.h CameraPoint)
+                heading_deg                   # then uint16 directionDeg — was swapped before 2026-09-26
             ))
             cam_id_counter += 1
 

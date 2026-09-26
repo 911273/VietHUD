@@ -53,6 +53,7 @@ struct RouteSeg {
     int16_t speedLimitKmh;          // -1 = unknown
     uint8_t roadClass;              // RoadSegment::roadClass (1 major .. 3 small, 0 other)
     uint8_t flags;                  // SEGFLAG_* (bridge / tunnel / link)
+    uint8_t source;                 // RoadSegment::speedSource (SPEED_SOURCE_*)
     float headingDeg;               // forward heading of THIS route direction (start->end as chained)
     float lenM;                     // segment length, meters
     float startDistM;               // arc length from route origin to this segment's start node
@@ -115,8 +116,11 @@ public:
     // remaining distance from `fromDistM` (clamped >= 0). Returns false if the
     // limit never changes within `maxM` ahead. Replaces the straight-line
     // ahead-limit sampling: follows the actual road through curves/junctions.
+    // taggedOnly: consider only segments whose limit comes from a real tag
+    // (not SPEED_SOURCE_DEFAULT, a road-class guess) — a change between two
+    // guesses is no evidence of a real sign.
     bool limitChangeAhead(float fromDistM, float currentLimitKmh, float maxM, float &outDistM,
-                          float &outLimitKmh) const;
+                          float &outLimitKmh, bool taggedOnly = false) const;
 
     // The speed limit at arc length `distM` along the route. If `distM` is past
     // the built end, returns the last known limit on the route. Returns false

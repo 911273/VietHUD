@@ -26,6 +26,20 @@ struct AppConfig {
     // switch itself (still a plain on/off).
     bool audioEnabled = true;
 
+    // Per-alert-type sound (2026-09-26, "cai dat loai canh bao se duoc thong
+    // bao bang am thanh"). Each gates BOTH the chime and the voice line of that
+    // alert; the visual card/sign is unaffected. audioEnabled above is still the
+    // master switch (also toggled by holding the Dashboard ~2.5 s).
+    bool audioOverspeed = true;  // over the limit
+    bool audioCamera = true;     // speed camera ahead
+    bool audioLimitAhead = true; // speed-limit change ahead
+    bool audioResident = true;   // residential area start/end
+    bool audioNoOvertake = true; // no-overtaking start/end
+    bool audioToll = true;       // toll booth
+    bool audioLight = true;      // traffic light
+    bool audioDanger = true;     // hazard / danger zone
+    bool audioSystem = true;     // GPS ready/lost + device-temperature chimes
+
     // Speaker volume 0-100% (audio/AudioPlayer.cpp audioSetVolume). Defaults to
     // 100 = loudest the NS4168 + full-scale digital path allow (raised from the
     // old hard-coded 80% default 2026-09-24). Applied in applyConfig(),

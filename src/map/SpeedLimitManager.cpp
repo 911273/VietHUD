@@ -68,6 +68,11 @@ struct CachedTile {
     uint32_t lastUsedMs = 0;
     int segCount = 0;
     RoadSegment *segments = NULL; // PSRAM buffer, allocated once in speedLimitManagerStart()
+    // Node lookup (2026-09-26): segments[] is sorted by startLatE7 at load, and
+    // endIdx[] lists segment indices sorted by endLatE7, so the segments
+    // touching a node are found by binary search (tileSegmentsAtNode) instead
+    // of scanning the whole tile — the matcher/route hot path in dense streets.
+    uint16_t *endIdx = NULL;
 };
 static CachedTile cache[kCacheSize];
 
@@ -83,6 +88,7 @@ static void allocateTileCache() {
             Serial.println("[map] WARN: PSRAM allocation for tile cache failed, falling back to internal RAM");
             cache[i].segments = (RoadSegment *)malloc(sizeof(RoadSegment) * kMaxSegmentsPerTile);
         }
+        cache[i].endIdx = (uint16_t *)heap_caps_malloc(sizeof(uint16_t) * kMaxSegmentsPerTile, MALLOC_CAP_SPIRAM);
     }
 }
 
@@ -220,6 +226,7 @@ static bool evaluateSegment(const RoadSegment &seg, float fixLat, float fixLon, 
 // RAM, only the current tile + its 4 neighbors, evicting least-recently-used
 // when the small fixed cache is full.
 // ---------------------------------------------------------------------
+static uint32_t gTileLoadsWindow = 0; // SD tile reads (cache misses) since the last [map] tick log
 static uint32_t packTile(int32_t latCell, int32_t lonCell) {
     return ((uint32_t)latCell << 16) | ((uint32_t)lonCell & 0xFFFF);
 }
@@ -228,6 +235,50 @@ static CachedTile *findCachedTile(uint32_t tileId) {
     for (int i = 0; i < kCacheSize; i++)
         if (cache[i].valid && cache[i].tileId == tileId) return &cache[i];
     return NULL;
+}
+
+static const RoadSegment *gSortSegs = NULL; // qsort context for cmpEndIdx (single task)
+static int cmpStartLat(const void *a, const void *b) {
+    int32_t x = ((const RoadSegment *)a)->startLatE7, y = ((const RoadSegment *)b)->startLatE7;
+    return (x > y) - (x < y);
+}
+static int cmpEndIdx(const void *a, const void *b) {
+    int32_t x = gSortSegs[*(const uint16_t *)a].endLatE7, y = gSortSegs[*(const uint16_t *)b].endLatE7;
+    return (x > y) - (x < y);
+}
+static void indexTile(CachedTile &t) {
+    qsort(t.segments, t.segCount, sizeof(RoadSegment), cmpStartLat);
+    if (!t.endIdx) return;
+    for (int i = 0; i < t.segCount; i++) t.endIdx[i] = (uint16_t)i;
+    gSortSegs = t.segments;
+    qsort(t.endIdx, t.segCount, sizeof(uint16_t), cmpEndIdx);
+}
+
+// Calls fn(seg) for every segment of the tile with an endpoint coinciding with
+// the node (segNodesCoincide), via the two sorted orders built by indexTile().
+template <class Fn> static void tileSegmentsAtNode(const CachedTile &t, int32_t latE7, int32_t lonE7, Fn fn) {
+    const int32_t lo = latE7 - SEG_NODE_MATCH_EPS_E7, hi = latE7 + SEG_NODE_MATCH_EPS_E7;
+    int a = 0, b = t.segCount;
+    while (a < b) { int m = (a + b) >> 1; if (t.segments[m].startLatE7 < lo) a = m + 1; else b = m; }
+    for (int i = a; i < t.segCount && t.segments[i].startLatE7 <= hi; i++)
+        if (segNodesCoincide(t.segments[i].startLatE7, t.segments[i].startLonE7, latE7, lonE7)) fn(t.segments[i]);
+    if (!t.endIdx) { // no index memory: plain scan for the end-node side
+        for (int i = 0; i < t.segCount; i++)
+            if (segNodesCoincide(t.segments[i].endLatE7, t.segments[i].endLonE7, latE7, lonE7) &&
+                !segNodesCoincide(t.segments[i].startLatE7, t.segments[i].startLonE7, latE7, lonE7))
+                fn(t.segments[i]);
+        return;
+    }
+    a = 0; b = t.segCount;
+    while (a < b) { int m = (a + b) >> 1; if (t.segments[t.endIdx[m]].endLatE7 < lo) a = m + 1; else b = m; }
+    for (int i = a; i < t.segCount; i++) {
+        const RoadSegment &g = t.segments[t.endIdx[i]];
+        if (g.endLatE7 > hi) break;
+        // A segment whose BOTH ends touch the node (degenerate) was already reported above.
+        if (segNodesCoincide(g.endLatE7, g.endLonE7, latE7, lonE7) &&
+            !segNodesCoincide(g.startLatE7, g.startLonE7, latE7, lonE7))
+            fn(g);
+    }
 }
 
 static const CachedTile *getOrLoadTile(uint32_t tileId) {
@@ -265,12 +316,14 @@ static const CachedTile *getOrLoadTile(uint32_t tileId) {
         if (cache[i].lastUsedMs < cache[victim].lastUsedMs) victim = i;
     }
     if (!cache[victim].segments) return NULL;
+    gTileLoadsWindow++;
     int n = 0;
     sdMgrReadTile(entry, cache[victim].segments, kMaxSegmentsPerTile, &n);
     cache[victim].valid = true;
     cache[victim].tileId = tileId;
     cache[victim].segCount = n;
     cache[victim].lastUsedMs = millis();
+    indexTile(cache[victim]);
     return &cache[victim];
 }
 
@@ -399,6 +452,7 @@ static const float kItemLateralTolM = 25.0f;   // stricter: a camera/sign must b
 static const float kItemOwnMarginM = 3.0f;     // ...no other road may be closer to it by more than this (see routeOwnsItem)
 static const float kItemNearRadiusM = 30.0f;   // roads considered as competing owners of an item
 
+static uint32_t gTickMaxUs = 0, gTickMaxMatchUs = 0, gTickMaxMapUs = 0; // worst tick per debug window
 static Route gRoute;                  // the one forward-route instance this module owns
 static int gRouteCount = 0;           // mirror of gRoute.count(), kept in sync by buildForwardRoute()/resetRouteState() so call sites read a plain int
 static uint32_t gRouteHeadRoadId = 0; // road id the route was built from (its first segment)
@@ -422,22 +476,17 @@ static int routeSegmentProvider(int32_t nodeLatE7, int32_t nodeLonE7, RoadSegmen
         for (int dLon = -1; dLon <= 1; dLon++) {
             const CachedTile *tile = getOrLoadTile(packTile(latCell + dLat, lonCell + dLon));
             if (!tile) continue;
-            for (int s = 0; s < tile->segCount && n < maxOut; s++) {
-                const RoadSegment &c = tile->segments[s];
-                // Tolerant node match (see segNodesCoincide in SpeedMapFormat.h):
-                // returns candidates incident to the node even when tile-clipped
-                // vector data leaves border endpoints off by a sub-meter amount,
-                // so RoutePredictor can stitch across tile boundaries.
-                bool startsHere = segNodesCoincide(c.startLatE7, c.startLonE7, nodeLatE7, nodeLonE7);
-                bool endsHere = segNodesCoincide(c.endLatE7, c.endLonE7, nodeLatE7, nodeLonE7);
-                if (!startsHere && !endsHere) continue;
-                bool dup = false;
-                for (int k = 0; k < n; k++) {
-                    if (out[k].id == c.id) { dup = true; break; }
-                }
-                if (dup) continue;
+            // Tolerant node match (see segNodesCoincide in SpeedMapFormat.h):
+            // returns candidates incident to the node even when tile-clipped
+            // vector data leaves border endpoints off by a sub-meter amount,
+            // so RoutePredictor can stitch across tile boundaries. Binary
+            // search on the tile's sorted orders (tileSegmentsAtNode).
+            tileSegmentsAtNode(*tile, nodeLatE7, nodeLonE7, [&](const RoadSegment &c) {
+                if (n >= maxOut) return;
+                for (int k = 0; k < n; k++)
+                    if (out[k].id == c.id) return;
                 out[n++] = c;
-            }
+            });
         }
     }
     return n;
@@ -487,10 +536,14 @@ static const ItemNearEntry &itemNearRoads(uint32_t key, float lat, float lon) {
         for (int dLon = -1; dLon <= 1; dLon++) {
             const CachedTile *tile = getOrLoadTile(packTile(latCell + dLat, lonCell + dLon));
             if (!tile) continue;
-            for (int s = 0; s < tile->segCount; s++) {
+            // segments[] is sorted by startLatE7 (indexTile): scan only the latitude band.
+            int32_t bandLo = (int32_t)((lat - boxDeg) * 1e7f), bandHi = (int32_t)((lat + boxDeg) * 1e7f);
+            int s0 = 0, s1 = tile->segCount;
+            while (s0 < s1) { int m = (s0 + s1) >> 1; if (tile->segments[m].startLatE7 < bandLo) s0 = m + 1; else s1 = m; }
+            for (int s = s0; s < tile->segCount && tile->segments[s].startLatE7 <= bandHi; s++) {
                 const RoadSegment &c = tile->segments[s];
-                float aLat = c.startLatE7 / 1e7f, aLon = c.startLonE7 / 1e7f;
-                if (fabsf(aLat - lat) > boxDeg || fabsf(aLon - lon) > boxDeg * 1.1f) continue;
+                float aLon = c.startLonE7 / 1e7f;
+                if (fabsf(aLon - lon) > boxDeg * 1.1f) continue;
                 float d = segPointDistM(c, lat, lon);
                 if (d > kItemNearRadiusM) continue;
                 if (e.n < kItemNearMax) {
@@ -529,7 +582,7 @@ static bool routeBeyondUnpassedFork(float arcM) {
 
 static bool routeFindAheadLimitChange(float fromDistM, float currentLimitKmh, float maxM, float &outDistM,
                                       float &outLimitKmh) {
-    return gRoute.limitChangeAhead(fromDistM, currentLimitKmh, maxM, outDistM, outLimitKmh);
+    return gRoute.limitChangeAhead(fromDistM, currentLimitKmh, maxM, outDistM, outLimitKmh, /*taggedOnly=*/true);
 }
 
 static bool routeLimitAtDist(float distM, float &outLimitKmh) { return gRoute.limitAt(distM, outLimitKmh); }
@@ -560,7 +613,24 @@ static bool routeUpdateCarPosition(float lat, float lon) {
 
 // Clears all route state — used after the synthetic self-test so it doesn't
 // seed the first real match with a route anchored where the car isn't.
+// Passed-sign override (2026-09-26, "mot so bieu tuong canh bao toc do bi
+// sai, hien so khong dung nhu bien bao"). ~96% of segments carry a DEFAULT
+// limit — a guess from the road class (40/30/50), not a sign. A real speed-limit
+// sign the car has just passed on its own route is ground truth, so it becomes
+// the displayed limit and stays so while the car keeps following the predicted
+// road ahead. It is dropped when the car turns off onto a road the route did
+// not predict (a junction turn), when it loses the route, after
+// kSignOverrideMaxMs, or when the next speed sign replaces it.
+static float gSignOverrideKmh = -1.0f;
+static uint32_t gSignOverrideMs = 0;
+static const uint32_t kSignOverrideMaxMs = 20UL * 60UL * 1000UL;
+static void clearSignOverride(const char *why) {
+    if (gSignOverrideKmh > 0) Serial.printf("[map] sign limit %.0f dropped (%s)\n", (double)gSignOverrideKmh, why);
+    gSignOverrideKmh = -1.0f;
+}
+
 static void resetRouteState() {
+    clearSignOverride("route reset");
     gRoute.reset();
     gRouteCount = 0;
     gRouteHeadRoadId = 0;
@@ -886,6 +956,9 @@ static void runMatch(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
             needRebuild = true; // off the route entirely
         }
     }
+    if (gSignOverrideKmh > 0 && gRouteCount > 0 && gRouteHeadRoadId != chosen.roadId &&
+        !gRoute.containsSegment(chosen.roadId))
+        clearSignOverride("turned off the predicted road");
     if (needRebuild) {
         float hd = gnss.headingValid ? gnss.headingDeg : (float)chosenSeg.headingDeg;
         buildForwardRoute(chosenSeg, hd);
@@ -1061,18 +1134,19 @@ static const float kCameraBearingToleranceDeg = 60.0f; // how far off dead-ahead
 // being picked up. Falls back to the old bearing-cone scan when there's no
 // usable route.
 static void matchCameraAheadRoute(const GnssSnapshot &gnss, const RoadInfoSnapshot &roadMatch, RoadInfoSnapshot &out) {
-    const CameraPoint *cams;
+    const CamPt *cams;
     int camCount;
     sdMgrGetCameras(&cams, &camCount);
     if (camCount == 0) return;
 
     float warnDistM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
     float bestAheadDistM = 1e9f;
-    const CameraPoint *best = NULL;
+    const CamPt *best = NULL;
 
     // Bounding-box prefilter around the car, then project onto the route.
     float dLatMax = (warnDistM + kRouteLateralTolM) / 110540.0f + 0.0005f;
-    for (int i = 0; i < camCount; i++) {
+    int32_t bandLo = (int32_t)((gnss.latDeg - (dLatMax)) * 1e7f), bandHi = (int32_t)((gnss.latDeg + (dLatMax)) * 1e7f);
+    for (int i = pointsLatBegin(cams, camCount, bandLo); i < camCount && cams[i].latE7 <= bandHi; i++) {
         float camLat = cams[i].latE7 / 1e7f, camLon = cams[i].lonE7 / 1e7f;
         if (fabsf(camLat - gnss.latDeg) > dLatMax) continue;
         Vec2 p = toLocalMeters(camLat, camLon, gnss.latDeg, gnss.lonDeg);
@@ -1103,15 +1177,16 @@ static void matchCameraAheadRoute(const GnssSnapshot &gnss, const RoadInfoSnapsh
 }
 
 static void matchCameraAheadStraight(const GnssSnapshot &gnss, const RoadInfoSnapshot &roadMatch, RoadInfoSnapshot &out) {
-    const CameraPoint *cams;
+    const CamPt *cams;
     int camCount;
     sdMgrGetCameras(&cams, &camCount);
     if (camCount == 0) return;
 
     float warnDistM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
     float bestDistM = 1e9f;
-    const CameraPoint *best = NULL;
-    for (int i = 0; i < camCount; i++) {
+    const CamPt *best = NULL;
+    int32_t bandLo = (int32_t)((gnss.latDeg - (warnDistM / 110540.0f + 0.0005f)) * 1e7f), bandHi = (int32_t)((gnss.latDeg + (warnDistM / 110540.0f + 0.0005f)) * 1e7f);
+    for (int i = pointsLatBegin(cams, camCount, bandLo); i < camCount && cams[i].latE7 <= bandHi; i++) {
         float camLat = cams[i].latE7 / 1e7f, camLon = cams[i].lonE7 / 1e7f;
         Vec2 p = toLocalMeters(camLat, camLon, gnss.latDeg, gnss.lonDeg); // camera's offset FROM the fix
         float distM = sqrtf(p.x * p.x + p.y * p.y);
@@ -1152,12 +1227,12 @@ static const float kSignBearingToleranceDeg = 50.0f; // straight-line fallback o
 // passed (for the no-tag fallback below), and applies the fallback current-limit
 // logic. Factored out 2026-09-23 so the route rewrite and the old bearing-cone
 // path can't drift apart in how they populate the same fields.
-static void fillSignResults(RoadInfoSnapshot &out, const TrafficSignPoint *bestSpeedSign, float bestSpeedDistM,
-                            const TrafficSignPoint *bestResident, float bestResidentDistM,
-                            const TrafficSignPoint *bestNoOvertake, float bestNoOvertakeDistM,
-                            const TrafficSignPoint *bestToll, float bestTollDistM, const TrafficSignPoint *bestLight,
-                            float bestLightDistM, const TrafficSignPoint *bestDanger, float bestDangerDistM,
-                            const TrafficSignPoint *closestSign, float closestSignDistM) {
+static void fillSignResults(RoadInfoSnapshot &out, const SignPt *bestSpeedSign, float bestSpeedDistM,
+                            const SignPt *bestResident, float bestResidentDistM,
+                            const SignPt *bestNoOvertake, float bestNoOvertakeDistM,
+                            const SignPt *bestToll, float bestTollDistM, const SignPt *bestLight,
+                            float bestLightDistM, const SignPt *bestDanger, float bestDangerDistM,
+                            const SignPt *closestSign, float closestSignDistM) {
     static float sLastPassedSpeedLimit = -1.0f;
     static uint32_t sLastPassedSpeedLimitMs = 0;
 
@@ -1235,7 +1310,7 @@ static void fillSignResults(RoadInfoSnapshot &out, const TrafficSignPoint *bestS
 //     on a curve is judged by the road direction there.
 // Falls back to the bearing-cone scan when there's no usable route.
 static void matchSignsAheadRoute(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
-    const TrafficSignPoint *signs;
+    const SignPt *signs;
     int signCount;
     sdMgrGetSigns(&signs, &signCount);
     if (signCount == 0) return;
@@ -1244,18 +1319,18 @@ static void matchSignsAheadRoute(const GnssSnapshot &gnss, RoadInfoSnapshot &out
     float dLatMax = (signWarnDistM + kRouteLateralTolM) / 110540.0f + 0.0005f;
 
     float closestSignDistM = 1e9f;
-    const TrafficSignPoint *closestSign = NULL;
-    float bestSpeedDistM = 1e9f;  const TrafficSignPoint *bestSpeedSign = NULL;
-    float bestResidentDistM = 1e9f; const TrafficSignPoint *bestResident = NULL;
-    float bestNoOvertakeDistM = 1e9f; const TrafficSignPoint *bestNoOvertake = NULL;
-    float bestTollDistM = 1e9f;   const TrafficSignPoint *bestToll = NULL;
-    float bestLightDistM = 1e9f;  const TrafficSignPoint *bestLight = NULL;
-    float bestDangerDistM = 1e9f; const TrafficSignPoint *bestDanger = NULL;
+    const SignPt *closestSign = NULL;
+    float bestSpeedDistM = 1e9f;  const SignPt *bestSpeedSign = NULL;
+    float bestResidentDistM = 1e9f; const SignPt *bestResident = NULL;
+    float bestNoOvertakeDistM = 1e9f; const SignPt *bestNoOvertake = NULL;
+    float bestTollDistM = 1e9f;   const SignPt *bestToll = NULL;
+    float bestLightDistM = 1e9f;  const SignPt *bestLight = NULL;
+    float bestDangerDistM = 1e9f; const SignPt *bestDanger = NULL;
 
-    for (int i = 0; i < signCount; i++) {
+    int32_t bandLo = (int32_t)((gnss.latDeg - (dLatMax)) * 1e7f), bandHi = (int32_t)((gnss.latDeg + (dLatMax)) * 1e7f);
+    for (int i = pointsLatBegin(signs, signCount, bandLo); i < signCount && signs[i].latE7 <= bandHi; i++) {
         float signLat = signs[i].latE7 / 1e7f;
         float signLon = signs[i].lonE7 / 1e7f;
-        if (fabsf(signLat - gnss.latDeg) > dLatMax) continue;
         Vec2 p = toLocalMeters(signLat, signLon, gnss.latDeg, gnss.lonDeg);
         if (sqrtf(p.x * p.x + p.y * p.y) > signWarnDistM + kRouteLateralTolM) continue;
 
@@ -1288,39 +1363,46 @@ static void matchSignsAheadRoute(const GnssSnapshot &gnss, RoadInfoSnapshot &out
             bestDangerDistM = aheadDist; bestDanger = &signs[i];
         }
     }
+    if (bestSpeedSign && bestSpeedDistM < 35.0f && bestSpeedSign->speedLimitKmh >= 5) {
+        float v = (float)bestSpeedSign->speedLimitKmh;
+        if (v != gSignOverrideKmh) Serial.printf("[map] passed speed sign %.0f -> current limit\n", (double)v);
+        gSignOverrideKmh = v;
+        gSignOverrideMs = millis();
+    }
     fillSignResults(out, bestSpeedSign, bestSpeedDistM, bestResident, bestResidentDistM, bestNoOvertake,
                     bestNoOvertakeDistM, bestToll, bestTollDistM, bestLight, bestLightDistM, bestDanger,
                     bestDangerDistM, closestSign, closestSignDistM);
 }
 
 static void matchSignsAheadStraight(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
-    const TrafficSignPoint *signs;
+    const SignPt *signs;
     int signCount;
     sdMgrGetSigns(&signs, &signCount);
     if (signCount == 0) return;
 
     float closestSignDistM = 1e9f;
-    const TrafficSignPoint *closestSign = NULL;
+    const SignPt *closestSign = NULL;
 
     float bestSpeedDistM = 1e9f;
-    const TrafficSignPoint *bestSpeedSign = NULL;
+    const SignPt *bestSpeedSign = NULL;
 
     float bestResidentDistM = 1e9f;
-    const TrafficSignPoint *bestResident = NULL;
+    const SignPt *bestResident = NULL;
 
     float bestNoOvertakeDistM = 1e9f;
-    const TrafficSignPoint *bestNoOvertake = NULL;
+    const SignPt *bestNoOvertake = NULL;
 
     float bestTollDistM = 1e9f;
-    const TrafficSignPoint *bestToll = NULL;
+    const SignPt *bestToll = NULL;
 
     float bestLightDistM = 1e9f;
-    const TrafficSignPoint *bestLight = NULL;
+    const SignPt *bestLight = NULL;
 
     float bestDangerDistM = 1e9f;
-    const TrafficSignPoint *bestDanger = NULL;
+    const SignPt *bestDanger = NULL;
 
-    for (int i = 0; i < signCount; i++) {
+    int32_t bandLo = (int32_t)((gnss.latDeg - (0.005f)) * 1e7f), bandHi = (int32_t)((gnss.latDeg + (0.005f)) * 1e7f);
+    for (int i = pointsLatBegin(signs, signCount, bandLo); i < signCount && signs[i].latE7 <= bandHi; i++) {
         float signLat = signs[i].latE7 / 1e7f;
         float signLon = signs[i].lonE7 / 1e7f;
 
@@ -1404,10 +1486,11 @@ bool speedLimitManagerGetNearbyMarkers(float lat, float lon, float radiusM, Near
     float cosLat = cosf(lat * (float)M_PI / 180.0f);
     int n = 0;
 
-    const CameraPoint *cams;
+    const CamPt *cams;
     int camCount;
     sdMgrGetCameras(&cams, &camCount);
-    for (int i = 0; i < camCount && n < maxOut; i++) {
+    int32_t bandLo = (int32_t)((lat - radiusM / 110540.0f) * 1e7f), bandHi = (int32_t)((lat + radiusM / 110540.0f) * 1e7f);
+    for (int i = pointsLatBegin(cams, camCount, bandLo); i < camCount && cams[i].latE7 <= bandHi && n < maxOut; i++) {
         float camLat = cams[i].latE7 / 1e7f, camLon = cams[i].lonE7 / 1e7f;
         float dxM = (camLon - lon) * 111320.0f * cosLat;
         float dyM = (camLat - lat) * 110540.0f;
@@ -1418,10 +1501,10 @@ bool speedLimitManagerGetNearbyMarkers(float lat, float lon, float radiusM, Near
         n++;
     }
 
-    const TrafficSignPoint *signs;
+    const SignPt *signs;
     int signCount;
     sdMgrGetSigns(&signs, &signCount);
-    for (int i = 0; i < signCount && n < maxOut; i++) {
+    for (int i = pointsLatBegin(signs, signCount, bandLo); i < signCount && signs[i].latE7 <= bandHi && n < maxOut; i++) {
         float signLat = signs[i].latE7 / 1e7f, signLon = signs[i].lonE7 / 1e7f;
         float dxM = (signLon - lon) * 111320.0f * cosLat;
         float dyM = (signLat - lat) * 110540.0f;
@@ -1505,7 +1588,18 @@ static void speedLimitTaskFn(void *) {
         if (ri.mapLoaded) {
             GnssSnapshot gnss = gnssSnapshot();
             RoadInfoSnapshot out;
+            uint32_t tTick0 = micros();
             runMatch(gnss, out);
+            uint32_t tMatch = micros() - tTick0;
+            if (gSignOverrideKmh > 0) {
+                if (millis() - gSignOverrideMs > kSignOverrideMaxMs) clearSignOverride("expired");
+                else if (!gCarOnRoute) clearSignOverride("off route");
+                else if (out.valid || gnss.fix) {
+                    out.valid = true;
+                    out.speedLimitKmh = gSignOverrideKmh;
+                    out.source = SPEED_SOURCE_OSM_MAXSPEED; // a real sign, not a guess
+                }
+            }
 
             // Ahead-lookahead (see findAheadLimitChange's own comment) —
             // runs while actually moving and EITHER we have a trustworthy
@@ -1567,8 +1661,14 @@ static void speedLimitTaskFn(void *) {
                 // roadInfoPublish() is — demo/DemoMode.cpp drives the map
                 // directly via mapRendererComputeFromSegments() with its own
                 // synthetic road network instead.
+                uint32_t tMap0 = micros();
                 mapRendererUpdate(gnss);
+                uint32_t tMap = micros() - tMap0;
+                if (tMap > gTickMaxMapUs) gTickMaxMapUs = tMap;
             }
+            uint32_t tTick = micros() - tTick0;
+            if (tTick > gTickMaxUs) gTickMaxUs = tTick;
+            if (tMatch > gTickMaxMatchUs) gTickMaxMatchUs = tMatch;
 
             // Same 3s periodic-debug pattern as gnss/GNSS.cpp and
             // radar/LD2451.cpp — lat/lon isn't shown anywhere in the UI, so
@@ -1587,6 +1687,11 @@ static void speedLimitTaskFn(void *) {
                               (unsigned long)out.roadId, (double)out.confidence, (double)out.matchDistanceM,
                               (double)out.speedLimitKmh, speedSourceStr(out.source), gTrackReason,
                               gTrack.hypothesisCount(), (double)gTrack.margin());
+                Serial.printf("[map] tick max %lums (match %lums, map %lums) route=%d segs, %lu tile loads\n",
+                              (unsigned long)(gTickMaxUs / 1000), (unsigned long)(gTickMaxMatchUs / 1000),
+                              (unsigned long)(gTickMaxMapUs / 1000), gRouteCount, (unsigned long)gTileLoadsWindow);
+                gTileLoadsWindow = 0;
+                gTickMaxUs = gTickMaxMatchUs = gTickMaxMapUs = 0;
             }
         }
         esp_task_wdt_reset();

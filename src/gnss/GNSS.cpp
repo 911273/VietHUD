@@ -12,6 +12,27 @@
 #include <string.h> // memcpy (UBX MON-VER)
 #include <stdlib.h> // atoi (GSV counts)
 
+// Bench drive simulator state (see gnssSimStart in GNSS.h).
+static volatile bool gSimActive = false;
+static float gSimLat = 0, gSimLon = 0, gSimHeadingDeg = 0, gSimSpeedKmh = 0;
+static uint32_t gSimEndMs = 0, gSimLastStepMs = 0, gSimFixSeq = 0;
+void gnssSimStart(float lat, float lon, float headingDeg, float speedKmh, float seconds) {
+    if (seconds <= 0) {
+        gSimActive = false;
+        Serial.println("[gnss] drive simulation stopped");
+        return;
+    }
+    gSimLat = lat;
+    gSimLon = lon;
+    gSimHeadingDeg = headingDeg;
+    gSimSpeedKmh = speedKmh;
+    gSimLastStepMs = millis();
+    gSimEndMs = gSimLastStepMs + (uint32_t)(seconds * 1000.0f);
+    gSimActive = true;
+    Serial.printf("[gnss] drive simulation: %.6f,%.6f hdg %.0f %.0f km/h for %.0f s\n", (double)lat, (double)lon,
+                  (double)headingDeg, (double)speedKmh, (double)seconds);
+}
+
 // Confirmed on real hardware 2026-09-15 by sweeping candidate bauds and
 // dumping raw bytes: this specific M10N breakout is NOT the common
 // 9600-by-default kind — 9600 decoded as binary garbage (proved it wasn't
@@ -387,6 +408,35 @@ static void gnssTaskFn(void *) {
         // — this task keeps running and keeps its own filter/fix state warm,
         // so switching the demo off hands back a live reading within one
         // 50ms tick rather than a stale or re-converging one.
+        if (gSimActive) {
+            uint32_t nowS = millis();
+            if ((int32_t)(nowS - gSimEndMs) >= 0) {
+                gSimActive = false;
+                Serial.println("[gnss] drive simulation finished");
+            } else if (nowS - gSimLastStepMs >= 200) {
+                float dt = (nowS - gSimLastStepMs) / 1000.0f;
+                gSimLastStepMs = nowS;
+                float dM = gSimSpeedKmh / 3.6f * dt;
+                float hr = gSimHeadingDeg * 0.0174533f;
+                gSimLat += dM * cosf(hr) / 110540.0f;
+                gSimLon += dM * sinf(hr) / (111320.0f * cosf(gSimLat * 0.0174533f));
+                gSimFixSeq++;
+            }
+            if (gSimActive) {
+                snap.fix = true;
+                snap.linkAlive = true;
+                snap.satCount = 14;
+                snap.latDeg = gSimLat;
+                snap.lonDeg = gSimLon;
+                snap.egoSpeedKmh = snap.rawSpeedKmh = gSimSpeedKmh;
+                snap.headingDeg = gSimHeadingDeg;
+                snap.headingValid = true;
+                snap.headingPredicted = false;
+                snap.hdop = 0.9f;
+                snap.altitudeValid = false;
+                snap.fixSeq = 0x80000000u | gSimFixSeq;
+            }
+        }
         if (!demoModeIsEnabled()) gnssPublish(snap);
 
         uint32_t now = millis();

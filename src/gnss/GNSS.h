@@ -44,3 +44,9 @@ static const uint32_t kHeadingHoldMs = 6000;
 // OR there's no reliable fix at all — never assume stationary from an
 // absence of information.
 uint32_t gnssMsSinceStationary();
+
+// Bench drive simulator (serial "S lat lon heading speedKmh seconds"): replaces
+// the live fix with a car driving straight from (lat,lon) along `heading` at
+// `speedKmh` for `seconds` (5 fixes/s), so the matcher + map can be exercised
+// in a real dense area from the desk. seconds <= 0 stops it.
+void gnssSimStart(float lat, float lon, float headingDeg, float speedKmh, float seconds);
