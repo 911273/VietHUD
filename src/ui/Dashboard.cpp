@@ -934,7 +934,11 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 
     wifiTopIcon = lv_label_create(topBar);
     lv_label_set_text(wifiTopIcon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x7C8A9A), 0);
+    // Fixed width, right-aligned: the text grows to "WiFi ✓" when a phone joins,
+    // and the clock is aligned to this box once at build time.
+    lv_obj_set_width(wifiTopIcon, 44);
+    lv_obj_set_style_text_align(wifiTopIcon, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_align_to(wifiTopIcon, gearIcon, LV_ALIGN_OUT_LEFT_MID, -10, 0);
     lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
@@ -1079,7 +1083,11 @@ static void buildDashboardPortrait(lv_obj_t *scr) {
 
     wifiTopIcon = lv_label_create(topBar);
     lv_label_set_text(wifiTopIcon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x7C8A9A), 0);
+    // Fixed width, right-aligned: the text grows to "WiFi ✓" when a phone joins,
+    // and the clock is aligned to this box once at build time.
+    lv_obj_set_width(wifiTopIcon, 44);
+    lv_obj_set_style_text_align(wifiTopIcon, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_align_to(wifiTopIcon, gearIcon, LV_ALIGN_OUT_LEFT_MID, -8, 0);
     lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
@@ -1529,17 +1537,20 @@ void refreshDashboard() {
     }
     lv_label_set_text(gnssCaption, gBuf); // text itself set once at build — see buildDashboard()
 
-    // WiFi icon — shown only while actually on (net/WebPortal.h). Gated on
-    // an actual state CHANGE, not called unconditionally every tick, same
-    // discipline as lastDaytime/lastCriticalState below — a HIDDEN-flag
-    // toggle is cheap on its own, but there's no reason to touch it 6-7x/s
-    // for a value that only ever changes on a user gesture.
-    static bool lastWifiOn = false;
-    bool wifiOn = webPortalIsEnabled();
-    if (wifiOn != lastWifiOn) {
-        lastWifiOn = wifiOn;
-        if (wifiOn) lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
+    // WiFi icon, three states: hidden (WiFi off), grey (hotspot on, waiting),
+    // green "WiFi ✓" (a phone is connected to the hotspot). Touched only on a
+    // state CHANGE — a style/text write always invalidates, and this runs 6-7x/s.
+    static int lastWifiState = 0; // 0 off, 1 on/waiting, 2 phone connected
+    int wifiState = !webPortalIsEnabled() ? 0 : (webPortalClientCount() > 0 ? 2 : 1);
+    if (wifiState != lastWifiState) {
+        lastWifiState = wifiState;
+        if (wifiState == 0) {
+            lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_label_set_text(wifiTopIcon, wifiState == 2 ? LV_SYMBOL_WIFI " " LV_SYMBOL_OK : LV_SYMBOL_WIFI);
+            lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(wifiState == 2 ? 0x3CC46E : 0x7C8A9A), 0);
+            lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     // Real local time from the GNSS fix (spec section 15.2 wants sunrise/

@@ -222,9 +222,37 @@ static void wifiQrRebuild() {
     }
 }
 
+// Phone-joined detection for the QR screen: g_qrPrevClients = AP client count at
+// the previous refresh (-1 = take a fresh baseline), g_qrJoinedAtMs = when a
+// phone joined while the screen was up (0 = none pending).
+static int g_qrPrevClients = -1;
+static uint32_t g_qrJoinedAtMs = 0;
+static lv_obj_t *connToast = nullptr;   // "phone connected" pill on lv_layer_top()
+static uint32_t connToastUntilMs = 0;
+
+static void showPhoneConnectedToast() {
+    if (!connToast) {
+        connToast = lv_label_create(lv_layer_top());
+        lv_obj_set_style_bg_color(connToast, lv_color_hex(0x10261A), 0);
+        lv_obj_set_style_bg_opa(connToast, LV_OPA_90, 0);
+        lv_obj_set_style_border_color(connToast, lv_color_hex(0x3CC46E), 0);
+        lv_obj_set_style_border_width(connToast, 1, 0);
+        lv_obj_set_style_radius(connToast, 14, 0);
+        lv_obj_set_style_pad_hor(connToast, 14, 0);
+        lv_obj_set_style_pad_ver(connToast, 6, 0);
+        lv_obj_set_style_text_color(connToast, lv_color_hex(0xDFF5E6), 0);
+        lv_label_set_text(connToast, LV_SYMBOL_OK " Điện thoại đã kết nối · trang cài đặt: 192.168.4.1");
+        lv_obj_align(connToast, LV_ALIGN_TOP_MID, 0, 40);
+    }
+    lv_obj_clear_flag(connToast, LV_OBJ_FLAG_HIDDEN);
+    connToastUntilMs = millis() + 6000;
+}
+
 static void onWifiScanOpen(lv_event_t *) {
     webPortalRequestEnable(true);   // the AP must be up for the phone to join it
     g_qrPayload[0] = '\0';          // force a rebuild for the (now-active) AP creds
+    g_qrPrevClients = -1;           // baseline taken on the first refresh (see refreshScanListIfOpen)
+    g_qrJoinedAtMs = 0;
     wifiQrRebuild();
     lv_obj_clear_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(wifiScanOverlay);
@@ -395,6 +423,23 @@ static void refreshBridgeToast() {
 // (AP creds can change) and show the device hotspot creds + live status.
 static void refreshScanListIfOpen() {
     if (!wifiScanOverlay || lv_obj_has_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN)) return;
+
+    // A phone just joined the hotspot while this screen is up: let the green
+    // "Điện thoại đã kết nối" line show for ~1.5 s, then go back to the Dashboard
+    // (the phone opens the portal by itself). A phone that was ALREADY connected
+    // when the screen was opened doesn't trigger this, so QR 2 stays scannable.
+    int clientsNow = webPortalClientCount();
+    if (g_qrPrevClients < 0) g_qrPrevClients = clientsNow;
+    if (g_qrPrevClients == 0 && clientsNow > 0) g_qrJoinedAtMs = millis() | 1;
+    if (clientsNow == 0) g_qrJoinedAtMs = 0;
+    g_qrPrevClients = clientsNow;
+    if (g_qrJoinedAtMs && millis() - g_qrJoinedAtMs >= 1500 && !updateApiBusy()) {
+        g_qrJoinedAtMs = 0;
+        Serial.printf("[ui] phone joined the hotspot (%d client(s)) -> back to Dashboard\n", clientsNow);
+        showPhoneConnectedToast();
+        onWifiScanClose(nullptr);
+        return;
+    }
     wifiQrRebuild();
 
     if (scanSavedLbl) {
@@ -1283,7 +1328,15 @@ void buildSettingsScreen() {
     lv_timer_create(refreshSensorsPanel, 500, NULL); // live values only need to be as fresh as a human reads them
     // Phone-update progress pill: runs on EVERY screen (refreshSensorsPanel bails
     // out unless Settings is showing), cheap no-op while no phone is updating.
-    lv_timer_create([](lv_timer_t *) { refreshBridgeToast(); }, 500, NULL);
+    lv_timer_create(
+        [](lv_timer_t *) {
+            refreshBridgeToast();
+            if (connToast && connToastUntilMs && (int32_t)(millis() - connToastUntilMs) >= 0) {
+                connToastUntilMs = 0;
+                lv_obj_add_flag(connToast, LV_OBJ_FLAG_HIDDEN);
+            }
+        },
+        500, NULL);
     lv_timer_create(checkIdleReturnToDashboard, 1000, NULL);
 
     selectCategory(0);
