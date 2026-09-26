@@ -258,6 +258,7 @@ static void onWifiScanOpen(lv_event_t *) {
     lv_obj_move_foreground(wifiScanOverlay);
 }
 static void onWifiScanClose(lv_event_t *) {
+    Serial.println("[ui] WiFi QR screen closed");
     lv_obj_add_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
     g_activeCategory = 0; // leave the WiFi context so the idle-return timer re-arms
     // The WiFi "menu" IS this QR screen now, so closing it returns straight to the
@@ -337,17 +338,25 @@ static void buildWifiScanOverlay(lv_obj_t *parent) {
 
     bridgeBar = lv_bar_create(wifiScanOverlay);
     lv_obj_set_size(bridgeBar, rw, 10);
-    lv_obj_set_pos(bridgeBar, rx, Hh - 66);
+    lv_obj_set_pos(bridgeBar, rx, Hh - 72);
     lv_obj_set_style_bg_color(bridgeBar, lv_color_hex(0x1E2A38), LV_PART_MAIN);
     lv_obj_set_style_bg_color(bridgeBar, lv_color_hex(0x3DA5FF), LV_PART_INDICATOR);
     lv_bar_set_range(bridgeBar, 0, 100);
     lv_obj_add_flag(bridgeBar, LV_OBJ_FLAG_HIDDEN);
 
+    // Close = a strip running to the bottom AND right screen edges. Real taps
+    // in this corner were logged at y=319 (the panel reports touches near the
+    // bottom edge lower than the finger), i.e. BELOW the old button (y 270-310),
+    // so "Đóng" never fired. Reaching the edges + an extended click area makes
+    // any such clamped touch land on it.
+    (void)btnW;
     lv_obj_t *closeBtn = lv_button_create(wifiScanOverlay);
-    lv_obj_set_size(closeBtn, btnW, 40);
-    lv_obj_set_pos(closeBtn, W - btnW - 12, Hh - 50);
+    lv_obj_set_size(closeBtn, W - rx + 12, 58);
+    lv_obj_set_pos(closeBtn, rx - 12, Hh - 58);
+    lv_obj_set_ext_click_area(closeBtn, 10);
     lv_obj_set_style_bg_color(closeBtn, lv_color_hex(0x2A3644), 0);
-    lv_obj_set_style_radius(closeBtn, 10, 0);
+    lv_obj_set_style_radius(closeBtn, 0, 0);
+    lv_obj_set_style_shadow_width(closeBtn, 0, 0);
     lv_obj_add_event_cb(closeBtn, onWifiScanClose, LV_EVENT_CLICKED, NULL);
     lv_obj_t *closeLbl = lv_label_create(closeBtn);
     lv_label_set_text(closeLbl, "Đóng");
@@ -1123,7 +1132,10 @@ void buildSettingsScreen() {
         // tra/cấu hình," not the driving screen) rather than needing rows
         // trimmed to squeeze in. The old Radar/Safety tabs that used to also
         // need scrolling here are gone entirely (radar removed 2026-09-21).
-        if (i == 2 || i == 3) { // Sensors + WiFi tabs scroll (2026-09-25: WiFi now has AP + STA + data-update sections)
+        // Map (1) and Sensors (2) are taller than BODY_H and scroll. (Was "i == 2 ||
+        // i == 3" — left over from before the Map tab was inserted at index 1, so the
+        // Map tab couldn't scroll. WiFi (3) is just the QR overlay now.)
+        if (i == 1 || i == 2) {
             lv_obj_set_scroll_dir(panel, LV_DIR_VER);
             lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
         } else {

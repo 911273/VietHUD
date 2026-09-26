@@ -91,7 +91,29 @@ static lv_indev_t *lvTouchIndev;
 static uint32_t lastStatsMs = 0;
 static uint32_t lastMemStatsMs = 0;
 
+// Bench-only synthetic touch (serial 'T'/'H'/'G' in loop()): lets a PC drive the
+// UI without a finger — a press from (x0,y0) to (x1,y1) held until sInjEndMs.
+static volatile uint32_t sInjStartMs = 0, sInjEndMs = 0;
+static volatile int16_t sInjX0, sInjY0, sInjX1, sInjY1;
+
 static void touch_read_cb(lv_indev_t *, lv_indev_data_t *data) {
+    uint32_t nowMs = millis();
+    if (sInjEndMs && (int32_t)(nowMs - sInjEndMs) < 0) {
+        uint32_t span = sInjEndMs - sInjStartMs, t = nowMs - sInjStartMs;
+        data->point.x = sInjX0 + (int32_t)(sInjX1 - sInjX0) * (int32_t)t / (int32_t)(span ? span : 1);
+        data->point.y = sInjY0 + (int32_t)(sInjY1 - sInjY0) * (int32_t)t / (int32_t)(span ? span : 1);
+        data->state = LV_INDEV_STATE_PRESSED;
+        wakeScreen();
+        return;
+    }
+    if (sInjEndMs) { // injected gesture just ended: one release at its end point
+        sInjEndMs = 0;
+        data->point.x = sInjX1;
+        data->point.y = sInjY1;
+        data->state = LV_INDEV_STATE_RELEASED;
+        Serial.println("[touch] injected UP");
+        return;
+    }
     TouchPoint p = touchSnapshot();
     static bool wasTouched = false; // only log on DOWN/UP transitions, not every poll
     if (p.pressed) {
@@ -525,6 +547,18 @@ void loop() {
             webPortalRequestEnable(true); // bench: scan nearby WiFi (needs radio on) and log results
             webPortalStartScan();
             Serial.println("[debug] WiFi scan requested via serial");
+        } else if (c == 'T' || c == 'H' || c == 'G') {
+            // Bench: synthetic touch. "T x y" tap, "H x y ms" hold, "G x1 y1 x2 y2 ms" drag.
+            String line = Serial.readStringUntil('\n');
+            int v[5] = {0, 0, 0, 0, 0};
+            int n = sscanf(line.c_str(), "%d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4]);
+            int x0 = v[0], y0 = v[1], x1 = v[0], y1 = v[1], ms = 150;
+            if (c == 'H' && n >= 3) ms = v[2];
+            if (c == 'G' && n >= 5) { x1 = v[2]; y1 = v[3]; ms = v[4]; }
+            sInjX0 = x0; sInjY0 = y0; sInjX1 = x1; sInjY1 = y1;
+            sInjStartMs = millis();
+            sInjEndMs = sInjStartMs + (ms > 0 ? ms : 1);
+            Serial.printf("[touch] injected %c (%d,%d)->(%d,%d) %dms\n", c, x0, y0, x1, y1, ms);
         } else if (c == 'n') {
             // Bench: add a saved STA network without the touchscreen/portal —
             // "n<ssid>\t<password>\n". Used to put the device on a PC hotspot
