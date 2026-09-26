@@ -39,7 +39,7 @@ struct SwitchBinding {
 // 2 in use (Alert audio enabled, Trip logging) after radar removal
 // 2026-09-21 dropped the radar-only demo-mode/mount-flip switches this
 // array used to size against (was 12 wide for that reason).
-static SwitchBinding switchBindings[10];
+static SwitchBinding switchBindings[24];
 static int switchCount = 0;
 
 static lv_obj_t *settingsStatusLabel;
@@ -227,7 +227,6 @@ static void wifiQrRebuild() {
 // phone joined while the screen was up (0 = none pending).
 static int g_qrPrevClients = -1;
 static lv_obj_t *qrWifiSwitch = nullptr;  // WiFi on/off switch on the QR screen
-static bool g_qrSwitchTouched = false;    // user flipped it this visit -> respect it on Close
 static uint32_t g_qrJoinedAtMs = 0;
 static lv_obj_t *connToast = nullptr;   // "phone connected" pill on lv_layer_top()
 static uint32_t connToastUntilMs = 0;
@@ -251,22 +250,23 @@ static void showPhoneConnectedToast() {
 }
 
 static void onWifiScanOpen(lv_event_t *) {
-    webPortalRequestEnable(true);   // the AP must be up for the phone to join it
+    // Opening the screen does NOT change WiFi (2026-09-26, user request): the
+    // switch shows the current state; the user flips it to turn WiFi on/off.
     g_qrPayload[0] = '\0';          // force a rebuild for the (now-active) AP creds
     g_qrPrevClients = -1;           // baseline taken on the first refresh (see refreshScanListIfOpen)
     g_qrJoinedAtMs = 0;
-    g_qrSwitchTouched = false;
-    if (qrWifiSwitch) lv_obj_add_state(qrWifiSwitch, LV_STATE_CHECKED);
+    if (qrWifiSwitch) {
+        if (webPortalRequestedOn()) lv_obj_add_state(qrWifiSwitch, LV_STATE_CHECKED);
+        else lv_obj_remove_state(qrWifiSwitch, LV_STATE_CHECKED);
+    }
     wifiQrRebuild();
     lv_obj_clear_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(wifiScanOverlay);
 }
 static void onWifiScanClose(lv_event_t *) {
     Serial.println("[ui] WiFi QR screen closed");
-    // Opening this screen switched WiFi on; if nobody joined, switch it back off
-    // (it otherwise stayed on for the whole 10 min auto-off window — heat).
-    // (Unless the user set the switch themselves on this visit — then it stays as chosen.)
-    if (!g_qrSwitchTouched && webPortalClientCount() == 0 && !updateApiBusy()) webPortalRequestEnable(false);
+    // WiFi stays exactly as the switch left it (opening no longer turns it on,
+    // so closing no longer turns it off); the 10 min auto-off still applies.
     lv_obj_add_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
     g_activeCategory = 0; // leave the WiFi context so the idle-return timer re-arms
     // The WiFi "menu" IS this QR screen now, so closing it returns straight to the
@@ -342,7 +342,6 @@ static void buildWifiScanOverlay(lv_obj_t *parent) {
     lv_obj_add_event_cb(
         qrWifiSwitch, [](lv_event_t *e) {
             bool on = lv_obj_has_state((lv_obj_t *)lv_event_get_target(e), LV_STATE_CHECKED);
-            g_qrSwitchTouched = true;
             g_qrPrevClients = -1; // fresh baseline for the "phone joined" detection
             webPortalRequestEnable(on);
             Serial.printf("[ui] WiFi switched %s from the WiFi screen\n", on ? "ON" : "OFF");
@@ -1015,8 +1014,10 @@ static void onRestoreDefaults(lv_event_t *) {
     // stays blank, same as every other time it's displayed (see
     // wifiPasswordTa's own build comment) — cfg.wifiPassword IS reset
     // underneath, just never echoed into the field.
-    lv_textarea_set_text(wifiSsidTa, cfg.wifiSsid);
-    lv_textarea_set_text(wifiPasswordTa, "");
+    // Null-guarded (2026-09-26): the WiFi tab's text fields no longer exist (the
+    // tab is the QR screen now) — tapping "Defaults" crashed (LoadProhibited).
+    if (wifiSsidTa) lv_textarea_set_text(wifiSsidTa, cfg.wifiSsid);
+    if (wifiPasswordTa) lv_textarea_set_text(wifiPasswordTa, "");
     lv_label_set_text(settingsStatusLabel, "Restored defaults");
     Serial.println("[uidemo] config restored to defaults (not yet saved)");
 }
@@ -1025,11 +1026,19 @@ static void onRestoreDefaults(lv_event_t *) {
 // pre-built and toggled via LV_OBJ_FLAG_HIDDEN (no rebuild/flicker on
 // switching). Whole screen fits with no scrolling; Save/Defaults stay in a
 // fixed footer visible from every category.
-static const int kCategoryCount = 4;
+static const int kCategoryCount = 5;
 static lv_obj_t *categoryPanels[kCategoryCount];
 static lv_obj_t *navButtons[kCategoryCount];
 
 static void onWifiScanOpen(lv_event_t *); // fwd decl — selectCategory opens the QR screen
+
+void settingsSyncSwitches() {
+    for (int i = 0; i < switchCount; i++) {
+        SwitchBinding &b = switchBindings[i];
+        if (*b.target) lv_obj_add_state(b.sw, LV_STATE_CHECKED);
+        else lv_obj_clear_state(b.sw, LV_STATE_CHECKED);
+    }
+}
 
 static void selectCategory(int idx) {
     g_activeCategory = idx;
@@ -1113,7 +1122,7 @@ void buildSettingsScreen() {
     lv_obj_set_style_pad_all(navRail, 4, 0);
     lv_obj_clear_flag(navRail, LV_OBJ_FLAG_SCROLLABLE);
 
-    static const char *kCategoryNames[kCategoryCount] = {"Display", "Map", "Sensors", "WiFi"};
+    static const char *kCategoryNames[kCategoryCount] = {"Display", "Map", "Sensors", "WiFi", "Âm thanh"};
     for (int i = 0; i < kCategoryCount; i++) {
         lv_obj_t *btn = lv_button_create(navRail);
         lv_obj_set_size(btn, NAV_W - 8, 42);
@@ -1158,7 +1167,7 @@ void buildSettingsScreen() {
         // Map (1) and Sensors (2) are taller than BODY_H and scroll. (Was "i == 2 ||
         // i == 3" — left over from before the Map tab was inserted at index 1, so the
         // Map tab couldn't scroll. WiFi (3) is just the QR overlay now.)
-        if (i <= 2) { // Display, Map (+ Speed Map group) and Sensors are taller than BODY_H
+        if (i <= 2 || i == 4) { // Display, Map (+ Speed Map group), Sensors and Audio are taller than BODY_H
             lv_obj_set_scroll_dir(panel, LV_DIR_VER);
             lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
         } else {
@@ -1175,8 +1184,7 @@ void buildSettingsScreen() {
     // comment for why it's still just a plain on/off, repurposed rather
     // than removed, when radar was taken out 2026-09-21).
     y = 4;
-    addSwitchRow(categoryPanels[0], y, "Alert audio enabled", &cfg.audioEnabled);
-    addSliderRow(categoryPanels[0], y, "Volume", &cfg.audioVolume, 0, 100, 1.0f, " %");
+    // (Alert audio on/off + volume moved to the "Âm thanh" tab 2026-09-26.)
     addSliderRow(categoryPanels[0], y, "Brightness", &cfg.brightness, 5, 100, 1.0f, " %");
     // Backlight mode (2026-09-26): Auto caps the backlight at 50 % at night
     // (same GNSS sunrise/sunset as the Auto theme); Manual = always the slider.
@@ -1213,6 +1221,29 @@ void buildSettingsScreen() {
     // known stuck-bus quirk (2026-09-14) during the user's own testing.
     static const char *kRotationLabels[4] = {"0", "90", "180", "270"};
     addChoiceRow(categoryPanels[0], y, "Rotation", &cfg.screenRotation, kRotationLabels, 4);
+
+    // Audio tab (categoryPanels[4], 2026-09-26): master switch + volume, then
+    // which alert types speak. Holding the Dashboard ~2.5 s flips the master.
+    {
+        lv_obj_t *ap = categoryPanels[4];
+        int ya = 4;
+        addSwitchRow(ap, ya, "Âm thanh cảnh báo", &cfg.audioEnabled);
+        addSliderRow(ap, ya, "Âm lượng", &cfg.audioVolume, 0, 100, 1.0f, " %");
+        lv_obj_t *hint = lv_label_create(ap);
+        lv_label_set_text(hint, "Giữ màn hình chính 2.5 giây để bật/tắt nhanh.\nPhát âm thanh cho:");
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x7C8A9A), 0);
+        lv_obj_set_pos(hint, 4, ya);
+        ya += 40;
+        addSwitchRow(ap, ya, "Quá tốc độ", &cfg.audioOverspeed);
+        addSwitchRow(ap, ya, "Camera", &cfg.audioCamera);
+        addSwitchRow(ap, ya, "Đổi tốc độ phía trước", &cfg.audioLimitAhead);
+        addSwitchRow(ap, ya, "Khu dân cư", &cfg.audioResident);
+        addSwitchRow(ap, ya, "Cấm vượt", &cfg.audioNoOvertake);
+        addSwitchRow(ap, ya, "Trạm thu phí", &cfg.audioToll);
+        addSwitchRow(ap, ya, "Đèn tín hiệu", &cfg.audioLight);
+        addSwitchRow(ap, ya, "Khu vực nguy hiểm", &cfg.audioDanger);
+        addSwitchRow(ap, ya, "GPS / nhiệt độ", &cfg.audioSystem);
+    }
 
     // Demo mode (user-requested 2026-09-22, "demo hien thi truoc de toi chinh
     // sua") — plays a scripted tour of every Dashboard state so the UI can be

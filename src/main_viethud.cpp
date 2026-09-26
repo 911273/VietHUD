@@ -570,6 +570,12 @@ void loop() {
                 webPortalAddNetwork(line.substring(0, tab).c_str(), pass.c_str());
                 Serial.printf("[debug] saved network via serial: \"%s\"\n", line.substring(0, tab).c_str());
             }
+        } else if (c == 'S') {
+            // Bench: simulated drive through real map data — "S lat lon heading kmh seconds".
+            String line = Serial.readStringUntil('\n');
+            float a = 0, b = 0, h = 0, v = 0, t = 0;
+            if (sscanf(line.c_str(), "%f %f %f %f %f", &a, &b, &h, &v, &t) >= 5) gnssSimStart(a, b, h, v, t);
+            else gnssSimStart(0, 0, 0, 0, 0);
         } else if (c == 'u') {
             // Bench trigger for the OTA data update. Uses the SAME reliable path
             // as the web + on-screen buttons: set the NVS flag and reboot into

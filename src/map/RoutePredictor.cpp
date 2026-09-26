@@ -198,6 +198,7 @@ int Route::build(const RoadSegment &startSeg, float startHeadingDeg, float ahead
         rs.speedLimitKmh = pick.speedLimitKmh;
         rs.roadClass = pick.roadClass;
         rs.flags = pick.flags;
+        rs.source = pick.speedSource;
         rs.headingDeg = pickHeading;
         rs.lenM = lenM;
         rs.startDistM = arcLen;
@@ -249,13 +250,14 @@ bool Route::project(float latDeg, float lonDeg, float lateralTolM, float *outDis
 }
 
 bool Route::limitChangeAhead(float fromDistM, float currentLimitKmh, float maxM, float &outDistM,
-                             float &outLimitKmh) const {
+                             float &outLimitKmh, bool taggedOnly) const {
     for (int i = 0; i < count_; i++) {
         const RouteSeg &s = segs_[i];
         float segEnd = s.startDistM + s.lenM;
         if (segEnd <= fromDistM) continue;          // wholly behind the car
         if (s.startDistM - fromDistM > maxM) break;  // wholly beyond the warn horizon
         if (s.speedLimitKmh < 0) continue;           // unknown tag — not evidence of a change
+        if (taggedOnly && (s.source == SPEED_SOURCE_DEFAULT || s.source == SPEED_SOURCE_UNKNOWN)) continue;
         float lim = (float)s.speedLimitKmh;
         if (lim != currentLimitKmh) {
             float d = s.startDistM - fromDistM;

@@ -366,6 +366,23 @@ static void hideHoldRing() {
 // out entirely (there's no more target distance for that mode to show).
 static uint32_t pressStartMs = 0;
 static bool longPressFired = false;    // past the 1s mark at least
+// Hold ~2.5 s = toggle alert audio (2026-09-26, "cham man hinh 2-3s de tat
+// hoac bat audio"). Fires WHILE still held (so the driver feels it happen and
+// can let go); releasing afterwards then does nothing. Between 1 s and 2.5 s
+// the ring re-sweeps in amber, and releasing in that window opens Settings.
+static const uint32_t kAudioHoldMs = 2500;
+static bool audioToggledThisPress = false;
+static lv_obj_t *audioTopIcon = nullptr;
+static bool lastAudioIconState = true;
+static bool audioIconInit = false;
+static void updateAudioTopIcon() {
+    if (!audioTopIcon) return;
+    if (audioIconInit && lastAudioIconState == cfg.audioEnabled) return;
+    audioIconInit = true;
+    lastAudioIconState = cfg.audioEnabled;
+    lv_label_set_text(audioTopIcon, cfg.audioEnabled ? LV_SYMBOL_VOLUME_MAX : LV_SYMBOL_MUTE);
+    lv_obj_set_style_text_color(audioTopIcon, cfg.audioEnabled ? lv_color_hex(0xB8C6D4) : lv_color_hex(0xFF5A4F), 0);
+}
 
 // Guards onDashReleasedOrLost's body from running more than once per
 // physical press. LVGL can fire BOTH LV_EVENT_RELEASED and LV_EVENT_PRESS_LOST
@@ -392,15 +409,48 @@ static void onDashPressed(lv_event_t *e) {
 
     pressStartMs = millis();
     longPressFired = false;
+    audioToggledThisPress = false;
     releaseHandledThisPress = false;
+    lv_obj_set_style_arc_color(holdRing, lv_color_hex(0x4AA3FF), LV_PART_INDICATOR);
 }
 
-static void onDashLongPressed(lv_event_t *) { longPressFired = true; }
+static void onDashLongPressed(lv_event_t *) {
+    longPressFired = true;
+    // Second stage: amber sweep towards the audio toggle.
+    lv_anim_delete(holdRing, holdRingAnimCb);
+    lv_obj_set_style_arc_color(holdRing, lv_color_hex(0xF0A020), LV_PART_INDICATOR);
+    lv_arc_set_value(holdRing, 0);
+    lv_anim_init(&holdRingAnim);
+    lv_anim_set_var(&holdRingAnim, holdRing);
+    lv_anim_set_exec_cb(&holdRingAnim, holdRingAnimCb);
+    lv_anim_set_values(&holdRingAnim, 0, 100);
+    lv_anim_set_time(&holdRingAnim, kAudioHoldMs - HOLD_PRESS_MS);
+    lv_anim_start(&holdRingAnim);
+}
+
+static void onDashLongPressedRepeat(lv_event_t *) {
+    if (audioToggledThisPress || millis() - pressStartMs < kAudioHoldMs) return;
+    audioToggledThisPress = true;
+    hideHoldRing();
+    cfg.audioEnabled = !cfg.audioEnabled;
+    saveConfigToNVS(cfg);
+    settingsSyncSwitches();
+    updateAudioTopIcon();
+    if (cfg.audioEnabled) audioPlayBeep(1); // audible confirmation it's back on
+    Serial.printf("[ui] alert audio %s via 2.5 s hold\n", cfg.audioEnabled ? "ON" : "OFF");
+    if (wifiToastLabel) {
+        lv_label_set_text(wifiToastLabel, cfg.audioEnabled ? LV_SYMBOL_VOLUME_MAX "  Âm thanh: BẬT"
+                                                           : LV_SYMBOL_MUTE "  Âm thanh: TẮT");
+        lv_obj_clear_flag(wifiToastLabel, LV_OBJ_FLAG_HIDDEN);
+        wifiToastUntilMs = millis() + 1500;
+    }
+}
 
 static void onDashReleasedOrLost(lv_event_t *) {
     hideHoldRing();
     if (releaseHandledThisPress) return;
     releaseHandledThisPress = true;
+    if (audioToggledThisPress) return; // the hold already did its thing
     if (longPressFired) {
         lv_screen_load(settingsScreen);
         return;
@@ -833,6 +883,12 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     lv_obj_set_style_text_font(clockLabel, &lv_font_vn_20, 0);
     lv_label_set_text(clockLabel, "--:--");
     lv_obj_align(clockLabel, LV_ALIGN_RIGHT_MID, -12, 0); // style-based align: stays flush right as the text changes
+    // Alert-audio status, left of the clock (fixed offset: the clock is right-
+    // aligned and "HH:MM" is ~52 px in vn_20).
+    audioTopIcon = lv_label_create(topBar);
+    lv_obj_set_style_text_font(audioTopIcon, &lv_font_montserrat_20, 0);
+    lv_obj_align(audioTopIcon, LV_ALIGN_RIGHT_MID, -76, 0);
+    updateAudioTopIcon();
 
     gearIcon = lv_label_create(topBar);
     lv_obj_add_flag(gearIcon, LV_OBJ_FLAG_HIDDEN);
@@ -841,8 +897,8 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 
     // Center: Street Name Badge (Glassmorphism Pill)
     streetNameBadge = lv_obj_create(topBar);
-    lv_obj_set_size(streetNameBadge, 300, 30);
-    lv_obj_align(streetNameBadge, LV_ALIGN_CENTER, 0, 0); // centred; clears the GNSS block (left) and clock (right)
+    lv_obj_set_size(streetNameBadge, 264, 30);
+    lv_obj_align(streetNameBadge, LV_ALIGN_CENTER, 0, 0); // centred; clears the GNSS block (left) and audio icon + clock (right)
     lv_obj_set_style_bg_color(streetNameBadge, lv_color_hex(0x0C1522), 0);
     lv_obj_set_style_bg_opa(streetNameBadge, LV_OPA_80, 0);
     lv_obj_set_style_border_color(streetNameBadge, lv_color_hex(0x1F314A), 0);
@@ -861,7 +917,7 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     lv_obj_set_style_text_font(streetNameLabel, &lv_font_vn_20, 0);
     lv_obj_set_style_text_color(streetNameLabel, lv_color_hex(0xF0F4F8), 0);
     lv_label_set_long_mode(streetNameLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(streetNameLabel, 260);
+    lv_obj_set_width(streetNameLabel, 224);
     lv_obj_align(streetNameLabel, LV_ALIGN_LEFT_MID, 30, 0);
     lv_label_set_text(streetNameLabel, "");
     lv_obj_add_flag(streetNameBadge, LV_OBJ_FLAG_HIDDEN);
@@ -1003,6 +1059,10 @@ static void buildDashboardPortrait(lv_obj_t *scr) {
     lv_obj_set_style_text_font(clockLabel, &lv_font_vn_14, 0);
     lv_obj_align_to(clockLabel, wifiTopIcon, LV_ALIGN_OUT_LEFT_MID, -10, 0);
     lv_label_set_text(clockLabel, "--:--");
+    audioTopIcon = lv_label_create(topBar);
+    lv_obj_set_style_text_font(audioTopIcon, &lv_font_montserrat_14, 0);
+    lv_obj_align_to(audioTopIcon, clockLabel, LV_ALIGN_OUT_LEFT_MID, -8, 0);
+    updateAudioTopIcon();
 
     sunIcon = makeIcon(topBar, &sun_icon);
     lv_obj_align_to(sunIcon, clockLabel, LV_ALIGN_OUT_LEFT_MID, -6, 0);
@@ -1122,6 +1182,7 @@ void buildDashboard() {
     lv_obj_add_flag(dashRoot, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(dashRoot, onDashPressed, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(dashRoot, onDashLongPressed, LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_add_event_cb(dashRoot, onDashLongPressedRepeat, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
     lv_obj_add_event_cb(dashRoot, onDashReleasedOrLost, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(dashRoot, onDashReleasedOrLost, LV_EVENT_PRESS_LOST, NULL);
 
@@ -1195,7 +1256,7 @@ void buildDashboard() {
     // idle-dim check gives for reusing an existing periodic tick instead of
     // adding another one for a rarely-firing check.
     wifiToastLabel = lv_label_create(scr);
-    lv_obj_set_style_text_font(wifiToastLabel, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_font(wifiToastLabel, &lv_font_vn_20, 0); // VN text (audio toast) + symbols via fallback
     lv_obj_set_style_text_color(wifiToastLabel, lv_color_white(), 0);
     lv_obj_set_style_bg_color(wifiToastLabel, lv_color_hex(0x151C24), 0);
     lv_obj_set_style_bg_opa(wifiToastLabel, LV_OPA_90, 0);
@@ -1288,6 +1349,7 @@ void refreshDashboard() {
     if (!lv_obj_has_flag(wifiToastLabel, LV_OBJ_FLAG_HIDDEN) && millis() > wifiToastUntilMs) {
         lv_obj_add_flag(wifiToastLabel, LV_OBJ_FLAG_HIDDEN);
     }
+    updateAudioTopIcon(); // no-op unless cfg.audioEnabled changed (Settings / portal / hold gesture)
 
     // Single mutex-protected read per refresh — everything below uses these
     // local copies, never the live shared state (see core/SharedState.h).
@@ -1306,7 +1368,7 @@ void refreshDashboard() {
         static bool sMovedThisFix = false;
         int fixNow = gnss.fix ? 1 : 0;
         if (fixNow && gnss.egoSpeedKmh > 5.0f) sMovedThisFix = true;
-        if (sLastFix != -1 && fixNow != sLastFix && millis() - sLastGpsChimeMs > 3000) {
+        if (sLastFix != -1 && fixNow != sLastFix && millis() - sLastGpsChimeMs > 3000 && cfg.audioSystem) {
             if (fixNow) {
                 audioPlayGpsReady();
                 sLastGpsChimeMs = millis();
@@ -1381,13 +1443,13 @@ void refreshDashboard() {
         else col = lv_color_hex(0x93A0AE);                                                             // neutral
         uint32_t cu = lv_color_to_u32(col);
         if (cu != sLastTempColor) { sLastTempColor = cu; lv_obj_set_style_text_color(tempLabel, col, 0); }
-        if (tier > sLastTier) {                              // crossing UP into a hotter tier
+        if (tier > sLastTier && cfg.audioSystem) {           // crossing UP into a hotter tier
             if (tier == 1) audioPlaySignNotice();            // gentle "getting hot" notice
             else if (tier == 2) audioPlayOverspeedAlert();   // urgent alarm entering critical
         }
         sLastTier = tier;
         if (tier == 2) {
-            if (nowT - sLastCritAlarmMs > 15000) { sLastCritAlarmMs = nowT; audioPlayOverspeedAlert(); }
+            if (nowT - sLastCritAlarmMs > 15000) { sLastCritAlarmMs = nowT; if (cfg.audioSystem) audioPlayOverspeedAlert(); }
             if (!gThermalDimmed) { gThermalDimmed = true; applyConfig(); } // ~16% to cut heat
         } else if (gThermalDimmed) {
             gThermalDimmed = false;
@@ -1571,7 +1633,7 @@ void refreshDashboard() {
     static uint32_t lastSpeedingAudioMs = 0;
     if (speeding) {
         uint32_t now = millis();
-        if (!lastSpeeding || (now - lastSpeedingAudioMs > 8000)) {
+        if (cfg.audioOverspeed && (!lastSpeeding || (now - lastSpeedingAudioMs > 8000))) {
             lastSpeedingAudioMs = now;
             audioPlayOverspeedAlert();
             audioQueueVoice("slowdown/voice.mp3");
@@ -1662,7 +1724,7 @@ void refreshDashboard() {
         lastAheadLimit = road.aheadSpeedLimitKmh;
         // Visual is the trafficCard (W_AHEAD_LIMIT); this block only fires the
         // audio cue when a speed-limit change first appears ahead.
-        if (road.aheadLimitValid && newlyVisible) {
+        if (road.aheadLimitValid && newlyVisible && cfg.audioLimitAhead) {
             audioPlaySignNotice();
             audioQueueVoice("tocdogioihan.mp3");
             queueSpeedVoice(road.aheadSpeedLimitKmh);
@@ -1678,7 +1740,7 @@ void refreshDashboard() {
         lastCameraDist = road.cameraAheadDistanceM;
         // Visual is the trafficCard (W_CAMERA); this block only fires the audio
         // cue when a camera first appears ahead.
-        if (road.cameraAheadValid && newlyVisible) {
+        if (road.cameraAheadValid && newlyVisible && cfg.audioCamera) {
             audioPlayCameraAlert(); // immediate tone chime — cheap, instant, plays while the voice line below queues
             audioQueueVoice("speedcamera.mp3");
             if (road.cameraSpeedLimitKmh >= 0) queueSpeedVoice(road.cameraSpeedLimitKmh);
@@ -1723,7 +1785,10 @@ void refreshDashboard() {
         // Visual is the trafficCard (W_RESIDENT/W_NO_OVERTAKE/W_TOLL/W_LIGHT/
         // W_DANGER, icon + distance); this block only fires the audio cue when a
         // sign first appears ahead.
-        if (signVisible && newlyVisible) {
+        bool typeAudio = (currentSignType == 2 && cfg.audioResident) || (currentSignType == 3 && cfg.audioNoOvertake) ||
+                         (currentSignType == 5 && cfg.audioToll) || (currentSignType == 6 && cfg.audioLight) ||
+                         (currentSignType == 10 && cfg.audioDanger);
+        if (signVisible && newlyVisible && typeAudio) {
             audioPlaySignNotice(); // immediate tone chime — cheap, instant, plays while the voice line below queues
             // Only resident-area/no-overtaking/toll/traffic-light/danger have
             // a matching voice asset in data/speedmap/sounds/vi/ — no fallback

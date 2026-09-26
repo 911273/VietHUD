@@ -330,12 +330,12 @@ def main():
         
         if p['is_camera']:
             cam_records_bytes = struct.pack(
-                '<QiiHh',
+                '<QiihH',  # CameraPoint: int16 speedLimitKmh, THEN uint16 directionDeg (was swapped before 2026-09-26)
                 cam_id_counter,
                 lat_e7,
                 lon_e7,
-                heading_deg,
-                speed if speed > 0 else -1
+                speed if speed > 0 else -1,
+                heading_deg
             )
             camera_records.append(cam_records_bytes)
             cam_id_counter += 1
