@@ -104,6 +104,7 @@ static void onSliderChanged(lv_event_t *e) {
     // both screens are laid out once at boot for whichever orientation was
     // active then) — say so immediately rather than let the slider silently
     // do nothing, which is what every OTHER slider here does instead.
+    if (b->target == &cfg.brightnessMode) applyConfig(); // Auto/Manual backlight applies live
     if (b->target == &cfg.screenRotation) {
         saveConfigToNVS(cfg);
         lv_label_set_text(settingsStatusLabel, "Da luu xoay man hinh! Khoi dong lai de ap dung...");
@@ -1157,7 +1158,7 @@ void buildSettingsScreen() {
         // Map (1) and Sensors (2) are taller than BODY_H and scroll. (Was "i == 2 ||
         // i == 3" — left over from before the Map tab was inserted at index 1, so the
         // Map tab couldn't scroll. WiFi (3) is just the QR overlay now.)
-        if (i == 1 || i == 2) {
+        if (i <= 2) { // Display, Map (+ Speed Map group) and Sensors are taller than BODY_H
             lv_obj_set_scroll_dir(panel, LV_DIR_VER);
             lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
         } else {
@@ -1177,6 +1178,17 @@ void buildSettingsScreen() {
     addSwitchRow(categoryPanels[0], y, "Alert audio enabled", &cfg.audioEnabled);
     addSliderRow(categoryPanels[0], y, "Volume", &cfg.audioVolume, 0, 100, 1.0f, " %");
     addSliderRow(categoryPanels[0], y, "Brightness", &cfg.brightness, 5, 100, 1.0f, " %");
+    // Backlight mode (2026-09-26): Auto caps the backlight at 50 % at night
+    // (same GNSS sunrise/sunset as the Auto theme); Manual = always the slider.
+    static const char *kBrightnessModeLabels[2] = {"Tự động", "Thủ công"};
+    addChoiceRow(categoryPanels[0], y, "Chế độ sáng", &cfg.brightnessMode, kBrightnessModeLabels, 2);
+    {
+        lv_obj_t *hint = lv_label_create(categoryPanels[0]);
+        lv_label_set_text(hint, "Tự động: buổi tối giảm độ sáng còn 50%");
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x7C8A9A), 0);
+        lv_obj_set_pos(hint, 4, y);
+        y += 22;
+    }
     // Label updated 2026-09-16 alongside the gate itself changing from
     // touch-idle to vehicle-stationary time (see Dashboard.cpp) — "stopped"
     // says what actually starts the timer now.
@@ -1237,6 +1249,24 @@ void buildSettingsScreen() {
     addSwitchRow(categoryPanels[1], y, "Huong xe len tren (xoay)", &cfg.mapHeadingUp);
     addSwitchRow(categoryPanels[1], y, "Vehicle Trail (track)", &cfg.showVehicleTrail);
 
+    // Speed Map diagnostics (spec section 25) — offline microSD map-matching
+    // status, see map/SpeedLimitManager.h. This group is why categoryPanels[1]
+    // needs to be scrollable above: it doesn't fit in 260px alongside
+    // everything already in this tab.
+    y += 6;
+    lv_obj_t *mapHeaderSpeed = lv_label_create(categoryPanels[1]);
+    lv_label_set_text(mapHeaderSpeed, "Speed Map");
+    lv_obj_set_style_text_color(mapHeaderSpeed, lv_color_hex(0x7C8A9A), 0);
+    lv_obj_set_pos(mapHeaderSpeed, 4, y);
+    y += 20;
+    speedMapStatusVal = addReadonlyRow(categoryPanels[1], y, "Status");
+    speedMapRegionVal = addReadonlyRow(categoryPanels[1], y, "Region");
+    speedMapVersionVal = addReadonlyRow(categoryPanels[1], y, "Version");
+    speedMapLimitVal = addReadonlyRow(categoryPanels[1], y, "Current limit");
+    speedMapSourceVal = addReadonlyRow(categoryPanels[1], y, "Source");
+    speedMapMatchVal = addReadonlyRow(categoryPanels[1], y, "Match");
+    speedMapRoadIdVal = addReadonlyRow(categoryPanels[1], y, "Road ID");
+
 
     // Sensors tab (categoryPanels[2]) — real-hardware check/configure
     // (spec 16.6/16.7). GNSS (u-blox M10N, UART2) went real 2026-09-15;
@@ -1288,23 +1318,6 @@ void buildSettingsScreen() {
     // with speed) in SpeedLimitManager.cpp, not cfg.aheadLimitWarnDistM/
     // cameraWarnDistM. Those cfg fields are now legacy/unused.
 
-    // Speed Map diagnostics (spec section 25) — offline microSD map-matching
-    // status, see map/SpeedLimitManager.h. This group is why categoryPanels[2]
-    // needs to be scrollable above: it doesn't fit in 260px alongside
-    // everything already in this tab.
-    y += 6;
-    lv_obj_t *sensorsHeader3 = lv_label_create(categoryPanels[2]);
-    lv_label_set_text(sensorsHeader3, "Speed Map");
-    lv_obj_set_style_text_color(sensorsHeader3, lv_color_hex(0x7C8A9A), 0);
-    lv_obj_set_pos(sensorsHeader3, 4, y);
-    y += 20;
-    speedMapStatusVal = addReadonlyRow(categoryPanels[2], y, "Status");
-    speedMapRegionVal = addReadonlyRow(categoryPanels[2], y, "Region");
-    speedMapVersionVal = addReadonlyRow(categoryPanels[2], y, "Version");
-    speedMapLimitVal = addReadonlyRow(categoryPanels[2], y, "Current limit");
-    speedMapSourceVal = addReadonlyRow(categoryPanels[2], y, "Source");
-    speedMapMatchVal = addReadonlyRow(categoryPanels[2], y, "Match");
-    speedMapRoadIdVal = addReadonlyRow(categoryPanels[2], y, "Road ID");
 
     // WiFi tab (2026-09-26): the whole WiFi menu is now the QR setup screen.
     // Selecting this tab immediately opens the full-screen QR overlay (see

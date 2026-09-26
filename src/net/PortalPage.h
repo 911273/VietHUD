@@ -165,7 +165,7 @@ async function status(){if(BUSY||document.hidden)return;try{const d=await jget('
   +(d.speedMap.road?'<div style="grid-column:1/-1"><small>Đường</small><b>'+E(d.speedMap.road)+'</b></div>':'');
  $('cn').className='on';$('cn').textContent='Đã kết nối'}catch(e){$('cn').className='';$('cn').textContent='Mất kết nối'}}
 // ---------- settings ----------
-const CF=[['audioEnabled','Âm thanh cảnh báo','b'],['audioVolume','Âm lượng (%)','r',0,100],['brightness','Độ sáng (%)','r',5,100],
+const CF=[['audioEnabled','Âm thanh cảnh báo','b'],['audioVolume','Âm lượng (%)','r',0,100],['brightness','Độ sáng (%)','r',5,100],['brightnessAuto','Tự giảm độ sáng buổi tối (50%)','b'],
  ['overspeedOffsetKmh','Cảnh báo khi vượt quá (km/h)','n',0,10],['defaultLimitKmh','Giới hạn khi không rõ (km/h, 0 = tắt)','n',0,90],
  ['autoDimMin','Giảm sáng khi dừng sau (phút, 0 = tắt)','n',0,30],['gnssSpeedCalibrationPct','Hiệu chỉnh tốc độ GPS (%)','n',-15,15],['tripLoggingEnabled','Ghi nhật ký chuyến đi','b'],
  ['-','Nâng cao'],['gnssSpeedFilterAlpha','Làm mượt tốc độ (0,05–0,9)','n',0.05,0.9],['gnssFixTimeoutS','Báo mất GPS sau (giây)','n',1,10],

@@ -71,6 +71,7 @@ void loadConfigFromNVS(AppConfig &cfg) {
     cfg.dataUpdateUrl[sizeof(cfg.dataUpdateUrl) - 1] = '\0';
     cfg.screenRotation = prefs.getFloat("screenRot", cfg.screenRotation);
     cfg.themeMode = prefs.getFloat("themeMode", cfg.themeMode);
+    cfg.brightnessMode = prefs.getFloat("briMode", cfg.brightnessMode);
     cfg.showVehicleTrail = prefs.getBool("showTrail", cfg.showVehicleTrail);
     cfg.mapHeadingUp = prefs.getBool("mapHeadUp", cfg.mapHeadingUp);
     cfg.defaultLimitKmh = prefs.getFloat("defLimitKmh", cfg.defaultLimitKmh);
@@ -135,6 +136,7 @@ void saveConfigToNVS(const AppConfig &cfg) {
     prefs.putString("dataUrl", cfg.dataUpdateUrl);
     prefs.putFloat("screenRot", cfg.screenRotation);
     prefs.putFloat("themeMode", cfg.themeMode);
+    prefs.putFloat("briMode", cfg.brightnessMode);
     prefs.putBool("showTrail", cfg.showVehicleTrail);
     prefs.putBool("mapHeadUp", cfg.mapHeadingUp);
     prefs.putFloat("defLimitKmh", cfg.defaultLimitKmh);

@@ -81,9 +81,21 @@ static const int kPixelShiftOffsets[4][2] = {{0, 0}, {2, 0}, {2, 2}, {0, 2}};
 static int pixelShiftIdx = 0;
 static uint32_t lastTouchMs = 0;
 static bool screenDimmed = false;
+static bool gThermalDimmed = false; // die temp critical -> backlight forced low (see the temperature block)
+// Night per GNSS sunrise/sunset, cached by refreshDashboard(). applyConfig() is
+// also called early in setup(), BEFORE sharedStateInit() creates the mutex
+// gnssSnapshot() takes — so it must not call gnssSnapshot() itself.
+static bool gIsNight = false;
 
+// The ONE place that decides the backlight level, in priority order:
+// thermal protection > stationary auto-dim > night cap (Auto mode) > the
+// configured brightness.
 void applyConfig() {
-    float level = screenDimmed ? 12.0f : cfg.brightness;
+    float level = cfg.brightness;
+    if (cfg.brightnessMode < 0.5f && gIsNight && level > AppConfig::kNightBrightnessPct)
+        level = AppConfig::kNightBrightnessPct; // Auto: night -> at most 50 %
+    if (screenDimmed) level = 12.0f;
+    if (gThermalDimmed) level = 16.0f;       // ~16 % to shed heat
     backlightWrite((uint32_t)(level / 100.0f * 255.0f));
     audioSetVolume((uint8_t)cfg.audioVolume); // push the configured speaker volume to the audio driver
 }
@@ -1373,7 +1385,6 @@ void refreshDashboard() {
         static int sLastTier = 0;
         static uint32_t sLastCritAlarmMs = 0;
         static uint32_t sLastTempColor = 0xFFFFFFFFu;
-        static bool sThermalDimmed = false;
         uint32_t nowT = millis();
         if (sTempC < -900.0f || nowT - sLastTempMs > 2000) {
             sLastTempMs = nowT;
@@ -1405,9 +1416,9 @@ void refreshDashboard() {
         sLastTier = tier;
         if (tier == 2) {
             if (nowT - sLastCritAlarmMs > 15000) { sLastCritAlarmMs = nowT; audioPlayOverspeedAlert(); }
-            if (!sThermalDimmed) { sThermalDimmed = true; backlightWrite(40); } // ~16% to cut heat
-        } else if (sThermalDimmed) {
-            sThermalDimmed = false;
+            if (!gThermalDimmed) { gThermalDimmed = true; applyConfig(); } // ~16% to cut heat
+        } else if (gThermalDimmed) {
+            gThermalDimmed = false;
             applyConfig(); // cooled below critical — restore the configured brightness
         }
     }
@@ -1546,6 +1557,19 @@ void refreshDashboard() {
     // or cfg.themeMode itself changing) — touching lv_obj_set_style_*
     // unconditionally every 150ms would mean re-invalidating the whole
     // screen background + every themed label on every tick for nothing.
+    // Auto brightness: re-apply the backlight when day/night flips or the mode
+    // changes (applyConfig() itself applies the 50 % night cap).
+    {
+        static int sLastBriNight = -1;
+        gIsNight = !gnss.daytime;
+        int briNight = (cfg.brightnessMode < 0.5f && gIsNight) ? 1 : 0;
+        if (briNight != sLastBriNight) {
+            sLastBriNight = briNight;
+            applyConfig();
+            Serial.printf("[display] brightness %s\n", briNight ? "night cap 50%" : "normal");
+        }
+    }
+
     bool effectiveDaytime = cfg.themeMode == 1.0f    ? true
                              : cfg.themeMode == 2.0f ? false
                                                       : gnss.daytime; // 0 = Auto

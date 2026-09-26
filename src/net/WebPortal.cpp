@@ -438,11 +438,12 @@ static String jsonStr(const char *s) {
 static void handleConfigGet() {
     char b[420];
     snprintf(b, sizeof(b),
-             "{\"audioEnabled\":%d,\"audioVolume\":%.0f,\"brightness\":%.0f,\"autoDimMin\":%.0f,"
+             "{\"audioEnabled\":%d,\"audioVolume\":%.0f,\"brightness\":%.0f,\"brightnessAuto\":%d,\"autoDimMin\":%.0f,"
              "\"overspeedOffsetKmh\":%.0f,\"defaultLimitKmh\":%.0f,\"gnssSpeedCalibrationPct\":%.1f,"
              "\"tripLoggingEnabled\":%d,\"gnssSpeedFilterAlpha\":%.2f,\"gnssFixTimeoutS\":%.1f,"
              "\"wifiAutoOffMin\":%.0f,",
-             cfg.audioEnabled ? 1 : 0, (double)cfg.audioVolume, (double)cfg.brightness, (double)cfg.autoDimMin,
+             cfg.audioEnabled ? 1 : 0, (double)cfg.audioVolume, (double)cfg.brightness,
+             cfg.brightnessMode < 0.5f ? 1 : 0, (double)cfg.autoDimMin,
              (double)cfg.overspeedOffsetKmh, (double)cfg.defaultLimitKmh, (double)cfg.gnssSpeedCalibrationPct,
              cfg.tripLoggingEnabled ? 1 : 0, (double)cfg.gnssSpeedFilterAlpha, (double)cfg.gnssFixTimeoutS,
              (double)cfg.wifiAutoOffMin);
@@ -472,6 +473,7 @@ static void handleConfigPost() {
     argBool("audioEnabled", cfg.audioEnabled);
     argFloat("audioVolume", cfg.audioVolume);
     argFloat("brightness", cfg.brightness);
+    if (server.hasArg("brightnessAuto")) cfg.brightnessMode = server.arg("brightnessAuto") == "1" ? 0.0f : 1.0f;
     argFloat("autoDimMin", cfg.autoDimMin);
     argFloat("overspeedOffsetKmh", cfg.overspeedOffsetKmh);
     argFloat("defaultLimitKmh", cfg.defaultLimitKmh);
