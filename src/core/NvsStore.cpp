@@ -1,6 +1,7 @@
 #include "NvsStore.h"
 #include <Preferences.h>
 #include <string.h> // strncpy() — see loadConfigFromNVS()'s wifiSsid/wifiPassword copy
+#include <stdio.h>  // snprintf() — per-slot NVS keys for the saved-network list
 
 static Preferences prefs;
 
@@ -39,6 +40,30 @@ void loadConfigFromNVS(AppConfig &cfg) {
     String stap = prefs.getString("staPass", cfg.staPassword);
     strncpy(cfg.staPassword, stap.c_str(), sizeof(cfg.staPassword) - 1);
     cfg.staPassword[sizeof(cfg.staPassword) - 1] = '\0';
+
+    // WiFi Manager saved networks (2026-09-26).
+    cfg.savedNetworkCount = prefs.getInt("netCount", 0);
+    for (int i = 0; i < AppConfig::kMaxSavedNetworks; i++) {
+        char ks[12], kp[12];
+        snprintf(ks, sizeof(ks), "netS%d", i);
+        snprintf(kp, sizeof(kp), "netP%d", i);
+        String s = prefs.getString(ks, "");
+        String p = prefs.getString(kp, "");
+        strncpy(cfg.savedNetworks[i].ssid, s.c_str(), sizeof(cfg.savedNetworks[i].ssid) - 1);
+        cfg.savedNetworks[i].ssid[sizeof(cfg.savedNetworks[i].ssid) - 1] = '\0';
+        strncpy(cfg.savedNetworks[i].password, p.c_str(), sizeof(cfg.savedNetworks[i].password) - 1);
+        cfg.savedNetworks[i].password[sizeof(cfg.savedNetworks[i].password) - 1] = '\0';
+    }
+    // Migrate a pre-WiFi-Manager single STA credential into slot 0 once, so an
+    // existing device's saved network isn't lost by the upgrade.
+    if (cfg.savedNetworkCount <= 0 && cfg.staSsid[0]) {
+        strncpy(cfg.savedNetworks[0].ssid, cfg.staSsid, sizeof(cfg.savedNetworks[0].ssid) - 1);
+        cfg.savedNetworks[0].ssid[sizeof(cfg.savedNetworks[0].ssid) - 1] = '\0';
+        strncpy(cfg.savedNetworks[0].password, cfg.staPassword, sizeof(cfg.savedNetworks[0].password) - 1);
+        cfg.savedNetworks[0].password[sizeof(cfg.savedNetworks[0].password) - 1] = '\0';
+        cfg.savedNetworkCount = 1;
+    }
+
     cfg.wifiAutoOffMin = prefs.getFloat("wifiAutoOff", cfg.wifiAutoOffMin);
     String durl = prefs.getString("dataUrl", cfg.dataUpdateUrl);
     strncpy(cfg.dataUpdateUrl, durl.c_str(), sizeof(cfg.dataUpdateUrl) - 1);
@@ -87,6 +112,14 @@ void saveConfigToNVS(const AppConfig &cfg) {
     prefs.putString("wifiPass", cfg.wifiPassword);
     prefs.putString("staSsid", cfg.staSsid);
     prefs.putString("staPass", cfg.staPassword);
+    prefs.putInt("netCount", cfg.savedNetworkCount);
+    for (int i = 0; i < AppConfig::kMaxSavedNetworks; i++) {
+        char ks[12], kp[12];
+        snprintf(ks, sizeof(ks), "netS%d", i);
+        snprintf(kp, sizeof(kp), "netP%d", i);
+        prefs.putString(ks, cfg.savedNetworks[i].ssid);
+        prefs.putString(kp, cfg.savedNetworks[i].password);
+    }
     prefs.putFloat("wifiAutoOff", cfg.wifiAutoOffMin);
     prefs.putString("dataUrl", cfg.dataUpdateUrl);
     prefs.putFloat("screenRot", cfg.screenRotation);

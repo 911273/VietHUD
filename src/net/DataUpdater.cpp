@@ -20,6 +20,14 @@
 #define DU_MANIFEST_NAME "manifest.txt"
 
 static DataUpdateStatus s_status = {DU_IDLE, "", 0, 0, 0};
+
+// Auto-check state (2026-09-26): a lightweight "is a newer version published?"
+// probe that only fetches manifest.txt and compares its version line to the copy
+// on the SD card. Sets a flag the UI shows; it never downloads or reboots.
+static volatile bool s_checkRunning = false;
+static volatile bool s_updateAvailable = false;
+static char s_remoteVersion[24] = "";
+static char s_localVersion[24] = "";
 static volatile bool s_running = false;
 
 DataUpdateStatus dataUpdateGetStatus() { return s_status; }
@@ -327,6 +335,70 @@ bool dataUpdatePending() {
     p.end();
     return pend;
 }
+
+// ---- OTA auto-check: compare the remote manifest version to the local one ----
+static void extractVersion(const char *text, char *out, size_t cap) {
+    if (cap) out[0] = '\0';
+    const char *p = text;
+    while (p && *p) {
+        if (strncmp(p, "version ", 8) == 0) {
+            char v[24] = "";
+            if (sscanf(p, "version %23s", v) == 1) {
+                strncpy(out, v, cap - 1);
+                out[cap - 1] = '\0';
+            }
+            return;
+        }
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+}
+
+static void readLocalVersion(char *out, size_t cap) {
+    if (cap) out[0] = '\0';
+    char buf[96] = {0};
+    int got = sdMgrReadFileChunk(DU_SPEEDMAP_DIR DU_MANIFEST_NAME, 0, (uint8_t *)buf, sizeof(buf) - 1);
+    if (got > 0) {
+        buf[got] = '\0';
+        extractVersion(buf, out, cap);
+    }
+}
+
+static void checkTask(void *) {
+    String remoteText;
+    String base = cfg.dataUpdateUrl;
+    if (base.length() && !base.endsWith("/")) base += "/";
+    readLocalVersion(s_localVersion, sizeof(s_localVersion));
+    if (httpGetText(base + DU_MANIFEST_NAME, remoteText)) {
+        extractVersion(remoteText.c_str(), s_remoteVersion, sizeof(s_remoteVersion));
+        bool newer = s_remoteVersion[0] && strcmp(s_remoteVersion, s_localVersion) != 0;
+        s_updateAvailable = newer;
+        Serial.printf("[dataupd] check: local=\"%s\" remote=\"%s\" -> %s\n",
+                      s_localVersion, s_remoteVersion,
+                      newer ? "UPDATE AVAILABLE" : "up to date");
+    } else {
+        Serial.println("[dataupd] check: could not fetch remote manifest");
+    }
+    s_checkRunning = false;
+    vTaskDelete(NULL);
+}
+
+// Kick off a background version check. No-op if one is running, the URL is empty,
+// WiFi station isn't connected, or an update is already flagged. Safe & cheap:
+// only fetches the tiny manifest.txt.
+bool dataUpdateCheckStart() {
+    if (s_checkRunning || s_running) return false;
+    if (strlen(cfg.dataUpdateUrl) == 0) return false;
+    if (WiFi.status() != WL_CONNECTED) return false;
+    s_checkRunning = true;
+    xTaskCreatePinnedToCore(checkTask, "dataChk", 12288, NULL, 1, NULL, 0);
+    return true;
+}
+
+bool dataUpdateAvailable() { return s_updateAvailable; }
+bool dataUpdateCheckInProgress() { return s_checkRunning; }
+const char *dataUpdateRemoteVersion() { return s_remoteVersion; }
+const char *dataUpdateLocalVersion() { return s_localVersion; }
 
 bool dataUpdateStart() {
     if (s_running) return false;

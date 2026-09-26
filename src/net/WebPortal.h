@@ -76,6 +76,14 @@ void webPortalStatusText(char *buf, size_t cap);
 // 5 GHz-hotspot case). Added 2026-09-25.
 void webPortalStaInfo(char *buf, size_t cap);
 
+// The device's AP SSID (custom or auto "VietHUD-XXXX"), computed even when the AP
+// is off — for the on-screen QR "join my hotspot" setup code (Settings.cpp).
+void webPortalApSsid(char *buf, size_t cap);
+
+// The device's station (STA) IP once joined to a WiFi — for the on-screen "IP
+// after connect" display. false + empty buf when not connected.
+bool webPortalStaIp(char *buf, size_t cap);
+
 // --- WiFi scan + STA reconnect (2026-09-25), for the on-screen "WiFi setup"
 // overlay. All WiFi.* calls stay on the web task, so the UI (Core 1) only sets
 // requests / reads cached results — never touches the radio directly. ---
@@ -86,6 +94,15 @@ int  webPortalScanResult(int i, char *ssid, size_t cap, int *rssi, bool *locked)
 // Apply new STA creds (already written into cfg by the caller): reconnect the
 // station with them (turns WiFi on if it was off). Runs on the web task.
 void webPortalReconnectSta();
+
+// WiFi Manager (2026-09-26): manage the list of remembered station networks.
+// All mutate AppConfig + persist to NVS and kick a reconnect; safe to call from
+// the on-screen UI (Core 1) or the web handlers (web task) — plain cfg writes,
+// same pattern as the existing /config POST.
+int  webPortalSavedCount();                                  // # of saved networks
+bool webPortalSavedNetwork(int i, char *ssid, size_t cap);   // SSID of saved network i
+bool webPortalAddNetwork(const char *ssid, const char *password);  // add/update by SSID
+bool webPortalDeleteNetwork(int idx);                        // remove saved network idx
 
 // NTP-synced local time (feature F, 2026-09-25). Returns true and fills
 // hour/minute (local, VN UTC+7) once the device has joined a station network
