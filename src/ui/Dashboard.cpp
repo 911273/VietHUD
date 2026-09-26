@@ -934,36 +934,23 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     lv_label_set_text(gnssCaption, "--");
     lv_obj_align_to(gnssCaption, gnssIcon, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
 
-    // Right: time & settings
-    gearIcon = lv_label_create(topBar);
-    lv_obj_set_style_text_font(gearIcon, &lv_font_montserrat_20, 0);
-    lv_label_set_text(gearIcon, LV_SYMBOL_SETTINGS);
-    lv_obj_align(gearIcon, LV_ALIGN_RIGHT_MID, -12, 0);
-
-    wifiTopIcon = lv_label_create(topBar);
-    lv_obj_set_style_text_font(wifiTopIcon, &lv_font_montserrat_20, 0);
-    lv_label_set_text(wifiTopIcon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x7C8A9A), 0);
-    // Fixed width, right-aligned: the text grows to "WiFi ✓" when a phone joins,
-    // and the clock is aligned to this box once at build time.
-    lv_obj_set_width(wifiTopIcon, 52);
-    lv_obj_set_style_text_align(wifiTopIcon, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_align_to(wifiTopIcon, gearIcon, LV_ALIGN_OUT_LEFT_MID, -10, 0);
-    lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
-
+    // Right corner: clock only. (Settings gear and sun/moon icons removed from
+    // the landscape bar 2026-09-26 per user; the objects still exist, hidden,
+    // because the theme and day/night code update them.)
     clockLabel = lv_label_create(topBar);
     lv_obj_set_style_text_font(clockLabel, &lv_font_vn_20, 0);
-    lv_obj_align_to(clockLabel, wifiTopIcon, LV_ALIGN_OUT_LEFT_MID, -12, 0);
     lv_label_set_text(clockLabel, "--:--");
+    lv_obj_align(clockLabel, LV_ALIGN_RIGHT_MID, -12, 0); // style-based align: stays flush right as the text changes
 
+    gearIcon = lv_label_create(topBar);
+    lv_obj_add_flag(gearIcon, LV_OBJ_FLAG_HIDDEN);
     sunIcon = makeIcon(topBar, &sun_icon);
-    lv_obj_align_to(sunIcon, clockLabel, LV_ALIGN_OUT_LEFT_MID, -6, 0);
+    lv_obj_add_flag(sunIcon, LV_OBJ_FLAG_HIDDEN);
 
     // Center: Street Name Badge (Glassmorphism Pill)
     streetNameBadge = lv_obj_create(topBar);
-    lv_obj_set_size(streetNameBadge, 206, 30);
-    lv_obj_align(streetNameBadge, LV_ALIGN_LEFT_MID, 80, 0); // gap between GNSS (left) and sun/clock (right)
+    lv_obj_set_size(streetNameBadge, 300, 30);
+    lv_obj_align(streetNameBadge, LV_ALIGN_CENTER, 0, 0); // centred; clears the GNSS block (left) and clock (right)
     lv_obj_set_style_bg_color(streetNameBadge, lv_color_hex(0x0C1522), 0);
     lv_obj_set_style_bg_opa(streetNameBadge, LV_OPA_80, 0);
     lv_obj_set_style_border_color(streetNameBadge, lv_color_hex(0x1F314A), 0);
@@ -982,7 +969,7 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     lv_obj_set_style_text_font(streetNameLabel, &lv_font_vn_20, 0);
     lv_obj_set_style_text_color(streetNameLabel, lv_color_hex(0xF0F4F8), 0);
     lv_label_set_long_mode(streetNameLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(streetNameLabel, 170);
+    lv_obj_set_width(streetNameLabel, 260);
     lv_obj_align(streetNameLabel, LV_ALIGN_LEFT_MID, 30, 0);
     lv_label_set_text(streetNameLabel, "");
     lv_obj_add_flag(streetNameBadge, LV_OBJ_FLAG_HIDDEN);
@@ -1051,6 +1038,19 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     lv_obj_set_style_border_color(bottomBar, lv_color_hex(0x182232), 0); // same line as the top bar
     lv_obj_set_style_border_width(bottomBar, 1, 0);
     lv_obj_set_style_border_side(bottomBar, LV_BORDER_SIDE_TOP, 0);
+
+    // WiFi status icon, centre of the bottom bar (heading letter left, board
+    // temperature right): hidden = WiFi off, grey = hotspot on, green
+    // "WiFi ✓" = a phone is connected (refreshDashboard, state-change only).
+    wifiTopIcon = lv_label_create(bottomBar);
+    lv_obj_set_style_text_font(wifiTopIcon, &lv_font_montserrat_20, 0);
+    lv_label_set_text(wifiTopIcon, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x7C8A9A), 0);
+    lv_obj_set_width(wifiTopIcon, 60);
+    lv_obj_set_style_text_align(wifiTopIcon, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(wifiTopIcon, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
 
     midCol = makePane(scr, (scrW - 270) / 2, scrH - kBottomBarH - 6 - 60, 270, 60);
     buildTrafficCard(midCol, 270, 60);
