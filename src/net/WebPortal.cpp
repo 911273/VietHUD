@@ -137,7 +137,10 @@ static volatile bool wifiActuallyEnabled = false;
 
 void webPortalRequestEnable(bool on) { wifiEnabledRequest = on; }
 bool webPortalIsEnabled() { return wifiActuallyEnabled; }
-int webPortalClientCount() { return wifiActuallyEnabled ? (int)WiFi.softAPgetStationNum() : 0; }
+// Cached by the web task (the only task that touches WiFi.*) so the UI can poll
+// it every frame without calling into the WiFi driver from Core 1.
+static volatile int g_apClients = 0;
+int webPortalClientCount() { return wifiActuallyEnabled ? g_apClients : 0; }
 
 void webPortalStatusText(char *buf, size_t cap) {
     if (wifiActuallyEnabled)
@@ -803,6 +806,7 @@ static void applyWifiState(bool enable) {
         ntpSynced = false;
         Serial.println("[web] WiFi OFF");
     }
+    if (!enable) g_apClients = 0;
     wifiActuallyEnabled = enable;
 }
 
@@ -907,7 +911,8 @@ static void webTaskFn(void *) {
             }
 
             // Feature D: auto-off after wifiAutoOffMin with no AP client.
-            if (WiFi.softAPgetStationNum() > 0 || updateApiBusy()) lastClientMs = millis();
+            g_apClients = (int)WiFi.softAPgetStationNum();
+            if (g_apClients > 0 || updateApiBusy()) lastClientMs = millis();
             uint32_t idleLimitMs = (uint32_t)(cfg.wifiAutoOffMin * 60000.0f);
             if (idleLimitMs > 0 && millis() - lastClientMs > idleLimitMs) {
                 Serial.printf("[web] WiFi auto-off: no client for %.0f min\n", (double)cfg.wifiAutoOffMin);
