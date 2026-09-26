@@ -226,6 +226,8 @@ static void wifiQrRebuild() {
 // the previous refresh (-1 = take a fresh baseline), g_qrJoinedAtMs = when a
 // phone joined while the screen was up (0 = none pending).
 static int g_qrPrevClients = -1;
+static lv_obj_t *qrWifiSwitch = nullptr;  // WiFi on/off switch on the QR screen
+static bool g_qrSwitchTouched = false;    // user flipped it this visit -> respect it on Close
 static uint32_t g_qrJoinedAtMs = 0;
 static lv_obj_t *connToast = nullptr;   // "phone connected" pill on lv_layer_top()
 static uint32_t connToastUntilMs = 0;
@@ -253,12 +255,18 @@ static void onWifiScanOpen(lv_event_t *) {
     g_qrPayload[0] = '\0';          // force a rebuild for the (now-active) AP creds
     g_qrPrevClients = -1;           // baseline taken on the first refresh (see refreshScanListIfOpen)
     g_qrJoinedAtMs = 0;
+    g_qrSwitchTouched = false;
+    if (qrWifiSwitch) lv_obj_add_state(qrWifiSwitch, LV_STATE_CHECKED);
     wifiQrRebuild();
     lv_obj_clear_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(wifiScanOverlay);
 }
 static void onWifiScanClose(lv_event_t *) {
     Serial.println("[ui] WiFi QR screen closed");
+    // Opening this screen switched WiFi on; if nobody joined, switch it back off
+    // (it otherwise stayed on for the whole 10 min auto-off window — heat).
+    // (Unless the user set the switch themselves on this visit — then it stays as chosen.)
+    if (!g_qrSwitchTouched && webPortalClientCount() == 0 && !updateApiBusy()) webPortalRequestEnable(false);
     lv_obj_add_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
     g_activeCategory = 0; // leave the WiFi context so the idle-return timer re-arms
     // The WiFi "menu" IS this QR screen now, so closing it returns straight to the
@@ -322,19 +330,38 @@ static void buildWifiScanOverlay(lv_obj_t *parent) {
     // the transfer progress bar and Close at the bottom.
     int rx = 14 + qsz + 12 + 20;
     int rw = W - rx - 12;
+    lv_obj_t *swLbl = lv_label_create(wifiScanOverlay);
+    lv_label_set_text(swLbl, LV_SYMBOL_WIFI "  Wi-Fi");
+    lv_obj_set_style_text_color(swLbl, lv_color_white(), 0);
+    lv_obj_set_pos(swLbl, rx, qy + 8);
+    qrWifiSwitch = lv_switch_create(wifiScanOverlay);
+    lv_obj_set_size(qrWifiSwitch, 64, 32);
+    lv_obj_set_pos(qrWifiSwitch, W - 12 - 64, qy + 2);
+    lv_obj_set_ext_click_area(qrWifiSwitch, 8);
+    lv_obj_set_style_bg_color(qrWifiSwitch, lv_color_hex(0x34C46A), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_add_event_cb(
+        qrWifiSwitch, [](lv_event_t *e) {
+            bool on = lv_obj_has_state((lv_obj_t *)lv_event_get_target(e), LV_STATE_CHECKED);
+            g_qrSwitchTouched = true;
+            g_qrPrevClients = -1; // fresh baseline for the "phone joined" detection
+            webPortalRequestEnable(on);
+            Serial.printf("[ui] WiFi switched %s from the WiFi screen\n", on ? "ON" : "OFF");
+        },
+        LV_EVENT_VALUE_CHANGED, NULL);
+
     scanSavedLbl = lv_label_create(wifiScanOverlay);
     lv_label_set_long_mode(scanSavedLbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(scanSavedLbl, rw);
     lv_obj_set_style_text_color(scanSavedLbl, lv_color_hex(0xCCD6E0), 0);
     lv_obj_set_style_text_line_space(scanSavedLbl, 3, 0);
-    lv_obj_set_pos(scanSavedLbl, rx, qy + 4);
+    lv_obj_set_pos(scanSavedLbl, rx, qy + 46);
 
     int btnW = rw;
     scanConnLbl = lv_label_create(wifiScanOverlay);
     lv_label_set_long_mode(scanConnLbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(scanConnLbl, rw);
     lv_obj_set_style_text_color(scanConnLbl, lv_color_hex(0x8FA0B4), 0);
-    lv_obj_set_pos(scanConnLbl, rx, qy + 132);
+    lv_obj_set_pos(scanConnLbl, rx, qy + 112);
 
     bridgeBar = lv_bar_create(wifiScanOverlay);
     lv_obj_set_size(bridgeBar, rw, 10);
@@ -438,12 +465,24 @@ static void refreshScanListIfOpen() {
     }
     wifiQrRebuild();
 
+    // Switch mirrors the requested state (auto-off / 4 s hold can change it too);
+    // WiFi off -> the QR is dimmed and the status says so.
+    bool wifiWanted = webPortalRequestedOn();
+    if (qrWifiSwitch && lv_obj_has_state(qrWifiSwitch, LV_STATE_CHECKED) != wifiWanted) {
+        if (wifiWanted) lv_obj_add_state(qrWifiSwitch, LV_STATE_CHECKED);
+        else lv_obj_remove_state(qrWifiSwitch, LV_STATE_CHECKED);
+    }
+    if (wifiQrObj) {
+        lv_opa_t want = wifiWanted ? LV_OPA_COVER : LV_OPA_20;
+        if (lv_obj_get_style_opa(wifiQrObj, 0) != want) lv_obj_set_style_opa(wifiQrObj, want, 0);
+    }
+
     if (scanSavedLbl) {
         char ap[40];
         webPortalApSsid(ap, sizeof(ap));
         bool secured = strlen(cfg.wifiPassword) >= 8;
         char buf[200];
-        snprintf(buf, sizeof(buf), "Wi-Fi VietHUD:\n  %s\nMật khẩu:\n  %s\nTrang cài đặt:\n  192.168.4.1",
+        snprintf(buf, sizeof(buf), "Tên: %s\nMật khẩu: %s\nTrang: 192.168.4.1",
                  ap, secured ? cfg.wifiPassword : "(không có)");
         if (strcmp(lv_label_get_text(scanSavedLbl), buf) != 0) lv_label_set_text(scanSavedLbl, buf);
     }
@@ -453,7 +492,10 @@ static void refreshScanListIfOpen() {
         int pct = 0;
         bool bridging = bridgeStatusText(buf, sizeof(buf), &pct);
         uint32_t color = 0x3DA5FF;
-        if (!bridging) {
+        if (!bridging && !wifiWanted) {
+            snprintf(buf, sizeof(buf), "Wi-Fi đang tắt.\nGạt công tắc để bật và kết nối điện thoại.");
+            color = 0xE5B53A;
+        } else if (!bridging) {
             int clients = webPortalClientCount();
             char ip[24];
             char inet[80] = "";

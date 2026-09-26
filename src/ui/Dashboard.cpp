@@ -14,6 +14,7 @@
 #include "audio/AudioPlayer.h"
 
 LV_FONT_DECLARE(lv_font_montserrat_speed); // webPortalIsEnabled()/webPortalRequestEnable() — the 4s hold gesture toggles WiFi
+#include "driver/temp_sensor.h" // ESP32-S3 die sensor with selectable range (readDieTempC)
 LV_FONT_DECLARE(lv_font_vn_14); // Vietnamese-capable text font (Arial 14px, ASCII+VN); drop-in for montserrat_14
 LV_FONT_DECLARE(lv_font_vn_20); // same at 20px — landscape top bar (matches the 20px bottom-corner readouts)
 
@@ -1441,6 +1442,31 @@ void refreshDashboard() {
     // re-applied only when it actually changes, so normal operation never forces
     // a full-screen redraw on the map beneath (only the rare critical blink does).
     if (tempLabel) {
+        // Arduino's temperatureRead() always uses the sensor's default range
+        // (-10..80 C); above that it SATURATES (read a flat "110.0 C" on a hot
+        // windscreen, 2026-09-26). Read with the range that fits: -10..80 C
+        // (+-1 C), 20..100 C (+-2 C) or 50..125 C (+-3 C), with hysteresis, and
+        // re-read at once in the higher range if the current one saturated.
+        auto readDieTempC = []() -> float {
+            static temp_sensor_dac_offset_t range = TSENS_DAC_L2;
+            auto readIn = [](temp_sensor_dac_offset_t r) {
+                float c = NAN;
+                temp_sensor_config_t t = TSENS_CONFIG_DEFAULT();
+                t.dac_offset = r;
+                temp_sensor_set_config(t);
+                temp_sensor_start();
+                temp_sensor_read_celsius(&c);
+                temp_sensor_stop();
+                return c;
+            };
+            float c = readIn(range);
+            if (range == TSENS_DAC_L2 && !(c < 80.0f)) c = readIn(range = TSENS_DAC_L1);
+            if (range == TSENS_DAC_L1 && !(c < 100.0f)) c = readIn(range = TSENS_DAC_L0);
+            if (range == TSENS_DAC_L2 && c >= 75.0f) range = TSENS_DAC_L1;       // next read: wider range
+            else if (range == TSENS_DAC_L1 && c < 65.0f) range = TSENS_DAC_L2;   // cooled: back to the precise one
+            else if (range == TSENS_DAC_L0 && c < 90.0f) range = TSENS_DAC_L1;
+            return c;
+        };
         static uint32_t sLastTempMs = 0;
         static float sTempC = -999.0f;
         static int sLastTier = 0;
@@ -1450,7 +1476,7 @@ void refreshDashboard() {
         uint32_t nowT = millis();
         if (sTempC < -900.0f || nowT - sLastTempMs > 2000) {
             sLastTempMs = nowT;
-            sTempC = temperatureRead(); // ESP32-S3 internal die temperature, degrees C
+            sTempC = readDieTempC(); // ESP32-S3 internal die temperature, degrees C (range-adaptive)
             g_boardTempC = sTempC;      // publish for the web telemetry (net/WebPortal.cpp)
             char buf[16];
             snprintf(buf, sizeof(buf), "%.0f\xC2\xB0" "C", (double)sTempC); // "NN°C"
@@ -1555,16 +1581,28 @@ void refreshDashboard() {
     // WiFi icon, three states: hidden (WiFi off), grey (hotspot on, waiting),
     // green "WiFi ✓" (a phone is connected to the hotspot). Touched only on a
     // state CHANGE — a style/text write always invalidates, and this runs 6-7x/s.
-    static int lastWifiState = 0; // 0 off, 1 on/waiting, 2 phone connected
+    // State 1 BLINKS (amber, ~1 Hz) so "hotspot on, no phone yet" is noticeable;
+    // only the small icon area is invalidated, and only at the blink edges.
+    static int lastWifiState = 0; // 0 off, 1 on/waiting (blinking), 2 phone connected
     int wifiState = !webPortalIsEnabled() ? 0 : (webPortalClientCount() > 0 ? 2 : 1);
+    static bool sWifiBlinkOn = true;
     if (wifiState != lastWifiState) {
         lastWifiState = wifiState;
+        sWifiBlinkOn = true;
         if (wifiState == 0) {
             lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_label_set_text(wifiTopIcon, wifiState == 2 ? LV_SYMBOL_WIFI " " LV_SYMBOL_OK : LV_SYMBOL_WIFI);
-            lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(wifiState == 2 ? 0x3CC46E : 0x7C8A9A), 0);
+            lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(wifiState == 2 ? 0x3CC46E : 0xE5B53A), 0);
+            lv_obj_set_style_opa(wifiTopIcon, LV_OPA_COVER, 0);
             lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (wifiState == 1) {
+        bool on = (millis() / 500) % 2 == 0;
+        if (on != sWifiBlinkOn) {
+            sWifiBlinkOn = on;
+            lv_obj_set_style_opa(wifiTopIcon, on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
         }
     }
 
