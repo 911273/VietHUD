@@ -137,6 +137,7 @@ static volatile bool wifiActuallyEnabled = false;
 
 void webPortalRequestEnable(bool on) { wifiEnabledRequest = on; }
 bool webPortalIsEnabled() { return wifiActuallyEnabled; }
+bool webPortalRequestedOn() { return wifiEnabledRequest; }
 // Cached by the web task (the only task that touches WiFi.*) so the UI can poll
 // it every frame without calling into the WiFi driver from Core 1.
 static volatile int g_apClients = 0;
@@ -682,7 +683,7 @@ static void wmTick() {
     // Rate-limit: while attempting a candidate, wait 12s for it to link; between
     // (re)scans when nothing was connectable, back off 15s so we don't scan
     // back-to-back (each scan is ~2-4s and disturbs the AP).
-    uint32_t waitMs = (g_wmTry >= 0) ? 12000 : 15000;
+    uint32_t waitMs = (g_wmTry >= 0) ? 12000 : 60000; // rescan backoff 60 s: each scan keeps the radio busy (heat)
     if (g_wmAttemptMs != 0 && (uint32_t)(now - g_wmAttemptMs) < waitMs) return;
 
     if (g_wmTry < 0 || g_wmTry + 1 >= g_wmCandCount) {
@@ -751,10 +752,11 @@ static void applyWifiState(bool enable) {
         // wmTick() scan + connect to the strongest saved network in range.
         bool wantSta = cfg.savedNetworkCount > 0 || cfg.staSsid[0] != '\0';
         WiFi.mode(wantSta ? WIFI_AP_STA : WIFI_AP);
-        // No modem sleep while WiFi is on: with it, STA round-trips swing 30-190 ms
-        // (DTIM wake-ups) and TCP transfers crawl at ~20-40 KB/s. The device is on
-        // car power and WiFi is only on while someone is configuring/updating.
-        WiFi.setSleep(false);
+        // Modem sleep ON by default (heat: with it off permanently the die ran past
+        // 80 C on a windscreen). The web task switches it off only while a phone
+        // is actually transferring data (see webTaskFn), where STA round-trips
+        // would otherwise swing 30-190 ms and transfers crawl at ~20-40 KB/s.
+        WiFi.setSleep(true);
         // AP SSID: a user-set custom name, else "VietHUD-XXXX" (last 4 MAC hex)
         // so multiple units don't collide (spec 2.1). "VietHUD" alone counts as
         // "not customised" and gets the MAC suffix too.
@@ -865,6 +867,14 @@ static void webTaskFn(void *) {
             dnsServer.processNextRequest(); // feature E: captive portal DNS
             server.handleClient();
             updateApiLoop();                // deferred reboot after a staged data install
+            {   // full-power radio only while a phone is transferring data
+                static bool sNoSleep = false;
+                bool want = updateApiBusy();
+                if (want != sNoSleep) {
+                    sNoSleep = want;
+                    WiFi.setSleep(!want);
+                }
+            }
 
             // Feature F: track the station link, sync NTP once associated.
             wl_status_t wl = WiFi.status();
