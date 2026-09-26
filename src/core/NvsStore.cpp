@@ -82,7 +82,7 @@ void loadConfigFromNVS(AppConfig &cfg) {
     // when a road's limit is unknown (VN urban baseline). Reset it to the code
     // default exactly ONCE (guarded by a schema-version key) so a later manual
     // change the user makes is still respected and never re-clobbered.
-    const uint32_t kCfgSchemaVer = 3;
+    const uint32_t kCfgSchemaVer = 4;
     uint32_t cfgVer = prefs.getUInt("cfgVer", 0);
     if (cfgVer < 2) {
         cfg.defaultLimitKmh = 50.0f;
@@ -100,6 +100,12 @@ void loadConfigFromNVS(AppConfig &cfg) {
         pw[10] = '\0';
         strncpy(cfg.wifiPassword, pw, sizeof(cfg.wifiPassword) - 1);
         prefs.putString("wifiPass", cfg.wifiPassword);
+    }
+    // Schema 4 (2026-09-26): WiFi auto-off can no longer be disabled; a unit
+    // saved with 0 (= never) goes back to the 10 min default.
+    if (cfgVer < 4 && cfg.wifiAutoOffMin < 1.0f) {
+        cfg.wifiAutoOffMin = 10.0f;
+        prefs.putFloat("wifiAutoOff", cfg.wifiAutoOffMin);
     }
     if (cfgVer < kCfgSchemaVer) prefs.putUInt("cfgVer", kCfgSchemaVer);
     prefs.end();

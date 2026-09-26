@@ -169,7 +169,7 @@ const CF=[['audioEnabled','Âm thanh cảnh báo','b'],['audioVolume','Âm lư�
  ['overspeedOffsetKmh','Cảnh báo khi vượt quá (km/h)','n',0,10],['defaultLimitKmh','Giới hạn khi không rõ (km/h, 0 = tắt)','n',0,90],
  ['autoDimMin','Giảm sáng khi dừng sau (phút, 0 = tắt)','n',0,30],['gnssSpeedCalibrationPct','Hiệu chỉnh tốc độ GPS (%)','n',-15,15],['tripLoggingEnabled','Ghi nhật ký chuyến đi','b'],
  ['-','Nâng cao'],['gnssSpeedFilterAlpha','Làm mượt tốc độ (0,05–0,9)','n',0.05,0.9],['gnssFixTimeoutS','Báo mất GPS sau (giây)','n',1,10],
- ['wifiAutoOffMin','Tự tắt Wi-Fi khi không dùng (phút, 0 = không)','n',0,120],['wifiSsid','Tên Wi-Fi của VietHUD','t'],['wifiPassword','Mật khẩu Wi-Fi mới (để trống = giữ nguyên)','p'],['dataUpdateUrl','Địa chỉ dữ liệu','t']];
+ ['wifiAutoOffMin','Tự tắt Wi-Fi khi không có kết nối (phút)','n',1,120],['wifiSsid','Tên Wi-Fi của VietHUD','t'],['wifiPassword','Mật khẩu Wi-Fi mới (để trống = giữ nguyên)','p'],['dataUpdateUrl','Địa chỉ dữ liệu','t']];
 async function cfgLoad(){const v=await jget('/api/v1/config');$('cfg').innerHTML=CF.map(([k,l,t,a,b])=>{
  if(k==='-')return '<h3>'+l+'</h3>';if(t==='t'||t==='p')return '<div class="f" style="display:block"><span class="s">'+l+'</span><input type="'+(t==='p'?'password':'text')+'" id="c_'+k+'" value="'+E(t==='p'?'':v[k])+'" autocapitalize="off"></div>';
  if(t==='b')return '<label class="f"><span>'+l+'</span><input type="checkbox" id="c_'+k+'"'+(v[k]?' checked':'')+'></label>';

@@ -125,8 +125,10 @@ struct AppConfig {
     // works out of the box (GitHub raw 301/302s to Fastly — DataUpdater follows
     // redirects). Empty = updater disabled.
     char dataUpdateUrl[128] = "https://raw.githubusercontent.com/911273/VietHUD/main/speedmap/";
-    // Auto-off the WiFi AP after this many minutes with NO client connected
-    // (0 = never). Saves power/heat/exposure on a windscreen device left with
+    // Auto-off the WiFi AP after this many minutes with NO client connected.
+    // Always on (1..120 min, default 10 — user rule 2026-09-26: WiFi is OFF at
+    // boot and must switch itself off again when unused; the old 0 = "never"
+    // is gone). Saves power/heat/exposure on a windscreen device left with
     // WiFi on. web portal (Cài đặt) + Settings; see WebPortal.cpp webTaskFn().
     float wifiAutoOffMin = 10;
 
@@ -189,7 +191,7 @@ inline void clampConfig(AppConfig &c) {
     c.overspeedOffsetKmh = constrain(c.overspeedOffsetKmh, 0.0f, 10.0f);
     c.defaultLimitKmh = constrain(c.defaultLimitKmh, 0.0f, 120.0f);
     c.audioVolume = constrain(c.audioVolume, 0.0f, 100.0f);
-    c.wifiAutoOffMin = constrain(c.wifiAutoOffMin, 0.0f, 120.0f);
+    c.wifiAutoOffMin = constrain(c.wifiAutoOffMin, 1.0f, 120.0f);
     c.aheadLimitWarnDistM = constrain(c.aheadLimitWarnDistM, 50.0f, 100.0f);
     c.cameraWarnDistM = constrain(c.cameraWarnDistM, 50.0f, 100.0f);
     c.screenRotation = constrain(c.screenRotation, 0.0f, 3.0f);
