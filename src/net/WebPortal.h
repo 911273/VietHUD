@@ -110,3 +110,6 @@ bool webPortalDeleteNetwork(int idx);                        // remove saved net
 // Dashboard clock show the right time without waiting for a GPS fix. Returns
 // false when not yet synced, so the caller keeps using GPS time as before.
 bool webPortalLocalTime(int *hour, int *minute);
+
+// Phones/laptops currently joined to the device hotspot (0 when WiFi is off).
+int webPortalClientCount();

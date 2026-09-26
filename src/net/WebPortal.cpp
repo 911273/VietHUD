@@ -8,6 +8,8 @@
 #include "audio/AudioPlayer.h" // audioSelfTest() — web control panel "test audio" action
 #include "demo/DemoMode.h"      // demoModeSetEnabled()/IsEnabled() — web control panel demo toggle
 #include "net/DataUpdater.h"    // dataUpdateStart()/GetStatus() — online data update action
+#include "net/UpdateApi.h"      // Phone Update Bridge API (/api/v1/*)
+#include "net/PortalPage.h"     // kPortalHtml — the "/" single-page portal
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -28,7 +30,7 @@
 // directly rather than depending on anything external. SSID/password
 // now live in AppConfig (cfg.wifiSsid/cfg.wifiPassword — editable from
 // Settings > WiFi or /config), not hardcoded here.
-static WebServer server(80);
+static PortalServer server(80); // WebServer + raw-upload read-timeout hook (net/UpdateApi.h)
 static DNSServer dnsServer;                 // captive portal: answers every lookup with the AP IP (feature E)
 static const char *kMdnsHost = "viethud";   // -> http://viethud.local (feature B)
 static const IPAddress kApIp(192, 168, 4, 1); // default SoftAP address, used by the captive portal
@@ -134,6 +136,7 @@ static volatile bool wifiActuallyEnabled = false;
 
 void webPortalRequestEnable(bool on) { wifiEnabledRequest = on; }
 bool webPortalIsEnabled() { return wifiActuallyEnabled; }
+int webPortalClientCount() { return wifiActuallyEnabled ? (int)WiFi.softAPgetStationNum() : 0; }
 
 void webPortalStatusText(char *buf, size_t cap) {
     if (wifiActuallyEnabled)
@@ -217,162 +220,12 @@ bool webPortalLocalTime(int *hour, int *minute) {
 // for the same reasoning: live values only need to be as fresh as a human
 // reads them, no need for anything tighter.
 // ---------------------------------------------------------------------
-static const char kIndexHtml[] PROGMEM = R"HTML(<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VietHUD - Live</title>
-<style>
-body{background:#0B0F14;color:#CCD6E0;font-family:sans-serif;margin:0;padding:12px}
-h1{font-size:18px;color:#fff;margin:0 0 12px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
-.card{background:#151C24;border-radius:8px;padding:10px}
-.card .label{color:#7C8A9A;font-size:11px;text-transform:uppercase}
-.card .value{color:#fff;font-size:20px;margin-top:4px}
-.ok{color:#33CC66}.warn{color:#E0C020}.bad{color:#FF3B30}
-.card.camera{background:#E0A020;grid-column:1/-1}
-.card.camera .label,.card.camera .value{color:#000}
-nav a{color:#4AA3FF;margin-right:16px;font-size:13px;text-decoration:none}
-.ctl{margin:14px 0}.ctl button{background:#1E2A38;color:#CFE0F0;border:1px solid #2E3F52;border-radius:6px;padding:8px 12px;margin:4px 6px 0 0;font-size:13px;cursor:pointer}
-.ctl button:hover{background:#28394C}.ctl button.danger{border-color:#7A2E2E;color:#FF9A9A}
-#msg{color:#7C8A9A;font-size:12px;margin-left:6px}
-h2{font-size:15px;color:#fff;margin:0 0 8px}
-.wm{background:#151C24;border-radius:8px;padding:10px;margin:12px 0}
-.wm input{background:#0B0F14;color:#fff;border:1px solid #2E3F52;border-radius:6px;padding:8px;margin:4px 6px 0 0;font-size:13px}
-.wmrow{display:flex;flex-wrap:wrap;align-items:center;margin-top:6px}
-.net{display:flex;justify-content:space-between;align-items:center;background:#0F1620;border:1px solid #24303E;border-radius:6px;padding:7px 10px;margin:4px 0;cursor:pointer}
-.net:hover{background:#182230}.net .r{color:#7C8A9A;font-size:12px}
-.net b{color:#fff;font-weight:600}
-.net .del{color:#FF9A9A;border:1px solid #7A2E2E;border-radius:5px;padding:2px 8px;font-size:12px;cursor:pointer}
-.ota{border-radius:8px;padding:10px 12px;margin:10px 0;font-size:14px;display:none}
-.ota.show{display:block}.ota.new{background:#1E3A24;border:1px solid #2E7D40;color:#9EE6B0}
-.ota button{background:#2E7D40;color:#fff;border:0;border-radius:6px;padding:7px 12px;margin-left:8px;cursor:pointer;font-size:13px}
-</style></head><body>
-<nav><a href="/">Live</a><a href="/triplog">Trip logs</a><a href="/config">Config</a><a href="/update">OTA Update</a></nav>
-<h1>VietHUD - Live Telemetry</h1>
-<div class="grid" id="grid"></div>
-<div class="ctl">
-  <button onclick="if(confirm('Tai du lieu ban do/canh bao moi ve the?'))act('dataupdate')">&#11015; Update data</button>
-  <button onclick="act('audiotest')">&#128266; Test audio</button>
-  <button onclick="act('demo')">&#127916; Toggle demo</button>
-  <button class="danger" onclick="if(confirm('Xoa toan bo trip log?'))act('clearlogs')">&#128465; Clear trip logs</button>
-  <button class="danger" onclick="if(confirm('Khoi dong lai thiet bi?'))act('reboot')">&#128260; Reboot</button>
-  <span id="msg"></span>
-</div>
-<div id="du" style="margin:8px 0;font-size:13px"></div>
-<div id="ota" class="ota"></div>
-<div class="wm">
-  <h2>WiFi Manager</h2>
-  <div id="wmsaved"></div>
-  <div class="wmrow"><button onclick="wscan(1)">&#128260; Scan WiFi</button><span id="wmmsg" style="color:#7C8A9A;font-size:12px;margin-left:8px"></span></div>
-  <div id="wmscan"></div>
-  <div class="wmrow">
-    <input id="wmssid" placeholder="Ten WiFi (SSID)" size="16">
-    <input id="wmpass" type="password" placeholder="Mat khau" size="14">
-    <button onclick="wadd()">&#10133; Luu &amp; ket noi</button>
-  </div>
-</div>
-<script>
-async function wsaved(){
-  try{const r=await fetch('/api/wifi/saved');const a=await r.json();
-  document.getElementById('wmsaved').innerHTML=a.length? a.map(n=>
-    '<div class="net"><span><b>'+n.ssid+'</b> <span class="r">(da luu)</span></span>'+
-    '<span class="del" onclick="wdel(event,'+n.i+')">Xoa</span></div>').join('')
-    : '<div class="r" style="color:#7C8A9A;font-size:12px">Chua luu mang nao</div>';}catch(e){}
+// The page itself lives in net/PortalPage.h (mobile-first SPA: Dữ liệu /
+// Trạng thái / Wi-Fi / Hệ thống tabs + the Phone Update Bridge client).
+static void handleIndex() {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send_P(200, "text/html; charset=utf-8", kPortalHtml);
 }
-async function wscan(go){
-  document.getElementById('wmmsg').textContent='dang quet...';
-  try{const r=await fetch('/api/wifi/scan'+(go?'?rescan=1':''));const d=await r.json();
-    if(d.state===-2){document.getElementById('wmmsg').textContent='dang quet...';setTimeout(()=>wscan(0),1200);return;}
-    document.getElementById('wmmsg').textContent=(d.results||[]).length+' mang';
-    document.getElementById('wmscan').innerHTML=(d.results||[]).map(n=>
-     '<div class="net" onclick="pick(\''+n.ssid.replace(/'/g,"\\'")+'\')"><span><b>'+n.ssid+'</b> '+(n.locked?'&#128274;':'&#128275;')+
-     '</span><span class="r">'+n.rssi+' dBm</span></div>').join('');
-  }catch(e){document.getElementById('wmmsg').textContent='loi quet';}
-}
-function pick(s){document.getElementById('wmssid').value=s;document.getElementById('wmpass').focus();}
-async function wadd(){
-  const ssid=document.getElementById('wmssid').value,pass=document.getElementById('wmpass').value;
-  if(!ssid){document.getElementById('wmmsg').textContent='nhap SSID';return;}
-  const b=new URLSearchParams();b.append('ssid',ssid);b.append('password',pass);
-  const r=await fetch('/api/wifi/add',{method:'POST',body:b});
-  document.getElementById('wmmsg').textContent=await r.text();
-  document.getElementById('wmpass').value='';wsaved();
-}
-async function wdel(ev,i){ev.stopPropagation();if(!confirm('Xoa mang da luu?'))return;
-  const b=new URLSearchParams();b.append('idx',i);
-  await fetch('/api/wifi/del',{method:'POST',body:b});wsaved();
-}
-wsaved();
-function card(label, value, cls) {
-  return '<div class="card"><div class="label">' + label + '</div><div class="value ' + (cls||'') + '">' + value + '</div></div>';
-}
-async function act(a) {
-  document.getElementById('msg').textContent = a + '...';
-  try { const r = await fetch('/api/action?do=' + a, {method:'POST'}); document.getElementById('msg').textContent = await r.text(); }
-  catch(e){ document.getElementById('msg').textContent = 'error'; }
-}
-async function tick() {
-  try {
-    const r = await fetch('/api/status');
-    const d = await r.json();
-    let html = '';
-    // Speed-camera-ahead — full-width amber card, same warning color/meaning
-    // as the on-device Dashboard's own alert card (ui/Dashboard.cpp's
-    // updateAlertCard(): a known, upcoming hazard). Only rendered while a
-    // camera is actually ahead, not as an always-present "no camera" card
-    // — matches the on-device card's own idle/active logic.
-    if (d.cameraAhead) {
-      const c = d.cameraAhead;
-      const limitTxt = (c.speedLimitKmh !== null) ? ' (' + c.speedLimitKmh.toFixed(0) + ' km/h)' : '';
-      html += '<div class="card camera"><div class="label">Speed camera ahead</div><div class="value">' +
-              c.distanceM.toFixed(0) + ' m' + limitTxt + '</div></div>';
-    }
-    const tc = d.boardTempC;
-    const tcls = tc >= 92 ? 'bad' : (tc >= 80 ? 'warn' : 'ok');
-    html += card('Board temp', tc.toFixed(0) + ' °C', tcls);
-    html += card('GNSS fix', d.gnss.fix ? 'OK' : (d.gnss.linkAlive ? 'SEARCHING' : 'FAULT'),
-                  d.gnss.fix ? 'ok' : (d.gnss.linkAlive ? 'warn' : 'bad'));
-    html += card('Satellites', d.gnss.satCount);
-    html += card('Direction', d.gnss.headingValid ? (d.gnss.dir + ' (' + d.gnss.headingDeg.toFixed(0) + '°)') : '--');
-    html += card('Speed (filtered)', d.gnss.speedKmh.toFixed(1) + ' km/h');
-    html += card('Speed (raw)', d.gnss.rawSpeedKmh.toFixed(1) + ' km/h');
-    html += card('Speed map', d.speedMap.loaded ? 'LOADED' : 'NOT LOADED', d.speedMap.loaded ? 'ok' : 'bad');
-    html += card('Speed limit', d.speedMap.limitValid ? d.speedMap.limitKmh.toFixed(0) + ' km/h' : '--');
-    const w = d.wifi;
-    html += card('Hotspot (AP)', w.on ? (w.apSsid + ' · ' + w.apIp) : 'OFF', w.on ? 'ok' : '');
-    html += card('AP clients', w.clients);
-    // STA status decoded from w.staStatus (3=WL_CONNECTED,1=no SSID,4=fail,...)
-    let staTxt, staCls;
-    if (w.staConnected) { staTxt = (w.staSsid || 'STA') + ' · ' + w.staIp + ' · ' + w.rssi + 'dBm' + (w.ntp ? ' · NTP✓' : ''); staCls = 'ok'; }
-    else if (!w.staSsid) { staTxt = 'chua dat mang'; staCls = ''; }
-    else if (w.staStatus === 1) { staTxt = 'khong thay "' + w.staSsid + '" (5GHz/tat?)'; staCls = 'bad'; }
-    else if (w.staStatus === 4) { staTxt = 'sai mat khau "' + w.staSsid + '"?'; staCls = 'bad'; }
-    else { staTxt = 'dang ket noi "' + w.staSsid + '"...'; staCls = 'warn'; }
-    html += card('Internet (STA)', staTxt, staCls);
-    html += card('Free internal RAM', d.mem.freeInternalKB + ' KB (min ' + d.mem.minFreeInternalKBEver + ' KB)');
-    html += card('Free PSRAM', d.mem.freePsramKB + ' KB');
-    html += card('Uptime', Math.floor(d.uptimeMs / 1000) + ' s');
-    document.getElementById('grid').innerHTML = html;
-    // Data-update progress line (state: 0 idle,1 running,2 success,3 failed)
-    const u = d.dataUpdate;
-    let du = '';
-    if (u.state === 1) du = '<span class="warn">⏳ ' + u.msg + ' — ' + u.filesDone + '/' + u.filesTotal + ' (' + u.percent + '%)</span>';
-    else if (u.state === 2) du = '<span class="ok">✅ ' + u.msg + '</span>';
-    else if (u.state === 3) du = '<span class="bad">⚠ ' + u.msg + '</span>';
-    document.getElementById('du').innerHTML = du;
-    // OTA "update available" banner (auto-check compares remote vs local version).
-    const o = d.ota, ob = document.getElementById('ota');
-    if (o && o.available) {
-      ob.className = 'ota new show';
-      ob.innerHTML = '&#127881; Co ban du lieu moi: <b>' + o.remote + '</b> (dang co <b>' + (o.local||'?') +
-        '</b>) <button onclick="if(confirm(\'Tai va ap dung ban cap nhat? Thiet bi se khoi dong lai.\'))act(\'dataupdate\')">Cap nhat ngay</button>';
-    } else { ob.className = 'ota'; ob.innerHTML = ''; }
-  } catch (e) { /* transient fetch failure — next tick retries */ }
-}
-tick();
-setInterval(tick, 500);
-</script></body></html>)HTML";
-
-static void handleIndex() { server.send_P(200, "text/html", kIndexHtml); }
 
 // ---------------------------------------------------------------------
 // "/api/status" — hand-rolled JSON (no ArduinoJson dependency — same
@@ -615,8 +468,7 @@ static void handleConfigGet() {
                      "button{background:#2E7D4F;color:#fff;border:0;border-radius:6px;padding:10px 20px;"
                      "font-size:14px}"
                      "</style></head><body>"
-                     "<nav><a href=\"/\">Live</a><a href=\"/config\">Config</a><a href=\"/update\">OTA "
-                     "Update</a></nav>"
+                     "<nav><a href=\"/\">&lsaquo; Trang ch&iacute;nh</a><a href=\"/config\">C&agrave;i &#273;&#7863;t</a><a href=\"/update\">Firmware</a></nav>"
                      "<h1>VietHUD - Configuration</h1><form method=\"POST\" action=\"/config\">");
 
     len += snprintf(configBuf + len, sizeof(configBuf) - len, "<fieldset><legend>Alerts</legend>");
@@ -736,7 +588,7 @@ static const char kUpdateHtml[] PROGMEM = R"HTML(<!DOCTYPE html><html><head><met
 h1{font-size:18px;color:#fff}nav a{color:#4AA3FF;margin-right:16px;font-size:13px;text-decoration:none}
 button{background:#2E7D4F;color:#fff;border:0;border-radius:6px;padding:10px 20px;font-size:14px}
 p.warn{color:#E0C020}</style></head><body>
-<nav><a href="/">Live</a><a href="/triplog">Trip logs</a><a href="/config">Config</a><a href="/update">OTA Update</a></nav>
+<nav><a href="/">&lsaquo; Trang ch&iacute;nh</a><a href="/triplog">Trip logs</a><a href="/config">C&agrave;i &#273;&#7863;t</a></nav>
 <h1>VietHUD - OTA Firmware Update</h1>
 <p class="warn">Upload a .bin built for env:viethud. Do not power off during upload — the device reboots automatically when done.</p>
 <form method="POST" action="/update" enctype="multipart/form-data">
@@ -899,6 +751,9 @@ static int doScan() {
 // existing status/diagnostic code keeps reporting the active network.
 static void wmTick() {
     if (cfg.savedNetworkCount <= 0) return;         // nothing to manage (AP only)
+    // A phone is pushing data through the AP right now: a scan (2-4 s off-channel)
+    // or an STA connect (moves the AP channel) would drop the transfer. Hold off.
+    if (updateApiBusy()) return;
     if (WiFi.status() == WL_CONNECTED) { g_wmTry = -1; g_wmAttemptMs = 0; return; }  // linked; reconnect fast if it drops
     uint32_t now = millis();
     // Rate-limit: while attempting a candidate, wait 12s for it to link; between
@@ -973,6 +828,10 @@ static void applyWifiState(bool enable) {
         // wmTick() scan + connect to the strongest saved network in range.
         bool wantSta = cfg.savedNetworkCount > 0 || cfg.staSsid[0] != '\0';
         WiFi.mode(wantSta ? WIFI_AP_STA : WIFI_AP);
+        // No modem sleep while WiFi is on: with it, STA round-trips swing 30-190 ms
+        // (DTIM wake-ups) and TCP transfers crawl at ~20-40 KB/s. The device is on
+        // car power and WiFi is only on while someone is configuring/updating.
+        WiFi.setSleep(false);
         // AP SSID: a user-set custom name, else "VietHUD-XXXX" (last 4 MAC hex)
         // so multiple units don't collide (spec 2.1). "VietHUD" alone counts as
         // "not customised" and gets the MAC suffix too.
@@ -1053,6 +912,7 @@ static void webTaskFn(void *) {
     server.on("/hotspot-detect.html", HTTP_GET, handleCaptiveRedirect); // iOS/macOS
     server.on("/ncsi.txt", HTTP_GET, handleCaptiveRedirect);          // Windows
     server.onNotFound(handleCaptiveRedirect);                         // feature E
+    updateApiRegister(server);                                        // Phone Update Bridge (/api/v1/*)
 
     esp_task_wdt_add(NULL);
     uint32_t lastClientMs = millis();  // feature D: auto-off timer baseline
@@ -1066,7 +926,7 @@ static void webTaskFn(void *) {
         // this task. Scan works in AP_STA; it briefly disturbs the AP, fine for
         // a setup moment.
         if (wifiActuallyEnabled) {
-            if (g_scanReq) {
+            if (g_scanReq && !updateApiBusy()) {
                 g_scanReq = false;
                 doScan();                 // fills g_scan* for the UI picker
                 g_wmTry = -1; g_wmAttemptMs = 0;  // let wmTick() reconnect after the scan drop
@@ -1081,6 +941,7 @@ static void webTaskFn(void *) {
         if (wifiActuallyEnabled) {
             dnsServer.processNextRequest(); // feature E: captive portal DNS
             server.handleClient();
+            updateApiLoop();                // deferred reboot after a staged data install
 
             // Feature F: track the station link, sync NTP once associated.
             wl_status_t wl = WiFi.status();
@@ -1127,7 +988,7 @@ static void webTaskFn(void *) {
             }
 
             // Feature D: auto-off after wifiAutoOffMin with no AP client.
-            if (WiFi.softAPgetStationNum() > 0) lastClientMs = millis();
+            if (WiFi.softAPgetStationNum() > 0 || updateApiBusy()) lastClientMs = millis();
             uint32_t idleLimitMs = (uint32_t)(cfg.wifiAutoOffMin * 60000.0f);
             if (idleLimitMs > 0 && millis() - lastClientMs > idleLimitMs) {
                 Serial.printf("[web] WiFi auto-off: no client for %.0f min\n", (double)cfg.wifiAutoOffMin);
@@ -1141,4 +1002,4 @@ static void webTaskFn(void *) {
     }
 }
 
-void webPortalInit() { xTaskCreatePinnedToCore(webTaskFn, "webTask", 8192, NULL, 1, NULL, 0); }
+void webPortalInit() { xTaskCreatePinnedToCore(webTaskFn, "webTask", 12288, NULL, 1, NULL, 0); }

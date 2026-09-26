@@ -10,6 +10,7 @@ Steps:
   3. Compute SHA-256 of each core .bin and write manifest.txt
      (line 1: `version <YYYY.MM.DD.HHMM>`, then `<name> <bytes> <sha256>` — the
      exact format the firmware DataUpdater parses; raster/sounds excluded).
+     + manifest.txt.sig (ECDSA P-256 signature — firmware rejects unsigned data)
   4. If manifest.txt is byte-identical to the repo's current one, STOP (no commit,
      no push, no Telegram) — keeps daily runs from spamming when nothing changed.
   5. git add/commit/push to the configured branch.
@@ -124,6 +125,21 @@ def telegram(summary, manifest_changed=True):
         LOG.error("Telegram error: %s", e)
 
 
+def sign_manifest(manifest_path):
+    """Write <manifest>.sig (ECDSA P-256, base64 DER) — see tools/sign_manifest.py.
+    Key: $VIETHUD_SIGNING_KEY (default ~/.viethud/manifest_signing_key.pem)."""
+    import base64
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    key_path = Path(os.environ.get("VIETHUD_SIGNING_KEY",
+                                   str(Path.home() / ".viethud" / "manifest_signing_key.pem")))
+    key = serialization.load_pem_private_key(key_path.read_bytes(), None)
+    sig = key.sign(Path(manifest_path).read_bytes(), ec.ECDSA(hashes.SHA256()))
+    Path(str(manifest_path) + ".sig").write_text(base64.b64encode(sig).decode() + "\n",
+                                                 encoding="ascii", newline="\n")
+    LOG.info("signed %s", manifest_path)
+
+
 def main():
     speedmap_dir = Path(SPEEDMAP_OUT)
     summary_path = speedmap_dir.parent / "last_pack_summary.json"
@@ -156,7 +172,9 @@ def main():
         src = speedmap_dir / name
         if src.exists():
             shutil.copy2(src, repo_speedmap / name)
-    old_mf_path.write_text(new_manifest, encoding="utf-8")
+    old_mf_path.write_text(new_manifest, encoding="utf-8", newline="\n")
+    # Sign it: firmware refuses unsigned data (Phone Update Bridge + online update).
+    sign_manifest(old_mf_path)
 
     _run(["git", "add", "-A", GIT_SPEEDMAP_SUBDIR], cwd=repo)
     msg = (f"data: update speedmap {version} "

@@ -2,6 +2,7 @@
 #include <Preferences.h>
 #include <string.h> // strncpy() — see loadConfigFromNVS()'s wifiSsid/wifiPassword copy
 #include <stdio.h>  // snprintf() — per-slot NVS keys for the saved-network list
+#include <esp_system.h> // esp_random() — per-device hotspot password (schema 3)
 
 static Preferences prefs;
 
@@ -83,13 +84,26 @@ void loadConfigFromNVS(AppConfig &cfg) {
     // when a road's limit is unknown (VN urban baseline). Reset it to the code
     // default exactly ONCE (guarded by a schema-version key) so a later manual
     // change the user makes is still respected and never re-clobbered.
-    const uint32_t kCfgSchemaVer = 2;
+    const uint32_t kCfgSchemaVer = 3;
     uint32_t cfgVer = prefs.getUInt("cfgVer", 0);
-    if (cfgVer < kCfgSchemaVer) {
+    if (cfgVer < 2) {
         cfg.defaultLimitKmh = 50.0f;
         prefs.putFloat("defLimitKmh", 50.0f);
-        prefs.putUInt("cfgVer", kCfgSchemaVer);
     }
+    // Schema 3 (2026-09-26, Phone Update Bridge security): every unit shipped
+    // with the SAME hotspot password "12345678", so anyone in range could join
+    // and use the portal. Replace that factory default ONCE with a per-device
+    // random one (shown on-screen + inside the join QR, so the user never has to
+    // type it). A password the user chose themselves is left untouched.
+    if (cfgVer < 3 && strcmp(cfg.wifiPassword, "12345678") == 0) {
+        static const char kAlphabet[] = "abcdefghjkmnpqrstuvwxyz23456789"; // no 0/O/1/l/i look-alikes
+        char pw[11];
+        for (int i = 0; i < 10; i++) pw[i] = kAlphabet[esp_random() % (sizeof(kAlphabet) - 1)];
+        pw[10] = '\0';
+        strncpy(cfg.wifiPassword, pw, sizeof(cfg.wifiPassword) - 1);
+        prefs.putString("wifiPass", cfg.wifiPassword);
+    }
+    if (cfgVer < kCfgSchemaVer) prefs.putUInt("cfgVer", kCfgSchemaVer);
     prefs.end();
     sanitizeConfig(cfg); // NaN/Inf guard against a corrupted flash page — must run BEFORE clamping, see its comment
     clampConfig(cfg);

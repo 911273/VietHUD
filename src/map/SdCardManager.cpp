@@ -4,6 +4,7 @@
 #include <SD_MMC.h>
 #include <esp_heap_caps.h>
 #include <esp_task_wdt.h> // esp_task_wdt_reset() — see ensureSdMmcBegun()'s own comment
+#include <mbedtls/sha256.h> // sdMgrSha256File() — data-install readback verify
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <stdio.h> // sscanf() — trip-log filename parsing in sdMgrListTripLogs()
@@ -633,7 +634,7 @@ int sdMgrDeleteAllTripLogs() {
 
 int sdMgrReadFileChunk(const char *path, size_t offset, uint8_t *buf, size_t bufSize) {
     SdLock lock;
-    if (!ensureSdMmcBegun()) return -1;
+    if (!ensureSdMmcBegun() || !SD_MMC.exists(path)) return -1; // quiet "not found" for optional files
     File f = SD_MMC.open(path, FILE_READ);
     if (!f) return -1;
     if (offset >= f.size()) {
@@ -820,4 +821,154 @@ const char *sdMgrGetSegmentRoadName(uint32_t segId) {
     sLastSegId = segId;
     sLastRoadName[0] = '\0';
     return "";
+}
+
+// ---------------------------------------------------------------------------
+// Data-install primitives (Phone Update Bridge / online update, 2026-09-26).
+// See src/update/DataInstaller.cpp for the staging + journal protocol these
+// serve. All are mutex-guarded like the rest of this module.
+// ---------------------------------------------------------------------------
+
+// ONE streaming writer at a time, kept OPEN between chunks. The old
+// open-append-close-per-chunk pattern (sdMgrAppendBytes) re-walks the FAT
+// cluster chain on every open, so a multi-MB file got slower with every chunk;
+// holding the handle makes each write O(chunk). The SD mutex is still taken
+// only per write, so the map matcher keeps reading tiles between chunks.
+static File sWriter;
+
+bool sdMgrWriterOpen(const char *path, bool append) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    if (sWriter) sWriter.close();
+    sWriter = SD_MMC.open(path, append ? FILE_APPEND : FILE_WRITE);
+    return (bool)sWriter;
+}
+
+bool sdMgrWriterWrite(const uint8_t *buf, size_t len) {
+    SdLock lock;
+    if (!sWriter) return false;
+    return sWriter.write(buf, len) == len;
+}
+
+void sdMgrWriterClose() {
+    SdLock lock;
+    if (sWriter) {
+        sWriter.flush();
+        sWriter.close();
+    }
+}
+
+int64_t sdMgrFileSize(const char *path) {
+    SdLock lock;
+    if (!ensureSdMmcBegun() || !SD_MMC.exists(path)) return -1; // exists() first: open() of a missing file logs an error
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) return -1;
+    int64_t s = (int64_t)f.size();
+    f.close();
+    return s;
+}
+
+bool sdMgrExists(const char *path) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    return SD_MMC.exists(path);
+}
+
+bool sdMgrMkdir(const char *path) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    return SD_MMC.exists(path) || SD_MMC.mkdir(path);
+}
+
+// Plain rename that does NOT delete an existing target first (FAT rename fails
+// if the target exists — the installer journal handles the backup step itself,
+// so a crash can never leave BOTH files missing).
+bool sdMgrMove(const char *from, const char *to) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    return SD_MMC.rename(from, to);
+}
+
+uint64_t sdMgrFreeBytes() {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return 0;
+    uint64_t total = SD_MMC.totalBytes(), used = SD_MMC.usedBytes();
+    return total > used ? total - used : 0;
+}
+
+// Replace a small file's whole content (manifest, journal, session record).
+bool sdMgrWriteSmallFile(const char *path, const void *data, size_t len) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    File f = SD_MMC.open(path, FILE_WRITE);
+    if (!f) return false;
+    size_t w = f.write((const uint8_t *)data, len);
+    f.flush();
+    f.close();
+    return w == len;
+}
+
+// Stream a whole file through SHA-256 with one open handle (readback verify of
+// what is ACTUALLY on the card). Mutex taken per 4 KB chunk; tick() (may be
+// NULL) is called between chunks — callers pass a watchdog feed.
+bool sdMgrSha256File(const char *path, uint8_t out[32], void (*tick)()) {
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    if (!buf) return false;
+    File f;
+    {
+        SdLock lock;
+        if (ensureSdMmcBegun()) f = SD_MMC.open(path, FILE_READ);
+    }
+    if (!f) {
+        heap_caps_free(buf);
+        return false;
+    }
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    bool ok = true;
+    for (;;) {
+        int r;
+        {
+            SdLock lock;
+            r = f.read(buf, 4096);
+        }
+        if (r < 0) { ok = false; break; }
+        if (r == 0) break;
+        mbedtls_sha256_update(&ctx, buf, r);
+        if (tick) tick();
+    }
+    {
+        SdLock lock;
+        f.close();
+    }
+    mbedtls_sha256_finish(&ctx, out);
+    mbedtls_sha256_free(&ctx);
+    heap_caps_free(buf);
+    return ok;
+}
+
+// Delete every regular file directly inside dir (non-recursive). Used to wipe
+// the data-install staging area. Returns files removed, -1 if no card.
+int sdMgrClearDir(const char *dir) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return -1;
+    File d = SD_MMC.open(dir);
+    if (!d || !d.isDirectory()) return 0;
+    // Collect first, delete after: deleting while iterating is unreliable on SD_MMC.
+    static char names[48][48];
+    int n = 0;
+    for (File f = d.openNextFile(); f && n < 48; f = d.openNextFile()) {
+        if (!f.isDirectory()) {
+            const char *nm = f.name();
+            const char *base = strrchr(nm, '/');
+            snprintf(names[n++], sizeof(names[0]), "%s/%s", dir, base ? base + 1 : nm);
+        }
+        f.close();
+    }
+    d.close();
+    int removed = 0;
+    for (int i = 0; i < n; i++)
+        if (SD_MMC.remove(names[i])) removed++;
+    return removed;
 }
