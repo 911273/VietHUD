@@ -265,23 +265,14 @@ static void onWifiScanClose(lv_event_t *) {
     lv_screen_load(dashboardScreen);
 }
 
-// Layout for the 480x320 landscape panel:
-//   [QR1 join WiFi][QR2 open portal][ device WiFi name / password / address ]
-//   [ status line (phone connected / receiving 62% / verifying ...)  ][ Đóng ]
-//   [ progress bar                                                    ]
-static lv_obj_t *wifiQrUrlObj = nullptr;      // second QR: http://192.168.4.1
+// Layout for the 480x320 landscape panel — ONE QR (join the device WiFi; the
+// phone then opens the portal by itself / at 192.168.4.1):
+//   [        ][ WiFi name / password / portal address ]
+//   [ QR     ][ status (phone connected / receiving %) ]
+//   [        ][ progress bar                           ]
+//   [caption ][                               [ Đóng ] ]
 static lv_obj_t *bridgeBar = nullptr;         // phone -> device transfer progress
 static lv_obj_t *bridgeToast = nullptr;       // small pill on lv_layer_top() while a phone is updating
-
-static lv_obj_t *makeQrCaption(lv_obj_t *parent, const char *txt, int x, int y, int w) {
-    lv_obj_t *l = lv_label_create(parent);
-    lv_obj_set_width(l, w);
-    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(l, lv_color_hex(0xCCD6E0), 0);
-    lv_label_set_text(l, txt);
-    lv_obj_set_pos(l, x, y);
-    return l;
-}
 
 static lv_obj_t *makeQr(lv_obj_t *parent, int size, int x, int y) {
     lv_obj_t *q = lv_qrcode_create(parent);
@@ -289,7 +280,7 @@ static lv_obj_t *makeQr(lv_obj_t *parent, int size, int x, int y) {
     lv_qrcode_set_dark_color(q, lv_color_black());
     lv_qrcode_set_light_color(q, lv_color_white());
     lv_obj_set_style_border_color(q, lv_color_white(), 0);
-    lv_obj_set_style_border_width(q, 5, 0); // quiet zone so phone cameras lock on
+    lv_obj_set_style_border_width(q, 6, 0); // quiet zone so phone cameras lock on
     lv_obj_set_pos(q, x, y);
     return q;
 }
@@ -312,45 +303,41 @@ static void buildWifiScanOverlay(lv_obj_t *parent) {
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
     lv_obj_set_pos(title, 12, 8);
 
-    // Two QRs side by side: (1) join the device hotspot, (2) open the portal in
-    // the REAL browser (Camera -> Safari), not the captive mini-window, which on
-    // iPhone has no 4G access and can't run the data update.
-    int qsz = (Hh - 150);
-    if (qsz > 140) qsz = 140;
-    if (qsz < 96) qsz = 96;
-    int qy = 36, gap = 18;
-    wifiQrObj = makeQr(wifiScanOverlay, qsz, 12, qy);
+    // The one QR: joins the phone to the device hotspot (WIFI: payload).
+    int qy = 34;
+    int qsz = Hh - qy - 50; // leave room for the caption underneath
+    if (qsz > 220) qsz = 220;
+    if (qsz < 120) qsz = 120;
+    wifiQrObj = makeQr(wifiScanOverlay, qsz, 14, qy);
     lv_qrcode_update(wifiQrObj, "WIFI:;", 6); // placeholder until wifiQrRebuild()
-    wifiQrUrlObj = makeQr(wifiScanOverlay, qsz, 12 + qsz + 10 + gap, qy);
-    static const char kPortalUrl[] = "http://192.168.4.1";
-    lv_qrcode_update(wifiQrUrlObj, kPortalUrl, strlen(kPortalUrl));
-    int capY = qy + qsz + 14;
-    makeQrCaption(wifiScanOverlay, "1. Quét để vào Wi-Fi", 2, capY, qsz + 20);
-    makeQrCaption(wifiScanOverlay, "2. Quét để mở trang", 12 + qsz + 10 + gap - 10, capY, qsz + 20);
+    lv_obj_t *cap = lv_label_create(wifiScanOverlay);
+    lv_obj_set_width(cap, qsz + 12);
+    lv_obj_set_style_text_align(cap, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(cap, lv_color_hex(0xCCD6E0), 0);
+    lv_label_set_text(cap, "Quét bằng camera để vào Wi-Fi");
+    lv_obj_set_pos(cap, 14, qy + qsz + 16);
 
-    // Right column: the same credentials in text, for a manual join.
-    int rx = 12 + 2 * (qsz + 10) + gap + 14;
-    int rw = W - rx - 10;
+    // Right column: the same credentials in text (manual join), then live status,
+    // the transfer progress bar and Close at the bottom.
+    int rx = 14 + qsz + 12 + 20;
+    int rw = W - rx - 12;
     scanSavedLbl = lv_label_create(wifiScanOverlay);
     lv_label_set_long_mode(scanSavedLbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(scanSavedLbl, rw);
     lv_obj_set_style_text_color(scanSavedLbl, lv_color_hex(0xCCD6E0), 0);
     lv_obj_set_style_text_line_space(scanSavedLbl, 3, 0);
-    lv_obj_set_pos(scanSavedLbl, rx, qy);
+    lv_obj_set_pos(scanSavedLbl, rx, qy + 4);
 
-    // Bottom: live status (phone connected / transfer progress / VietHUD's own
-    // internet), a progress bar for the phone->device transfer, and Close.
-    int by = capY + 26;
-    int btnW = rw > 120 ? rw : 120;
+    int btnW = rw;
     scanConnLbl = lv_label_create(wifiScanOverlay);
     lv_label_set_long_mode(scanConnLbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(scanConnLbl, W - btnW - 34);
+    lv_obj_set_width(scanConnLbl, rw);
     lv_obj_set_style_text_color(scanConnLbl, lv_color_hex(0x8FA0B4), 0);
-    lv_obj_set_pos(scanConnLbl, 12, by);
+    lv_obj_set_pos(scanConnLbl, rx, qy + 132);
 
     bridgeBar = lv_bar_create(wifiScanOverlay);
-    lv_obj_set_size(bridgeBar, W - btnW - 34, 10);
-    lv_obj_set_pos(bridgeBar, 12, Hh - 22);
+    lv_obj_set_size(bridgeBar, rw, 10);
+    lv_obj_set_pos(bridgeBar, rx, Hh - 66);
     lv_obj_set_style_bg_color(bridgeBar, lv_color_hex(0x1E2A38), LV_PART_MAIN);
     lv_obj_set_style_bg_color(bridgeBar, lv_color_hex(0x3DA5FF), LV_PART_INDICATOR);
     lv_bar_set_range(bridgeBar, 0, 100);
@@ -358,7 +345,7 @@ static void buildWifiScanOverlay(lv_obj_t *parent) {
 
     lv_obj_t *closeBtn = lv_button_create(wifiScanOverlay);
     lv_obj_set_size(closeBtn, btnW, 40);
-    lv_obj_set_pos(closeBtn, W - btnW - 10, Hh - 50);
+    lv_obj_set_pos(closeBtn, W - btnW - 12, Hh - 50);
     lv_obj_set_style_bg_color(closeBtn, lv_color_hex(0x2A3644), 0);
     lv_obj_set_style_radius(closeBtn, 10, 0);
     lv_obj_add_event_cb(closeBtn, onWifiScanClose, LV_EVENT_CLICKED, NULL);
@@ -427,7 +414,7 @@ static void refreshScanListIfOpen() {
     // A phone just joined the hotspot while this screen is up: let the green
     // "Điện thoại đã kết nối" line show for ~1.5 s, then go back to the Dashboard
     // (the phone opens the portal by itself). A phone that was ALREADY connected
-    // when the screen was opened doesn't trigger this, so QR 2 stays scannable.
+    // when the screen was opened doesn't trigger this (the QR stays up if reopened).
     int clientsNow = webPortalClientCount();
     if (g_qrPrevClients < 0) g_qrPrevClients = clientsNow;
     if (g_qrPrevClients == 0 && clientsNow > 0) g_qrJoinedAtMs = millis() | 1;
@@ -468,7 +455,7 @@ static void refreshScanListIfOpen() {
                     snprintf(inet, sizeof(inet), "\nVietHUD có Internet qua \"%s\"", cfg.staSsid);
             }
             if (clients > 0) {
-                snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Điện thoại đã kết nối (%d)\nMở trang → Dữ liệu → Kiểm tra cập nhật%s",
+                snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Điện thoại đã kết nối (%d)\nTrang cài đặt tự mở trên điện thoại\n(hoặc vào 192.168.4.1)%s",
                          clients, inet);
                 color = 0x34C46A;
             } else {
