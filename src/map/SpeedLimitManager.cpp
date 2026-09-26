@@ -49,7 +49,7 @@ static const int kMaxSegmentsPerTile = 2048;
 // comfortably covers the live matcher's 5 (which mostly overlap the map's
 // own 9, being centered on the same car position) plus headroom for the
 // non-overlapping corners.
-static const int kCacheSize = 12;
+static const int kCacheSize = 24; // 12 -> 24 (2026-09-27): dense areas at wide zoom thrashed 12 (10-20 SD tile reads / 3 s)
 
 // At 2048 segments x 28 bytes x 12 cached tiles = ~672KB, this is
 // PSRAM-backed (heap_caps_malloc, MALLOC_CAP_SPIRAM), not a plain static
@@ -395,14 +395,45 @@ bool speedLimitManagerGetNearbySegments(float lat, float lon, float radiusM, Roa
     if (maxOut > kSelCap) maxOut = kSelCap;
     float score[kSelCap];
     int n = 0;
-    int worstIdx = -1;      // index of the current worst (largest score) kept, once full
-    float worstScore = -1e30f;
+    // Max-heap on score (root = worst kept) — replacing the worst is O(log N).
+    // The old linear "recompute the worst" after every replacement was O(N*180):
+    // ~1 s per map update in dense areas at wide zoom (bench, 2026-09-27).
+    auto siftDown = [&](int i) {
+        for (;;) {
+            int l = 2 * i + 1, r = l + 1, m = i;
+            if (l < n && score[l] > score[m]) m = l;
+            if (r < n && score[r] > score[m]) m = r;
+            if (m == i) return;
+            float ts = score[i]; score[i] = score[m]; score[m] = ts;
+            RoadSegment tg = out[i]; out[i] = out[m]; out[m] = tg;
+            i = m;
+        }
+    };
+    auto siftUp = [&](int i) {
+        while (i > 0) {
+            int pa = (i - 1) / 2;
+            if (score[pa] >= score[i]) return;
+            float ts = score[i]; score[i] = score[pa]; score[pa] = ts;
+            RoadSegment tg = out[i]; out[i] = out[pa]; out[pa] = tg;
+            i = pa;
+        }
+    };
+    const float cosLat = cosf(lat * (float)M_PI / 180.0f);
+    const int32_t rLatE7 = (int32_t)(radiusM / 110540.0f * 1e7f);
+    const int32_t rLonE7 = (int32_t)(radiusM / (111320.0f * cosLat) * 1e7f);
+    const int32_t latE7 = (int32_t)(lat * 1e7f), lonE7 = (int32_t)(lon * 1e7f);
     for (int dLat = -span; dLat <= span; dLat++) {
         for (int dLon = -span; dLon <= span; dLon++) {
             const CachedTile *tile = getOrLoadTile(packTile(latCell + dLat, lonCell + dLon));
             if (!tile) continue; // most candidate tiles legitimately don't exist in the database — not an error
             for (int s = 0; s < tile->segCount; s++) {
                 const RoadSegment &seg = tile->segments[s];
+                // Cheap reject: both ends beyond the radius on the same side.
+                if ((seg.startLatE7 > latE7 + rLatE7 && seg.endLatE7 > latE7 + rLatE7) ||
+                    (seg.startLatE7 < latE7 - rLatE7 && seg.endLatE7 < latE7 - rLatE7) ||
+                    (seg.startLonE7 > lonE7 + rLonE7 && seg.endLonE7 > lonE7 + rLonE7) ||
+                    (seg.startLonE7 < lonE7 - rLonE7 && seg.endLonE7 < lonE7 - rLonE7))
+                    continue;
                 float startLat = seg.startLatE7 / 1e7f, startLon = seg.startLonE7 / 1e7f;
                 float endLat = seg.endLatE7 / 1e7f, endLon = seg.endLonE7 / 1e7f;
                 float d = pointSegmentDistanceM(lat, lon, startLat, startLon, endLat, endLon);
@@ -413,16 +444,11 @@ bool speedLimitManagerGetNearbySegments(float lat, float lon, float radiusM, Roa
                     out[n] = seg;
                     score[n] = sc;
                     n++;
-                    if (n == maxOut) { // now full — find the worst kept
-                        worstIdx = 0; worstScore = score[0];
-                        for (int k = 1; k < n; k++) if (score[k] > worstScore) { worstScore = score[k]; worstIdx = k; }
-                    }
-                } else if (sc < worstScore) {
-                    out[worstIdx] = seg;
-                    score[worstIdx] = sc;
-                    // recompute the worst kept
-                    worstIdx = 0; worstScore = score[0];
-                    for (int k = 1; k < n; k++) if (score[k] > worstScore) { worstScore = score[k]; worstIdx = k; }
+                    siftUp(n - 1);
+                } else if (sc < score[0]) {
+                    out[0] = seg;
+                    score[0] = sc;
+                    siftDown(0);
                 }
             }
         }
@@ -623,6 +649,10 @@ static bool routeUpdateCarPosition(float lat, float lon) {
 // kSignOverrideMaxMs, or when the next speed sign replaces it.
 static float gSignOverrideKmh = -1.0f;
 static uint32_t gSignOverrideMs = 0;
+static uint8_t gSignOverrideSrc = SPEED_SOURCE_OSM_MAXSPEED; // DEFAULT when the value is the legal default, not a number on a sign
+// Residential-area state from R.420 (start) / R.421 (end) signs passed on the
+// route: -1 unknown, 0 outside, 1 inside. Sticky until the opposite sign.
+static int gResidentialState = -1;
 static const uint32_t kSignOverrideMaxMs = 20UL * 60UL * 1000UL;
 static void clearSignOverride(const char *why) {
     if (gSignOverrideKmh > 0) Serial.printf("[map] sign limit %.0f dropped (%s)\n", (double)gSignOverrideKmh, why);
@@ -1335,6 +1365,48 @@ static void fillSignResults(RoadInfoSnapshot &out, const SignPt *bestSpeedSign, 
 //     ROUTE's local heading at that sign, not the car's raw heading, so a sign
 //     on a curve is judged by the road direction there.
 // Falls back to the bearing-cone scan when there's no usable route.
+// ---- Legal default limits (2026-09-27, "bien het han che toc do thi doan
+// duong tiep theo se han che toc do theo quy dinh theo luat, hoac theo so lieu
+// ma du lieu co"). Thong tu 38/2024/TT-BGTVT (from 01/01/2025), cars and
+// light trucks, no speed sign in force:
+//   inside a residential area  : 60 divided road / one-way >=2 lanes, else 50
+//   outside a residential area : 90 divided road / one-way >=2 lanes, else 80
+// "Divided" is approximated by a one-way segment of a major/main road class
+// (OSM maps dual carriageways as two one-way ways; small one-way streets are
+// usually one lane). Expressways always carry their own signs.
+static const RouteSeg *routeSegAtArc(float arc) {
+    for (int i = 0; i < gRouteCount; i++) {
+        const RouteSeg &r = gRoute.seg(i);
+        if (arc >= r.startDistM && arc <= r.startDistM + r.lenM) return &r;
+    }
+    return NULL;
+}
+static float legalDefaultKmh(bool residential, const RouteSeg *seg) {
+    bool divided = seg && (seg->flags & SEGFLAG_ONEWAY) && (seg->roadClass == 1 || seg->roadClass == 2);
+    return residential ? (divided ? 60.0f : 50.0f) : (divided ? 90.0f : 80.0f);
+}
+// Limit in force just past `arc` when no numbered speed sign applies there:
+// the road's real tag if it has one; else the law (when we know whether we're
+// in a residential area); else the data's own value for that road.
+static float limitWithoutSignAt(float arc, int residentialState, uint8_t *outSrc) {
+    const RouteSeg *seg = routeSegAtArc(arc + 1.0f);
+    if (seg && seg->speedLimitKmh > 0 && seg->source != SPEED_SOURCE_DEFAULT && seg->source != SPEED_SOURCE_UNKNOWN) {
+        *outSrc = SPEED_SOURCE_OSM_MAXSPEED;
+        return (float)seg->speedLimitKmh;
+    }
+    *outSrc = SPEED_SOURCE_DEFAULT;
+    if (residentialState >= 0) return legalDefaultKmh(residentialState == 1, seg);
+    if (seg && seg->speedLimitKmh > 0) return (float)seg->speedLimitKmh;
+    return legalDefaultKmh(false, seg);
+}
+static void setSignOverride(float kmh, uint8_t src, const char *why) {
+    if (kmh != gSignOverrideKmh || src != gSignOverrideSrc)
+        Serial.printf("[map] %s -> current limit %.0f (%s)\n", why, (double)kmh, speedSourceStr(src));
+    gSignOverrideKmh = kmh;
+    gSignOverrideSrc = src;
+    gSignOverrideMs = millis();
+}
+
 static void matchSignsAheadRoute(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
     const SignPt *signs;
     int signCount;
@@ -1347,7 +1419,8 @@ static void matchSignsAheadRoute(const GnssSnapshot &gnss, RoadInfoSnapshot &out
     float closestSignDistM = 1e9f;
     const SignPt *closestSign = NULL;
     float bestSpeedDistM = 1e9f;  const SignPt *bestSpeedSign = NULL;
-    float bestResidentDistM = 1e9f; const SignPt *bestResident = NULL;
+    float bestEndDistM = 1e9f, bestEndArc = 0; const SignPt *bestEnd = NULL; // speed sign with value 0 = end of restriction
+    float bestResidentDistM = 1e9f; const SignPt *bestResident = NULL; float bestResidentArc = 0;
     float bestNoOvertakeDistM = 1e9f; const SignPt *bestNoOvertake = NULL;
     float bestTollDistM = 1e9f;   const SignPt *bestToll = NULL;
     float bestLightDistM = 1e9f;  const SignPt *bestLight = NULL;
@@ -1377,8 +1450,10 @@ static void matchSignsAheadRoute(const GnssSnapshot &gnss, RoadInfoSnapshot &out
         uint8_t t = signs[i].signType;
         if (t == SIGN_TYPE_SPEED_LIMIT && signs[i].speedLimitKmh > 0 && aheadDist < bestSpeedDistM) {
             bestSpeedDistM = aheadDist; bestSpeedSign = &signs[i];
+        } else if (t == SIGN_TYPE_SPEED_LIMIT && signs[i].speedLimitKmh == 0 && aheadDist < bestEndDistM) {
+            bestEndDistM = aheadDist; bestEnd = &signs[i]; bestEndArc = arc;
         } else if (t == SIGN_TYPE_RESIDENT_AREA && aheadDist < bestResidentDistM) {
-            bestResidentDistM = aheadDist; bestResident = &signs[i];
+            bestResidentDistM = aheadDist; bestResident = &signs[i]; bestResidentArc = arc;
         } else if (t == SIGN_TYPE_NO_OVERTAKING && aheadDist < bestNoOvertakeDistM) {
             bestNoOvertakeDistM = aheadDist; bestNoOvertake = &signs[i];
         } else if (t == SIGN_TYPE_TOLL_BOOTH && aheadDist < bestTollDistM) {
@@ -1389,15 +1464,54 @@ static void matchSignsAheadRoute(const GnssSnapshot &gnss, RoadInfoSnapshot &out
             bestDangerDistM = aheadDist; bestDanger = &signs[i];
         }
     }
-    if (bestSpeedSign && bestSpeedDistM < 35.0f && bestSpeedSign->speedLimitKmh >= 5) {
-        float v = (float)bestSpeedSign->speedLimitKmh;
-        if (v != gSignOverrideKmh) Serial.printf("[map] passed speed sign %.0f -> current limit\n", (double)v);
-        gSignOverrideKmh = v;
-        gSignOverrideMs = millis();
+    // Passing signs (within 35 m ahead), applied in road order so the LAST one
+    // reached wins: residential start/end sets the area state (and, with no
+    // numbered sign, the legal limit); an end-of-restriction sign returns to
+    // the tag/law; a numbered speed sign sets its number.
+    // "End of restriction" followed by a new numbered limit (bench: 32 m apart)
+    // are one change: the number applies directly, no brief legal-default value
+    // between them (was a visible 40 -> 80 flicker). A numbered sign still AHEAD
+    // of the end sign also defers the end sign until it has been passed.
+    if (bestEnd && bestSpeedSign && bestSpeedDistM - bestEndDistM < 50.0f) bestEnd = NULL;
+    struct Pass { float d; int kind; };
+    Pass ps[3];
+    int np = 0;
+    if (bestResident && bestResidentDistM < 35.0f) ps[np++] = {bestResidentDistM, 0};
+    if (bestEnd && bestEndDistM < 35.0f) ps[np++] = {bestEndDistM, 1};
+    if (bestSpeedSign && bestSpeedDistM < 35.0f && bestSpeedSign->speedLimitKmh >= 5) ps[np++] = {bestSpeedDistM, 2};
+    for (int a = 0; a < np; a++)
+        for (int b = a + 1; b < np; b++)
+            if (ps[b].d < ps[a].d) { Pass t = ps[a]; ps[a] = ps[b]; ps[b] = t; }
+    for (int k = 0; k < np; k++) {
+        uint8_t src;
+        if (ps[k].kind == 0) {
+            int st = bestResident->subType == 0 ? 1 : 0;
+            if (st != gResidentialState)
+                Serial.printf("[map] residential area %s\n", st ? "START (R.420)" : "END (R.421)");
+            gResidentialState = st;
+            float v = limitWithoutSignAt(bestResidentArc, gResidentialState, &src);
+            setSignOverride(v, src, st ? "entering residential area" : "leaving residential area");
+        } else if (ps[k].kind == 1) {
+            float v = limitWithoutSignAt(bestEndArc, gResidentialState, &src);
+            setSignOverride(v, src, "end-of-restriction sign");
+        } else {
+            setSignOverride((float)bestSpeedSign->speedLimitKmh, SPEED_SOURCE_OSM_MAXSPEED, "speed sign");
+        }
     }
     fillSignResults(out, bestSpeedSign, bestSpeedDistM, bestResident, bestResidentDistM, bestNoOvertake,
                     bestNoOvertakeDistM, bestToll, bestTollDistM, bestLight, bestLightDistM, bestDanger,
                     bestDangerDistM, closestSign, closestSignDistM);
+    // An end-of-restriction sign ahead (nearer than any numbered sign): show the
+    // limit that will apply after it on the limit-ahead card.
+    if (bestEnd && bestEndDistM < bestSpeedDistM) {
+        uint8_t src;
+        float v = limitWithoutSignAt(bestEndArc, gResidentialState, &src);
+        if (!out.valid || v != out.speedLimitKmh) {
+            out.aheadLimitValid = true;
+            out.aheadSpeedLimitKmh = v;
+            out.aheadDistanceM = bestEndDistM;
+        }
+    }
 }
 
 static void matchSignsAheadStraight(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
@@ -1623,7 +1737,7 @@ static void speedLimitTaskFn(void *) {
                 else if (out.valid || gnss.fix) {
                     out.valid = true;
                     out.speedLimitKmh = gSignOverrideKmh;
-                    out.source = SPEED_SOURCE_OSM_MAXSPEED; // a real sign, not a guess
+                    out.source = gSignOverrideSrc; // OSM_MAXSPEED = a real sign; DEFAULT = legal default after an end sign
                 }
             }
 
