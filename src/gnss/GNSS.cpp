@@ -16,12 +16,33 @@
 static volatile bool gSimActive = false;
 static float gSimLat = 0, gSimLon = 0, gSimHeadingDeg = 0, gSimSpeedKmh = 0;
 static uint32_t gSimEndMs = 0, gSimLastStepMs = 0, gSimFixSeq = 0;
+// Waypoint mode (gnssSimRoute): follow a polyline instead of a straight line.
+static const int kSimMaxWp = 48;
+static float gSimWpLat[kSimMaxWp], gSimWpLon[kSimMaxWp];
+static int gSimWpN = 0, gSimWpNext = 0;
+void gnssSimRoute(const float *lat, const float *lon, int n, float speedKmh) {
+    if (n < 2) return;
+    if (n > kSimMaxWp) n = kSimMaxWp;
+    for (int i = 0; i < n; i++) { gSimWpLat[i] = lat[i]; gSimWpLon[i] = lon[i]; }
+    gSimWpN = n;
+    gSimWpNext = 1;
+    gSimLat = lat[0];
+    gSimLon = lon[0];
+    gSimSpeedKmh = speedKmh;
+    float dy = (lat[1] - lat[0]) * 110540.0f, dx = (lon[1] - lon[0]) * 111320.0f * cosf(lat[0] * 0.0174533f);
+    gSimHeadingDeg = fmodf(atan2f(dx, dy) * 57.29578f + 360.0f, 360.0f);
+    gSimLastStepMs = millis();
+    gSimEndMs = gSimLastStepMs + 3600000UL; // ends at the last waypoint
+    gSimActive = true;
+    Serial.printf("[gnss] route simulation: %d waypoints at %.0f km/h\n", n, (double)speedKmh);
+}
 void gnssSimStart(float lat, float lon, float headingDeg, float speedKmh, float seconds) {
     if (seconds <= 0) {
         gSimActive = false;
         Serial.println("[gnss] drive simulation stopped");
         return;
     }
+    gSimWpN = 0;
     gSimLat = lat;
     gSimLon = lon;
     gSimHeadingDeg = headingDeg;
@@ -417,9 +438,34 @@ static void gnssTaskFn(void *) {
                 float dt = (nowS - gSimLastStepMs) / 1000.0f;
                 gSimLastStepMs = nowS;
                 float dM = gSimSpeedKmh / 3.6f * dt;
-                float hr = gSimHeadingDeg * 0.0174533f;
-                gSimLat += dM * cosf(hr) / 110540.0f;
-                gSimLon += dM * sinf(hr) / (111320.0f * cosf(gSimLat * 0.0174533f));
+                if (gSimWpN > 0) {
+                    // consume dM along the polyline
+                    while (dM > 0 && gSimWpNext < gSimWpN) {
+                        float kx = 111320.0f * cosf(gSimLat * 0.0174533f);
+                        float dy = (gSimWpLat[gSimWpNext] - gSimLat) * 110540.0f;
+                        float dx = (gSimWpLon[gSimWpNext] - gSimLon) * kx;
+                        float L = sqrtf(dx * dx + dy * dy);
+                        if (L > 0.01f) gSimHeadingDeg = fmodf(atan2f(dx, dy) * 57.29578f + 360.0f, 360.0f);
+                        if (L <= dM) {
+                            gSimLat = gSimWpLat[gSimWpNext];
+                            gSimLon = gSimWpLon[gSimWpNext];
+                            gSimWpNext++;
+                            dM -= L;
+                        } else {
+                            gSimLat += dy * (dM / L) / 110540.0f;
+                            gSimLon += dx * (dM / L) / kx;
+                            dM = 0;
+                        }
+                    }
+                    if (gSimWpNext >= gSimWpN) {
+                        gSimEndMs = nowS; // arrived: stop on the next pass
+                        gSimWpN = 0;
+                    }
+                } else {
+                    float hr = gSimHeadingDeg * 0.0174533f;
+                    gSimLat += dM * cosf(hr) / 110540.0f;
+                    gSimLon += dM * sinf(hr) / (111320.0f * cosf(gSimLat * 0.0174533f));
+                }
                 gSimFixSeq++;
             }
             if (gSimActive) {

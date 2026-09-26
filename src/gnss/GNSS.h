@@ -50,3 +50,5 @@ uint32_t gnssMsSinceStationary();
 // `speedKmh` for `seconds` (5 fixes/s), so the matcher + map can be exercised
 // in a real dense area from the desk. seconds <= 0 stops it.
 void gnssSimStart(float lat, float lon, float headingDeg, float speedKmh, float seconds);
+// Waypoint form (serial "W kmh lat lon lat lon ..."): drive along a polyline.
+void gnssSimRoute(const float *lat, const float *lon, int n, float speedKmh);
