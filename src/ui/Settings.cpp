@@ -5,10 +5,11 @@
 #include "core/NvsStore.h"
 #include "core/SharedState.h" // gnssSnapshot()/roadInfoSnapshot() for the Sensors diagnostics panel
 #include "demo/DemoMode.h"    // scripted UI demo — Settings > Display switch
-#include "map/RasterMapManager.h"
 #include "map/SpeedLimitManager.h" // speedSourceStr() — Speed Map group in the Sensors tab
 #include "net/WebPortal.h"    // webPortalIsEnabled()/webPortalRequestEnable() — WiFi tab
 #include "net/DataUpdater.h"  // dataUpdateStart()/GetStatus() — WiFi tab "Update data" button
+#include "net/UpdateApi.h"    // updateApiBusy() — a phone is pushing data right now
+#include "update/DataInstaller.h" // installerProgress() — phone->device transfer progress
 #include <string.h>
 
 // ---------------------------------------------------------------------
@@ -50,15 +51,25 @@ static lv_obj_t *restartConfirmOverlay = nullptr;
 // declare-early/build-late split refreshSensorsPanel()'s own widget
 // pointers already use.
 static lv_obj_t *wifiEnableSwitch, *wifiSsidTa, *wifiPasswordTa;
-static lv_obj_t *staSsidTa = nullptr, *staPasswordTa = nullptr; // Internet (station) creds — WiFi tab
+static lv_obj_t *staSsidTa = nullptr, *staPasswordTa = nullptr; // legacy manual STA fields (removed from UI; kept as guarded nullptrs)
 static lv_obj_t *staStatusVal = nullptr;                        // STA connection info row
+static lv_obj_t *staSavedVal = nullptr;                         // saved-networks summary row (WiFi Manager)
 // "WiFi setup" overlay: scan nearby networks + pick one + enter password, on a
 // non-scrolling full-screen modal so the on-screen keyboard works reliably
 // (2026-09-25 — user couldn't type a password on the scrollable WiFi tab).
-static lv_obj_t *wifiScanOverlay = nullptr, *scanList = nullptr, *scanStatusLbl = nullptr;
-static lv_obj_t *scanSelLbl = nullptr, *scanPassTa = nullptr;
-static char g_selectedStaSsid[33] = "";
-static int g_lastRenderedScan = -99;
+static const int kCategoryWifi = 3; // index of the WiFi tab (kCategoryNames order)
+static int g_activeCategory = 0;    // which tab is currently shown (idle-return exemption)
+// "WiFi setup" overlay (2026-09-26): NO on-device password typing. It shows a QR
+// code that the phone's camera scans to join the device's own AP; the phone then
+// opens the web portal (captive portal auto-pops) and configures WiFi there, with
+// the phone's real keyboard. When the user saves a network on the phone, the WiFi
+// Manager auto-connects the device to it and auto-checks for a data update — the
+// overlay's status line reflects that live.
+static lv_obj_t *wifiScanOverlay = nullptr;   // the QR setup overlay (name kept for wiring)
+static lv_obj_t *wifiQrObj = nullptr;         // lv_qrcode
+static lv_obj_t *scanConnLbl = nullptr;       // live connection status inside the overlay
+static lv_obj_t *scanSavedLbl = nullptr;      // "saved networks" summary inside the overlay
+static char g_qrPayload[128] = "";            // last-built WIFI: QR string (rebuild only on change)
 // Demo mode (Settings > Display) — like WiFi's switch above, deliberately not
 // an AppConfig/NVS field, so it can never survive a reboot into real driving.
 // See demo/DemoMode.h.
@@ -93,6 +104,7 @@ static void onSliderChanged(lv_event_t *e) {
     // both screens are laid out once at boot for whichever orientation was
     // active then) — say so immediately rather than let the slider silently
     // do nothing, which is what every OTHER slider here does instead.
+    if (b->target == &cfg.brightnessMode) applyConfig(); // Auto/Manual backlight applies live
     if (b->target == &cfg.screenRotation) {
         saveConfigToNVS(cfg);
         lv_label_set_text(settingsStatusLabel, "Da luu xoay man hinh! Khoi dong lai de ap dung...");
@@ -161,6 +173,9 @@ static void onWifiTaClicked(lv_event_t *e) {
 // as every slider/switch in this screen applying live and only NVS-
 // persisting on the footer's Save button).
 static void onWifiKbReadyOrCancel(lv_event_t *) {
+    // Only the device's own AP (hotspot) SSID/password are typed on-device now —
+    // the network to CONNECT TO is configured from the phone via the QR/web flow,
+    // so there are no STA text fields here anymore.
     lv_obj_t *ta = lv_keyboard_get_textarea(wifiKeyboard);
     if (ta == wifiSsidTa) {
         strncpy(cfg.wifiSsid, lv_textarea_get_text(ta), sizeof(cfg.wifiSsid) - 1);
@@ -168,165 +183,350 @@ static void onWifiKbReadyOrCancel(lv_event_t *) {
     } else if (ta == wifiPasswordTa) {
         strncpy(cfg.wifiPassword, lv_textarea_get_text(ta), sizeof(cfg.wifiPassword) - 1);
         cfg.wifiPassword[sizeof(cfg.wifiPassword) - 1] = '\0';
-    } else if (ta == staSsidTa) {
-        strncpy(cfg.staSsid, lv_textarea_get_text(ta), sizeof(cfg.staSsid) - 1);
-        cfg.staSsid[sizeof(cfg.staSsid) - 1] = '\0';
-    } else if (ta == staPasswordTa || ta == scanPassTa) {
-        strncpy(cfg.staPassword, lv_textarea_get_text(ta), sizeof(cfg.staPassword) - 1);
-        cfg.staPassword[sizeof(cfg.staPassword) - 1] = '\0';
     }
     lv_keyboard_set_textarea(wifiKeyboard, NULL);
     lv_obj_add_flag(wifiKeyboard, LV_OBJ_FLAG_HIDDEN);
 }
 
-// ---- "WiFi setup" overlay: scan + pick + password + connect ----
-static void onScanItemClicked(lv_event_t *e) {
-    lv_obj_t *btn = lv_event_get_target_obj(e);
-    int idx = (int)(intptr_t)lv_obj_get_user_data(btn);
-    if (webPortalScanResult(idx, g_selectedStaSsid, sizeof(g_selectedStaSsid), nullptr, nullptr)) {
-        if (scanSelLbl) {
-            char b[48];
-            snprintf(b, sizeof(b), "Chon: %s", g_selectedStaSsid);
-            lv_label_set_text(scanSelLbl, b);
+// ---- "WiFi setup" overlay: QR to join the device AP, configure on the phone ----
+
+// (Re)build the WIFI: QR payload from the current AP credentials. Only rebuilds
+// the QR bitmap when the string actually changed (called on the refresh timer).
+static void wifiQrRebuild() {
+    if (!wifiQrObj) return;
+    char ap[40];
+    webPortalApSsid(ap, sizeof(ap));
+    // Minimal escaping of the WIFI: reserved chars (\ ; , : ").
+    auto esc = [](const char *in, char *out, size_t cap) {
+        size_t o = 0;
+        for (const char *p = in; *p && o < cap - 2; p++) {
+            if (*p == '\\' || *p == ';' || *p == ',' || *p == ':' || *p == '"') out[o++] = '\\';
+            out[o++] = *p;
         }
+        out[o] = '\0';
+    };
+    char es[48], ep[80];
+    esc(ap, es, sizeof(es));
+    bool secured = strlen(cfg.wifiPassword) >= 8; // WPA2 min; else the AP is open
+    char payload[128];
+    if (secured) {
+        esc(cfg.wifiPassword, ep, sizeof(ep));
+        snprintf(payload, sizeof(payload), "WIFI:T:WPA;S:%s;P:%s;;", es, ep);
+    } else {
+        snprintf(payload, sizeof(payload), "WIFI:T:nopass;S:%s;;", es);
+    }
+    if (strcmp(payload, g_qrPayload) != 0) {
+        strncpy(g_qrPayload, payload, sizeof(g_qrPayload) - 1);
+        g_qrPayload[sizeof(g_qrPayload) - 1] = '\0';
+        lv_qrcode_update(wifiQrObj, payload, strlen(payload));
     }
 }
-static void onWifiScanBtnClicked(lv_event_t *) {
-    webPortalRequestEnable(true); // scanning needs the radio on
-    webPortalStartScan();
-    g_lastRenderedScan = -99;
-    if (scanStatusLbl) lv_label_set_text(scanStatusLbl, "Dang quet...");
-    if (scanList) lv_obj_clean(scanList);
+
+// Phone-joined detection for the QR screen: g_qrPrevClients = AP client count at
+// the previous refresh (-1 = take a fresh baseline), g_qrJoinedAtMs = when a
+// phone joined while the screen was up (0 = none pending).
+static int g_qrPrevClients = -1;
+static lv_obj_t *qrWifiSwitch = nullptr;  // WiFi on/off switch on the QR screen
+static bool g_qrSwitchTouched = false;    // user flipped it this visit -> respect it on Close
+static uint32_t g_qrJoinedAtMs = 0;
+static lv_obj_t *connToast = nullptr;   // "phone connected" pill on lv_layer_top()
+static uint32_t connToastUntilMs = 0;
+
+static void showPhoneConnectedToast() {
+    if (!connToast) {
+        connToast = lv_label_create(lv_layer_top());
+        lv_obj_set_style_bg_color(connToast, lv_color_hex(0x10261A), 0);
+        lv_obj_set_style_bg_opa(connToast, LV_OPA_90, 0);
+        lv_obj_set_style_border_color(connToast, lv_color_hex(0x3CC46E), 0);
+        lv_obj_set_style_border_width(connToast, 1, 0);
+        lv_obj_set_style_radius(connToast, 14, 0);
+        lv_obj_set_style_pad_hor(connToast, 14, 0);
+        lv_obj_set_style_pad_ver(connToast, 6, 0);
+        lv_obj_set_style_text_color(connToast, lv_color_hex(0xDFF5E6), 0);
+        lv_label_set_text(connToast, LV_SYMBOL_OK " Điện thoại đã kết nối · trang cài đặt: 192.168.4.1");
+        lv_obj_align(connToast, LV_ALIGN_TOP_MID, 0, 40);
+    }
+    lv_obj_clear_flag(connToast, LV_OBJ_FLAG_HIDDEN);
+    connToastUntilMs = millis() + 6000;
 }
+
 static void onWifiScanOpen(lv_event_t *) {
+    webPortalRequestEnable(true);   // the AP must be up for the phone to join it
+    g_qrPayload[0] = '\0';          // force a rebuild for the (now-active) AP creds
+    g_qrPrevClients = -1;           // baseline taken on the first refresh (see refreshScanListIfOpen)
+    g_qrJoinedAtMs = 0;
+    g_qrSwitchTouched = false;
+    if (qrWifiSwitch) lv_obj_add_state(qrWifiSwitch, LV_STATE_CHECKED);
+    wifiQrRebuild();
     lv_obj_clear_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(wifiScanOverlay);
-    g_selectedStaSsid[0] = '\0';
-    if (scanSelLbl) lv_label_set_text(scanSelLbl, "Chon: (chua chon)");
-    if (scanPassTa) lv_textarea_set_text(scanPassTa, "");
-    onWifiScanBtnClicked(nullptr); // auto-scan on open
 }
 static void onWifiScanClose(lv_event_t *) {
-    lv_obj_add_flag(wifiKeyboard, LV_OBJ_FLAG_HIDDEN);
+    Serial.println("[ui] WiFi QR screen closed");
+    // Opening this screen switched WiFi on; if nobody joined, switch it back off
+    // (it otherwise stayed on for the whole 10 min auto-off window — heat).
+    // (Unless the user set the switch themselves on this visit — then it stays as chosen.)
+    if (!g_qrSwitchTouched && webPortalClientCount() == 0 && !updateApiBusy()) webPortalRequestEnable(false);
     lv_obj_add_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
+    g_activeCategory = 0; // leave the WiFi context so the idle-return timer re-arms
+    // The WiFi "menu" IS this QR screen now, so closing it returns straight to the
+    // Dashboard rather than to an (intentionally empty) WiFi tab behind it.
+    lv_screen_load(dashboardScreen);
 }
-static void onWifiScanConnect(lv_event_t *) {
-    if (g_selectedStaSsid[0] == '\0') {
-        if (scanStatusLbl) lv_label_set_text(scanStatusLbl, "Chua chon mang!");
-        return;
-    }
-    strncpy(cfg.staSsid, g_selectedStaSsid, sizeof(cfg.staSsid) - 1);
-    cfg.staSsid[sizeof(cfg.staSsid) - 1] = '\0';
-    const char *pw = lv_textarea_get_text(scanPassTa);
-    if (pw && pw[0]) { // blank = keep existing password
-        strncpy(cfg.staPassword, pw, sizeof(cfg.staPassword) - 1);
-        cfg.staPassword[sizeof(cfg.staPassword) - 1] = '\0';
-    }
-    saveConfigToNVS(cfg);
-    webPortalReconnectSta(); // apply the new station creds on the web task
-    if (staSsidTa) lv_textarea_set_text(staSsidTa, cfg.staSsid); // reflect in the manual field
-    onWifiScanClose(nullptr);
+
+// Layout for the 480x320 landscape panel — ONE QR (join the device WiFi; the
+// phone then opens the portal by itself / at 192.168.4.1):
+//   [        ][ WiFi name / password / portal address ]
+//   [ QR     ][ status (phone connected / receiving %) ]
+//   [        ][ progress bar                           ]
+//   [caption ][                               [ Đóng ] ]
+static lv_obj_t *bridgeBar = nullptr;         // phone -> device transfer progress
+static lv_obj_t *bridgeToast = nullptr;       // small pill on lv_layer_top() while a phone is updating
+
+static lv_obj_t *makeQr(lv_obj_t *parent, int size, int x, int y) {
+    lv_obj_t *q = lv_qrcode_create(parent);
+    lv_qrcode_set_size(q, size);
+    lv_qrcode_set_dark_color(q, lv_color_black());
+    lv_qrcode_set_light_color(q, lv_color_white());
+    lv_obj_set_style_border_color(q, lv_color_white(), 0);
+    lv_obj_set_style_border_width(q, 6, 0); // quiet zone so phone cameras lock on
+    lv_obj_set_pos(q, x, y);
+    return q;
 }
 
 static void buildWifiScanOverlay(lv_obj_t *parent) {
+    int W = gfx->width(), Hh = gfx->height();
     wifiScanOverlay = lv_obj_create(parent);
     lv_obj_set_pos(wifiScanOverlay, 0, 0);
-    lv_obj_set_size(wifiScanOverlay, gfx->width(), gfx->height());
+    lv_obj_set_size(wifiScanOverlay, W, Hh);
     lv_obj_set_style_bg_color(wifiScanOverlay, lv_color_hex(0x0B0F14), 0);
     lv_obj_set_style_bg_opa(wifiScanOverlay, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(wifiScanOverlay, 0, 0);
     lv_obj_set_style_radius(wifiScanOverlay, 0, 0);
+    lv_obj_set_style_pad_all(wifiScanOverlay, 0, 0);
     lv_obj_clear_flag(wifiScanOverlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *title = lv_label_create(wifiScanOverlay);
-    lv_label_set_text(title, "Ket noi Internet (WiFi)");
+    lv_label_set_text(title, LV_SYMBOL_WIFI "  Kết nối điện thoại");
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_set_pos(title, 8, 6);
+    lv_obj_set_pos(title, 12, 8);
 
-    lv_obj_t *rescan = lv_button_create(wifiScanOverlay);
-    lv_obj_set_size(rescan, 90, 30);
-    lv_obj_align(rescan, LV_ALIGN_TOP_RIGHT, -8, 4);
-    lv_obj_add_event_cb(rescan, onWifiScanBtnClicked, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *rescanLbl = lv_label_create(rescan);
-    lv_label_set_text(rescanLbl, "Quet lai");
-    lv_obj_center(rescanLbl);
+    // The one QR: joins the phone to the device hotspot (WIFI: payload).
+    int qy = 34;
+    int qsz = Hh - qy - 50; // leave room for the caption underneath
+    if (qsz > 220) qsz = 220;
+    if (qsz < 120) qsz = 120;
+    wifiQrObj = makeQr(wifiScanOverlay, qsz, 14, qy);
+    lv_qrcode_update(wifiQrObj, "WIFI:;", 6); // placeholder until wifiQrRebuild()
+    lv_obj_t *cap = lv_label_create(wifiScanOverlay);
+    lv_obj_set_width(cap, qsz + 12);
+    lv_obj_set_style_text_align(cap, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(cap, lv_color_hex(0xCCD6E0), 0);
+    lv_label_set_text(cap, "Quét bằng camera để vào Wi-Fi");
+    lv_obj_set_pos(cap, 14, qy + qsz + 16);
 
-    scanStatusLbl = lv_label_create(wifiScanOverlay);
-    lv_label_set_text(scanStatusLbl, "");
-    lv_obj_set_style_text_color(scanStatusLbl, lv_color_hex(0x9FB2C6), 0);
-    lv_obj_set_pos(scanStatusLbl, 8, 30);
+    // Right column: the same credentials in text (manual join), then live status,
+    // the transfer progress bar and Close at the bottom.
+    int rx = 14 + qsz + 12 + 20;
+    int rw = W - rx - 12;
+    lv_obj_t *swLbl = lv_label_create(wifiScanOverlay);
+    lv_label_set_text(swLbl, LV_SYMBOL_WIFI "  Wi-Fi");
+    lv_obj_set_style_text_color(swLbl, lv_color_white(), 0);
+    lv_obj_set_pos(swLbl, rx, qy + 8);
+    qrWifiSwitch = lv_switch_create(wifiScanOverlay);
+    lv_obj_set_size(qrWifiSwitch, 64, 32);
+    lv_obj_set_pos(qrWifiSwitch, W - 12 - 64, qy + 2);
+    lv_obj_set_ext_click_area(qrWifiSwitch, 8);
+    lv_obj_set_style_bg_color(qrWifiSwitch, lv_color_hex(0x34C46A), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_add_event_cb(
+        qrWifiSwitch, [](lv_event_t *e) {
+            bool on = lv_obj_has_state((lv_obj_t *)lv_event_get_target(e), LV_STATE_CHECKED);
+            g_qrSwitchTouched = true;
+            g_qrPrevClients = -1; // fresh baseline for the "phone joined" detection
+            webPortalRequestEnable(on);
+            Serial.printf("[ui] WiFi switched %s from the WiFi screen\n", on ? "ON" : "OFF");
+        },
+        LV_EVENT_VALUE_CHANGED, NULL);
 
-    // Left: scrollable list of found networks.
-    scanList = lv_list_create(wifiScanOverlay);
-    lv_obj_set_pos(scanList, 4, 50);
-    lv_obj_set_size(scanList, 280, gfx->height() - 58);
-    lv_obj_set_style_bg_color(scanList, lv_color_hex(0x151C24), 0);
+    scanSavedLbl = lv_label_create(wifiScanOverlay);
+    lv_label_set_long_mode(scanSavedLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(scanSavedLbl, rw);
+    lv_obj_set_style_text_color(scanSavedLbl, lv_color_hex(0xCCD6E0), 0);
+    lv_obj_set_style_text_line_space(scanSavedLbl, 3, 0);
+    lv_obj_set_pos(scanSavedLbl, rx, qy + 46);
 
-    // Right column: selected + password + buttons.
-    int rx = 292;
-    scanSelLbl = lv_label_create(wifiScanOverlay);
-    lv_label_set_text(scanSelLbl, "Chon: (chua chon)");
-    lv_obj_set_style_text_color(scanSelLbl, lv_color_hex(0xCCD6E0), 0);
-    lv_obj_set_width(scanSelLbl, gfx->width() - rx - 6);
-    lv_label_set_long_mode(scanSelLbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_pos(scanSelLbl, rx, 50);
+    int btnW = rw;
+    scanConnLbl = lv_label_create(wifiScanOverlay);
+    lv_label_set_long_mode(scanConnLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(scanConnLbl, rw);
+    lv_obj_set_style_text_color(scanConnLbl, lv_color_hex(0x8FA0B4), 0);
+    lv_obj_set_pos(scanConnLbl, rx, qy + 134);
 
-    scanPassTa = lv_textarea_create(wifiScanOverlay);
-    lv_textarea_set_one_line(scanPassTa, true);
-    lv_textarea_set_password_mode(scanPassTa, true);
-    lv_textarea_set_max_length(scanPassTa, sizeof(cfg.staPassword) - 1);
-    lv_textarea_set_placeholder_text(scanPassTa, "Mat khau");
-    lv_obj_set_pos(scanPassTa, rx, 90);
-    lv_obj_set_size(scanPassTa, gfx->width() - rx - 6, 30);
-    lv_obj_add_event_cb(scanPassTa, onWifiTaClicked, LV_EVENT_CLICKED, NULL);
+    bridgeBar = lv_bar_create(wifiScanOverlay);
+    lv_obj_set_size(bridgeBar, rw, 10);
+    lv_obj_set_pos(bridgeBar, rx, Hh - 72);
+    lv_obj_set_style_bg_color(bridgeBar, lv_color_hex(0x1E2A38), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bridgeBar, lv_color_hex(0x3DA5FF), LV_PART_INDICATOR);
+    lv_bar_set_range(bridgeBar, 0, 100);
+    lv_obj_add_flag(bridgeBar, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *connBtn = lv_button_create(wifiScanOverlay);
-    lv_obj_set_size(connBtn, gfx->width() - rx - 6, 34);
-    lv_obj_set_pos(connBtn, rx, 128);
-    lv_obj_set_style_bg_color(connBtn, lv_color_hex(0x2E7D4F), 0);
-    lv_obj_add_event_cb(connBtn, onWifiScanConnect, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *connLbl = lv_label_create(connBtn);
-    lv_label_set_text(connLbl, "Ket noi");
-    lv_obj_center(connLbl);
-
+    // Close = a strip running to the bottom AND right screen edges. Real taps
+    // in this corner were logged at y=319 (the panel reports touches near the
+    // bottom edge lower than the finger), i.e. BELOW the old button (y 270-310),
+    // so "Đóng" never fired. Reaching the edges + an extended click area makes
+    // any such clamped touch land on it.
+    (void)btnW;
     lv_obj_t *closeBtn = lv_button_create(wifiScanOverlay);
-    lv_obj_set_size(closeBtn, gfx->width() - rx - 6, 30);
-    lv_obj_set_pos(closeBtn, rx, 166);
-    lv_obj_set_style_bg_color(closeBtn, lv_color_hex(0x44505C), 0);
+    lv_obj_set_size(closeBtn, W - rx + 12, 58);
+    lv_obj_set_pos(closeBtn, rx - 12, Hh - 58);
+    lv_obj_set_ext_click_area(closeBtn, 10);
+    lv_obj_set_style_bg_color(closeBtn, lv_color_hex(0x2A3644), 0);
+    lv_obj_set_style_radius(closeBtn, 0, 0);
+    lv_obj_set_style_shadow_width(closeBtn, 0, 0);
     lv_obj_add_event_cb(closeBtn, onWifiScanClose, LV_EVENT_CLICKED, NULL);
     lv_obj_t *closeLbl = lv_label_create(closeBtn);
-    lv_label_set_text(closeLbl, "Dong");
+    lv_label_set_text(closeLbl, "Đóng");
     lv_obj_center(closeLbl);
 }
 
-// Rebuilds the scan list when a scan finishes (called from refreshSensorsPanel
-// while the overlay is open). Kept out of the WiFi task — only reads the cached
-// results via webPortalScanResult().
-static void refreshScanListIfOpen() {
-    if (!wifiScanOverlay || lv_obj_has_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN)) return;
-    int st = webPortalScanState();
-    if (st == -2) {
-        if (scanStatusLbl) lv_label_set_text(scanStatusLbl, "Dang quet...");
+// Human text for the phone-update (bridge) state; returns true while a phone
+// update is in progress so the caller can show the progress bar.
+static bool bridgeStatusText(char *buf, size_t cap, int *pct) {
+    InstallerProgress p = installerProgress();
+    bool active = updateApiBusy() && (p.state == INST_RECEIVING || p.state == INST_READY ||
+                                      p.state == INST_VERIFYING || p.state == INST_COMMITTED);
+    *pct = p.bytesTotal ? (int)((uint64_t)p.bytesDone * 100 / p.bytesTotal) : 0;
+    if (!active) return false;
+    switch (p.state) {
+    case INST_VERIFYING: snprintf(buf, cap, LV_SYMBOL_REFRESH " Đang kiểm tra dữ liệu..."); break;
+    case INST_COMMITTED: snprintf(buf, cap, LV_SYMBOL_OK " Dữ liệu hợp lệ — khởi động lại để cài"); break;
+    default:
+        snprintf(buf, cap, LV_SYMBOL_DOWNLOAD " Đang nhận dữ liệu từ điện thoại  %d%%\n%u / %u KB · tệp %u/%u", *pct,
+                 (unsigned)(p.bytesDone / 1024), (unsigned)(p.bytesTotal / 1024),
+                 (unsigned)(p.filesDone < p.filesTotal ? p.filesDone + 1 : p.filesTotal), (unsigned)p.filesTotal);
+    }
+    return true;
+}
+
+// Small pill on the top layer so the driver sees a phone update progressing
+// even with this overlay closed (Dashboard showing). Only text changes -> only
+// the pill's own area is redrawn.
+static void refreshBridgeToast() {
+    bool overlayOpen = wifiScanOverlay && !lv_obj_has_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
+    char b[120];
+    int pct = 0;
+    bool active = bridgeStatusText(b, sizeof(b), &pct) && !overlayOpen;
+    if (!active) {
+        if (bridgeToast && !lv_obj_has_flag(bridgeToast, LV_OBJ_FLAG_HIDDEN)) lv_obj_add_flag(bridgeToast, LV_OBJ_FLAG_HIDDEN);
         return;
     }
-    if (st >= 0 && st != g_lastRenderedScan) {
-        g_lastRenderedScan = st;
-        lv_obj_clean(scanList);
-        for (int i = 0; i < st; i++) {
-            char ssid[33];
-            int rssi = 0;
-            bool locked = false;
-            webPortalScanResult(i, ssid, sizeof(ssid), &rssi, &locked);
-            char item[64];
-            snprintf(item, sizeof(item), "%s  %s%ddBm", ssid, locked ? "* " : "", rssi);
-            lv_obj_t *b = lv_list_add_button(scanList, NULL, item);
-            lv_obj_set_user_data(b, (void *)(intptr_t)i);
-            lv_obj_add_event_cb(b, onScanItemClicked, LV_EVENT_CLICKED, NULL);
+    if (!bridgeToast) {
+        bridgeToast = lv_label_create(lv_layer_top());
+        lv_obj_set_style_bg_color(bridgeToast, lv_color_hex(0x0F2238), 0);
+        lv_obj_set_style_bg_opa(bridgeToast, LV_OPA_90, 0);
+        lv_obj_set_style_border_color(bridgeToast, lv_color_hex(0x3DA5FF), 0);
+        lv_obj_set_style_border_width(bridgeToast, 1, 0);
+        lv_obj_set_style_radius(bridgeToast, 14, 0);
+        lv_obj_set_style_pad_hor(bridgeToast, 12, 0);
+        lv_obj_set_style_pad_ver(bridgeToast, 5, 0);
+        lv_obj_set_style_text_color(bridgeToast, lv_color_hex(0xDCEBFA), 0);
+        lv_obj_align(bridgeToast, LV_ALIGN_BOTTOM_MID, 0, -6);
+    }
+    InstallerProgress p = installerProgress();
+    char t[64];
+    if (p.state == INST_VERIFYING) snprintf(t, sizeof(t), LV_SYMBOL_REFRESH " Đang kiểm tra dữ liệu...");
+    else if (p.state == INST_COMMITTED) snprintf(t, sizeof(t), LV_SYMBOL_OK " Sắp khởi động lại để cài dữ liệu");
+    else snprintf(t, sizeof(t), LV_SYMBOL_DOWNLOAD " Nhận dữ liệu từ điện thoại %d%%", pct);
+    if (strcmp(lv_label_get_text(bridgeToast), t) != 0) lv_label_set_text(bridgeToast, t);
+    if (lv_obj_has_flag(bridgeToast, LV_OBJ_FLAG_HIDDEN)) lv_obj_clear_flag(bridgeToast, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Called from refreshSensorsPanel while the overlay is open: keep the QR current
+// (AP creds can change) and show the device hotspot creds + live status.
+static void refreshScanListIfOpen() {
+    if (!wifiScanOverlay || lv_obj_has_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN)) return;
+
+    // A phone just joined the hotspot while this screen is up: let the green
+    // "Điện thoại đã kết nối" line show for ~1.5 s, then go back to the Dashboard
+    // (the phone opens the portal by itself). A phone that was ALREADY connected
+    // when the screen was opened doesn't trigger this (the QR stays up if reopened).
+    int clientsNow = webPortalClientCount();
+    if (g_qrPrevClients < 0) g_qrPrevClients = clientsNow;
+    if (g_qrPrevClients == 0 && clientsNow > 0) g_qrJoinedAtMs = millis() | 1;
+    if (clientsNow == 0) g_qrJoinedAtMs = 0;
+    g_qrPrevClients = clientsNow;
+    if (g_qrJoinedAtMs && millis() - g_qrJoinedAtMs >= 1500 && !updateApiBusy()) {
+        g_qrJoinedAtMs = 0;
+        Serial.printf("[ui] phone joined the hotspot (%d client(s)) -> back to Dashboard\n", clientsNow);
+        showPhoneConnectedToast();
+        onWifiScanClose(nullptr);
+        return;
+    }
+    wifiQrRebuild();
+
+    // Switch mirrors the requested state (auto-off / 4 s hold can change it too);
+    // WiFi off -> the QR is dimmed and the status says so.
+    bool wifiWanted = webPortalRequestedOn();
+    if (qrWifiSwitch && lv_obj_has_state(qrWifiSwitch, LV_STATE_CHECKED) != wifiWanted) {
+        if (wifiWanted) lv_obj_add_state(qrWifiSwitch, LV_STATE_CHECKED);
+        else lv_obj_remove_state(qrWifiSwitch, LV_STATE_CHECKED);
+    }
+    if (wifiQrObj) {
+        lv_opa_t want = wifiWanted ? LV_OPA_COVER : LV_OPA_20;
+        if (lv_obj_get_style_opa(wifiQrObj, 0) != want) lv_obj_set_style_opa(wifiQrObj, want, 0);
+    }
+
+    if (scanSavedLbl) {
+        char ap[40];
+        webPortalApSsid(ap, sizeof(ap));
+        bool secured = strlen(cfg.wifiPassword) >= 8;
+        char buf[240];
+        int n = snprintf(buf, sizeof(buf), "Tên: %s\nMật khẩu: %s\nTrang: 192.168.4.1",
+                         ap, secured ? cfg.wifiPassword : "(không có)");
+        // Also on a WiFi network (home / phone hotspot): the portal is reachable
+        // at this address from any device on that same network.
+        char staIp[24];
+        if (webPortalStaIp(staIp, sizeof(staIp)) && n > 0 && n < (int)sizeof(buf))
+            snprintf(buf + n, sizeof(buf) - n, "\nMạng \"%s\": %s", cfg.staSsid, staIp);
+        if (strcmp(lv_label_get_text(scanSavedLbl), buf) != 0) lv_label_set_text(scanSavedLbl, buf);
+    }
+
+    if (scanConnLbl) {
+        char buf[200];
+        int pct = 0;
+        bool bridging = bridgeStatusText(buf, sizeof(buf), &pct);
+        uint32_t color = 0x3DA5FF;
+        if (!bridging && !wifiWanted) {
+            snprintf(buf, sizeof(buf), "Wi-Fi đang tắt.\nGạt công tắc để bật và kết nối điện thoại.");
+            color = 0xE5B53A;
+        } else if (!bridging) {
+            int clients = webPortalClientCount();
+            char ip[24];
+            char inet[80] = "";
+            if (webPortalStaIp(ip, sizeof(ip))) {
+                if (dataUpdateAvailable())
+                    snprintf(inet, sizeof(inet), "\nCó dữ liệu mới %s — mở trang để cập nhật", dataUpdateRemoteVersion());
+            }
+            if (clients > 0) {
+                snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Điện thoại đã kết nối (%d)\nTrang cài đặt tự mở trên điện thoại\n(hoặc vào 192.168.4.1)%s",
+                         clients, inet);
+                color = 0x34C46A;
+            } else {
+                snprintf(buf, sizeof(buf), "Chờ điện thoại kết nối...\nKhông cần Wi-Fi nhà để cập nhật dữ liệu.%s", inet);
+                color = 0x8FA0B4;
+            }
         }
-        char s[40];
-        snprintf(s, sizeof(s), st ? "Tim thay %d mang (* = co khoa)" : "Khong thay mang 2.4GHz", st);
-        if (scanStatusLbl) lv_label_set_text(scanStatusLbl, s);
+        lv_obj_set_style_text_color(scanConnLbl, lv_color_hex(color), 0);
+        if (strcmp(lv_label_get_text(scanConnLbl), buf) != 0) lv_label_set_text(scanConnLbl, buf);
+        if (bridgeBar) {
+            if (bridging) {
+                lv_obj_clear_flag(bridgeBar, LV_OBJ_FLAG_HIDDEN);
+                lv_bar_set_value(bridgeBar, pct, LV_ANIM_OFF);
+            } else if (!lv_obj_has_flag(bridgeBar, LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_add_flag(bridgeBar, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
     }
 }
 
@@ -432,15 +632,6 @@ static void onChoiceBtnClicked(lv_event_t *e) {
         if (restartConfirmOverlay) {
             lv_obj_clear_flag(restartConfirmOverlay, LV_OBJ_FLAG_HIDDEN);
         }
-    }
-    // Map source IS a choice row (addChoiceRow at the Map tab), so its apply
-    // logic must live HERE, not in onSliderChanged — it used to be only in the
-    // slider handler, which this choice row never dispatches to, so picking a
-    // map source silently did nothing (found in the 2026-09-24 UI audit).
-    if (b->target == &cfg.mapSource) {
-        RasterMapManager::instance().setMapSource((uint8_t)(int)cfg.mapSource);
-        saveConfigToNVS(cfg);
-        lv_label_set_text(settingsStatusLabel, "Da doi nguon ban do!");
     }
 }
 
@@ -561,7 +752,6 @@ static void onDataUpdateBtnClicked(lv_event_t *) {
 // Settings > Sensors > "Speed Map" group — see refreshSensorsPanel(). Region/
 // version come from speedLimitManagerGetInfo() (static once loaded at boot);
 // the rest come from roadInfoSnapshot() (updates every ~500ms).
-static lv_obj_t *mapFileVal = nullptr, *mapTilesCountVal = nullptr, *mapZoomVal = nullptr, *mapStatusVal = nullptr;
 static lv_obj_t *speedMapStatusVal, *speedMapRegionVal, *speedMapVersionVal;
 static lv_obj_t *speedMapLimitVal, *speedMapSourceVal, *speedMapMatchVal, *speedMapRoadIdVal;
 
@@ -608,63 +798,16 @@ static void refreshSensorsPanel(lv_timer_t *) {
     lv_obj_set_style_text_color(demoSceneVal, demoModeIsEnabled() ? lv_color_hex(0xE0C020) : lv_color_hex(0x7C8A9A),
                                  0);
 
-    char wifiBuf[48];
-    bool wifiOn = webPortalIsEnabled();
-    webPortalStatusText(wifiBuf, sizeof(wifiBuf));
-    lv_label_set_text(wifiStatusVal, wifiBuf);
-    lv_obj_set_style_text_color(wifiStatusVal, wifiOn ? lv_color_hex(0x33CC66) : lv_color_hex(0x7C8A9A), 0);
-
-    refreshScanListIfOpen(); // populate the WiFi-setup overlay's list when a scan finishes
-
-    if (staStatusVal) {
-        char staBuf[80];
-        webPortalStaInfo(staBuf, sizeof(staBuf));
-        lv_label_set_text(staStatusVal, staBuf);
-        // green when "Da noi" (connected), amber while connecting, grey/red otherwise
-        uint32_t col = 0x7C8A9A;
-        if (strncmp(staBuf, "Da noi", 6) == 0) col = 0x33CC66;
-        else if (strncmp(staBuf, "Dang", 4) == 0) col = 0xE0C020;
-        else if (strncmp(staBuf, "Khong thay", 10) == 0 || strncmp(staBuf, "Sai", 3) == 0) col = 0xFF3B30;
-        lv_obj_set_style_text_color(staStatusVal, lv_color_hex(col), 0);
-    }
-
-    if (dataUpdateStatusVal) {
-        DataUpdateStatus du = dataUpdateGetStatus();
-        char dbuf[80];
-        uint32_t col = 0x7C8A9A;
-        if (du.state == DU_RUNNING) {
-            snprintf(dbuf, sizeof(dbuf), "%s %d/%d (%d%%)", du.message, du.filesDone, du.filesTotal, du.percent);
-            col = 0xE0C020;
-        } else if (du.state == DU_SUCCESS) { snprintf(dbuf, sizeof(dbuf), "%s", du.message); col = 0x33CC66; }
-        else if (du.state == DU_FAILED) { snprintf(dbuf, sizeof(dbuf), "%s", du.message); col = 0xFF3B30; }
-        else snprintf(dbuf, sizeof(dbuf), "san sang");
-        lv_label_set_text(dataUpdateStatusVal, dbuf);
-        lv_obj_set_style_text_color(dataUpdateStatusVal, lv_color_hex(col), 0);
-    }
-    // Keeps the switch honest if WiFi was toggled by the Dashboard's 4s hold
-    // gesture rather than this switch itself — lv_obj_add/remove_state()
-    // (not lv_switch_set_state()) so this doesn't re-fire onWifiSwitchChanged
-    // and loop back into another webPortalRequestEnable() call, same pattern
-    // onRestoreDefaults() already uses for its own switch rows.
-    if (wifiOn) lv_obj_add_state(wifiEnableSwitch, LV_STATE_CHECKED);
-    else lv_obj_clear_state(wifiEnableSwitch, LV_STATE_CHECKED);
+    // WiFi is a QR-only screen now — all its live status (AP creds, STA
+    // connection, update-available) is drawn straight onto the full-screen QR
+    // overlay by refreshScanListIfOpen() while it's open. Nothing else on the
+    // WiFi tab to update.
+    refreshScanListIfOpen();
 
     // Speed Map — spec section 25. Region/version only change if the SD
     // card is swapped and the device rebooted, so a single mapLoaded check
     // gates all the "static" fields; the rest (limit/source/match/road)
     // come from the live 500ms RoadInfoSnapshot regardless.
-    // Map tab diagnostic fields
-    if (mapFileVal) {
-        lv_label_set_text(mapFileVal, RasterMapManager::instance().getCurrentSourcePath());
-        char mBuf[32];
-        snprintf(mBuf, sizeof(mBuf), "%u tiles", (unsigned int)RasterMapManager::instance().getTileCount());
-        lv_label_set_text(mapTilesCountVal, mBuf);
-        snprintf(mBuf, sizeof(mBuf), "z%u .. z%u", (unsigned int)RasterMapManager::instance().getMinZoom(),
-                 (unsigned int)RasterMapManager::instance().getMaxZoom());
-        lv_label_set_text(mapZoomVal, mBuf);
-        lv_label_set_text(mapStatusVal, RasterMapManager::instance().isLoaded() ? "Active (OK)" : "File missing");
-    }
-
     SpeedMapMetadata mapInfo;
     bool mapLoaded = speedLimitManagerGetInfo(mapInfo);
     if (mapLoaded) {
@@ -710,6 +853,17 @@ static void onBackToDashboard(lv_event_t *) { lv_screen_load(dashboardScreen); }
 // isn't worth being more precise than a human would notice.
 static void checkIdleReturnToDashboard(lv_timer_t *) {
     if (lv_screen_active() != settingsScreen) return;
+    // Do NOT auto-exit while the user is in the WiFi menu (user-requested
+    // 2026-09-26). Scanning, picking a network and typing a password on the
+    // on-screen keyboard legitimately take longer than the 5s idle window, and
+    // getting bounced back to the Dashboard mid-entry is exactly what the user
+    // hit. Pause the timer for the whole WiFi tab, plus whenever the on-screen
+    // keyboard or the full-screen WiFi setup overlay is open (both only appear
+    // from WiFi flows, and the same "don't interrupt text entry" reasoning
+    // applies to any field).
+    if (g_activeCategory == kCategoryWifi) return;
+    if (wifiScanOverlay && !lv_obj_has_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN)) return;
+    if (wifiKeyboard && !lv_obj_has_flag(wifiKeyboard, LV_OBJ_FLAG_HIDDEN)) return;
     static const uint32_t kIdleTimeoutMs = 5000;
     if (millis() - lastTouchAtMs() > kIdleTimeoutMs) {
         lv_screen_load(dashboardScreen);
@@ -875,7 +1029,17 @@ static const int kCategoryCount = 4;
 static lv_obj_t *categoryPanels[kCategoryCount];
 static lv_obj_t *navButtons[kCategoryCount];
 
+static void onWifiScanOpen(lv_event_t *); // fwd decl — selectCategory opens the QR screen
+
 static void selectCategory(int idx) {
+    g_activeCategory = idx;
+    // The WiFi tab has no on-screen controls anymore — selecting it goes straight
+    // to the full-screen QR setup screen (phone joins the AP + configures on the
+    // web; the device then auto-connects + checks for updates).
+    if (idx == kCategoryWifi && wifiScanOverlay) {
+        onWifiScanOpen(nullptr);
+        return;
+    }
     for (int i = 0; i < kCategoryCount; i++) {
         if (i == idx) {
             lv_obj_clear_flag(categoryPanels[i], LV_OBJ_FLAG_HIDDEN);
@@ -991,7 +1155,10 @@ void buildSettingsScreen() {
         // tra/cấu hình," not the driving screen) rather than needing rows
         // trimmed to squeeze in. The old Radar/Safety tabs that used to also
         // need scrolling here are gone entirely (radar removed 2026-09-21).
-        if (i == 2 || i == 3) { // Sensors + WiFi tabs scroll (2026-09-25: WiFi now has AP + STA + data-update sections)
+        // Map (1) and Sensors (2) are taller than BODY_H and scroll. (Was "i == 2 ||
+        // i == 3" — left over from before the Map tab was inserted at index 1, so the
+        // Map tab couldn't scroll. WiFi (3) is just the QR overlay now.)
+        if (i <= 2) { // Display, Map (+ Speed Map group) and Sensors are taller than BODY_H
             lv_obj_set_scroll_dir(panel, LV_DIR_VER);
             lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
         } else {
@@ -1011,6 +1178,17 @@ void buildSettingsScreen() {
     addSwitchRow(categoryPanels[0], y, "Alert audio enabled", &cfg.audioEnabled);
     addSliderRow(categoryPanels[0], y, "Volume", &cfg.audioVolume, 0, 100, 1.0f, " %");
     addSliderRow(categoryPanels[0], y, "Brightness", &cfg.brightness, 5, 100, 1.0f, " %");
+    // Backlight mode (2026-09-26): Auto caps the backlight at 50 % at night
+    // (same GNSS sunrise/sunset as the Auto theme); Manual = always the slider.
+    static const char *kBrightnessModeLabels[2] = {"Tự động", "Thủ công"};
+    addChoiceRow(categoryPanels[0], y, "Chế độ sáng", &cfg.brightnessMode, kBrightnessModeLabels, 2);
+    {
+        lv_obj_t *hint = lv_label_create(categoryPanels[0]);
+        lv_label_set_text(hint, "Tự động: buổi tối giảm độ sáng còn 50%");
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x7C8A9A), 0);
+        lv_obj_set_pos(hint, 4, y);
+        y += 22;
+    }
     // Label updated 2026-09-16 alongside the gate itself changing from
     // touch-idle to vehicle-stationary time (see Dashboard.cpp) — "stopped"
     // says what actually starts the timer now.
@@ -1064,31 +1242,31 @@ void buildSettingsScreen() {
     demoSceneVal = addReadonlyRow(categoryPanels[0], y, "Demo scene");
 
     // -----------------------------------------------------------------
-    // Map tab (categoryPanels[1]) - Map Source (Carto / OSM) & Layers
+    // Map tab (categoryPanels[1]) — vector map display options
     // -----------------------------------------------------------------
     y = 4;
-    // Carto is the only source with street-level detail (z14/z15); OSM &
-    // Voyager top out at coarse z13 everywhere incl. Hanoi (measured
-    // 2026-09-24), so Carto is the default and marked "HD" here to steer the
-    // user away from the low-detail ones.
-    static const char *kMapSourceLabels[3] = {"Carto HD", "OSM (co ban)", "OSM Dark"};
-    addChoiceRow(categoryPanels[1], y, "Map Source", &cfg.mapSource, kMapSourceLabels, 3);
-    addSwitchRow(categoryPanels[1], y, "Ban do JPEG (nen anh)", &cfg.showRasterMap);
-    addSwitchRow(categoryPanels[1], y, "Vector Roads overlay", &cfg.showVectorRoads);
+    // Vector map only (raster JPEG background removed 2026-09-26).
     addSwitchRow(categoryPanels[1], y, "Huong xe len tren (xoay)", &cfg.mapHeadingUp);
     addSwitchRow(categoryPanels[1], y, "Vehicle Trail (track)", &cfg.showVehicleTrail);
 
-    y += 8;
-    lv_obj_t *mapHeader = lv_label_create(categoryPanels[1]);
-    lv_label_set_text(mapHeader, "SD Card Map File");
-    lv_obj_set_style_text_color(mapHeader, lv_color_hex(0x7C8A9A), 0);
-    lv_obj_set_pos(mapHeader, 4, y);
+    // Speed Map diagnostics (spec section 25) — offline microSD map-matching
+    // status, see map/SpeedLimitManager.h. This group is why categoryPanels[1]
+    // needs to be scrollable above: it doesn't fit in 260px alongside
+    // everything already in this tab.
+    y += 6;
+    lv_obj_t *mapHeaderSpeed = lv_label_create(categoryPanels[1]);
+    lv_label_set_text(mapHeaderSpeed, "Speed Map");
+    lv_obj_set_style_text_color(mapHeaderSpeed, lv_color_hex(0x7C8A9A), 0);
+    lv_obj_set_pos(mapHeaderSpeed, 4, y);
     y += 20;
+    speedMapStatusVal = addReadonlyRow(categoryPanels[1], y, "Status");
+    speedMapRegionVal = addReadonlyRow(categoryPanels[1], y, "Region");
+    speedMapVersionVal = addReadonlyRow(categoryPanels[1], y, "Version");
+    speedMapLimitVal = addReadonlyRow(categoryPanels[1], y, "Current limit");
+    speedMapSourceVal = addReadonlyRow(categoryPanels[1], y, "Source");
+    speedMapMatchVal = addReadonlyRow(categoryPanels[1], y, "Match");
+    speedMapRoadIdVal = addReadonlyRow(categoryPanels[1], y, "Road ID");
 
-    mapFileVal = addReadonlyRow(categoryPanels[1], y, "Active file");
-    mapTilesCountVal = addReadonlyRow(categoryPanels[1], y, "Tile count");
-    mapZoomVal = addReadonlyRow(categoryPanels[1], y, "Zoom range");
-    mapStatusVal = addReadonlyRow(categoryPanels[1], y, "Status");
 
     // Sensors tab (categoryPanels[2]) — real-hardware check/configure
     // (spec 16.6/16.7). GNSS (u-blox M10N, UART2) went real 2026-09-15;
@@ -1140,177 +1318,21 @@ void buildSettingsScreen() {
     // with speed) in SpeedLimitManager.cpp, not cfg.aheadLimitWarnDistM/
     // cameraWarnDistM. Those cfg fields are now legacy/unused.
 
-    // Speed Map diagnostics (spec section 25) — offline microSD map-matching
-    // status, see map/SpeedLimitManager.h. This group is why categoryPanels[2]
-    // needs to be scrollable above: it doesn't fit in 260px alongside
-    // everything already in this tab.
-    y += 6;
-    lv_obj_t *sensorsHeader3 = lv_label_create(categoryPanels[2]);
-    lv_label_set_text(sensorsHeader3, "Speed Map");
-    lv_obj_set_style_text_color(sensorsHeader3, lv_color_hex(0x7C8A9A), 0);
-    lv_obj_set_pos(sensorsHeader3, 4, y);
-    y += 20;
-    speedMapStatusVal = addReadonlyRow(categoryPanels[2], y, "Status");
-    speedMapRegionVal = addReadonlyRow(categoryPanels[2], y, "Region");
-    speedMapVersionVal = addReadonlyRow(categoryPanels[2], y, "Version");
-    speedMapLimitVal = addReadonlyRow(categoryPanels[2], y, "Current limit");
-    speedMapSourceVal = addReadonlyRow(categoryPanels[2], y, "Source");
-    speedMapMatchVal = addReadonlyRow(categoryPanels[2], y, "Match");
-    speedMapRoadIdVal = addReadonlyRow(categoryPanels[2], y, "Road ID");
 
-    // WiFi tab (user-requested 2026-09-14 alongside the Dashboard's 4s hold
-    // gesture — see net/WebPortal.h). Defaults OFF every boot; this switch
-    // and the gesture both funnel through the same webPortalRequestEnable().
-    bool wifiTabNarrow = lv_obj_get_width(categoryPanels[3]) < kNarrowPanelThreshold;
-    y = 4;
+    // WiFi tab (2026-09-26): the whole WiFi menu is now the QR setup screen.
+    // Selecting this tab immediately opens the full-screen QR overlay (see
+    // selectCategory) where the phone joins the device AP and configures WiFi on
+    // the web portal; the device then auto-connects + auto-checks for updates.
+    // All on-screen AP/STA/scan/data-update controls were removed - no on-device
+    // typing. This panel just holds a one-line fallback in case it is ever seen.
     {
-        lv_obj_t *nameLbl = lv_label_create(categoryPanels[3]);
-        lv_label_set_text(nameLbl, "WiFi enabled");
-        lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
-        lv_obj_set_pos(nameLbl, 4, y + 3);
-        wifiEnableSwitch = lv_switch_create(categoryPanels[3]);
-        lv_obj_set_pos(wifiEnableSwitch, lv_obj_get_width(categoryPanels[3]) - 46, y);
-        lv_obj_add_event_cb(wifiEnableSwitch, onWifiSwitchChanged, LV_EVENT_VALUE_CHANGED, NULL);
-        y += 26;
+        lv_obj_t *wifiHint = lv_label_create(categoryPanels[3]);
+        lv_label_set_long_mode(wifiHint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(wifiHint, lv_obj_get_width(categoryPanels[3]) - 8);
+        lv_obj_set_style_text_color(wifiHint, lv_color_hex(0xCCD6E0), 0);
+        lv_label_set_text(wifiHint, "Đang mở mã QR để kết nối điện thoại...");
+        lv_obj_set_pos(wifiHint, 6, 8);
     }
-
-    // Textareas stack label-above-field in a narrow (portrait) panel, same
-    // threshold/reasoning as addSliderRow()'s own narrow case — the fixed
-    // x=140/width=220 landscape layout below would run off the edge of a
-    // ~220px-wide portrait content column otherwise.
-    lv_obj_t *ssidLbl = lv_label_create(categoryPanels[3]);
-    lv_label_set_text(ssidLbl, "SSID");
-    lv_obj_set_style_text_color(ssidLbl, lv_color_hex(0xCCD6E0), 0);
-    wifiSsidTa = lv_textarea_create(categoryPanels[3]);
-    lv_textarea_set_one_line(wifiSsidTa, true);
-    lv_textarea_set_max_length(wifiSsidTa, sizeof(cfg.wifiSsid) - 1);
-    lv_textarea_set_text(wifiSsidTa, cfg.wifiSsid);
-    if (wifiTabNarrow) {
-        lv_obj_set_pos(ssidLbl, 4, y);
-        lv_obj_set_pos(wifiSsidTa, 4, y + 18);
-        lv_obj_set_size(wifiSsidTa, lv_obj_get_width(categoryPanels[3]) - 8, 28);
-        y += 50;
-    } else {
-        lv_obj_set_pos(ssidLbl, 4, y + 6);
-        lv_obj_set_pos(wifiSsidTa, 140, y);
-        lv_obj_set_size(wifiSsidTa, 220, 28);
-        y += 34;
-    }
-    lv_obj_add_event_cb(wifiSsidTa, onWifiTaClicked, LV_EVENT_CLICKED, NULL);
-
-    // Password field starts BLANK, never pre-filled with cfg.wifiPassword —
-    // same "don't echo a saved secret back into a form" reasoning as the
-    // /config web page's own password field (net/WebPortal.cpp). Leaving it
-    // blank and tapping elsewhere keeps the existing password unchanged —
-    // onWifiKbReadyOrCancel() only overwrites cfg.wifiPassword with
-    // whatever's actually typed.
-    lv_obj_t *passLbl = lv_label_create(categoryPanels[3]);
-    lv_label_set_text(passLbl, "Password");
-    lv_obj_set_style_text_color(passLbl, lv_color_hex(0xCCD6E0), 0);
-    wifiPasswordTa = lv_textarea_create(categoryPanels[3]);
-    lv_textarea_set_one_line(wifiPasswordTa, true);
-    lv_textarea_set_password_mode(wifiPasswordTa, true);
-    lv_textarea_set_max_length(wifiPasswordTa, sizeof(cfg.wifiPassword) - 1);
-    lv_textarea_set_placeholder_text(wifiPasswordTa, "(unchanged)");
-    if (wifiTabNarrow) {
-        lv_obj_set_pos(passLbl, 4, y);
-        lv_obj_set_pos(wifiPasswordTa, 4, y + 18);
-        lv_obj_set_size(wifiPasswordTa, lv_obj_get_width(categoryPanels[3]) - 8, 28);
-        y += 50;
-    } else {
-        lv_obj_set_pos(passLbl, 4, y + 6);
-        lv_obj_set_pos(wifiPasswordTa, 140, y);
-        lv_obj_set_size(wifiPasswordTa, 220, 28);
-        y += 34;
-    }
-    lv_obj_add_event_cb(wifiPasswordTa, onWifiTaClicked, LV_EVENT_CLICKED, NULL);
-
-    wifiStatusVal = addWideReadonlyRow(categoryPanels[3], y, "AP");
-
-    // --- Internet (Station) section: join a phone hotspot / home WiFi so the
-    // device gets internet for online data updates + NTP time (2026-09-25). ---
-    lv_obj_t *staHdr = lv_label_create(categoryPanels[3]);
-    lv_label_set_text(staHdr, "Internet (noi WiFi/hotspot)");
-    lv_obj_set_style_text_color(staHdr, lv_color_hex(0x6FB4FF), 0);
-    lv_obj_set_pos(staHdr, 4, y + 4);
-    y += 26;
-
-    // Easy path: scan nearby networks + pick + enter password on a full-screen
-    // overlay (keyboard works there). The manual fields below stay as a fallback.
-    lv_obj_t *scanOpenBtn = lv_button_create(categoryPanels[3]);
-    lv_obj_set_pos(scanOpenBtn, 4, y);
-    lv_obj_set_size(scanOpenBtn, lv_obj_get_width(categoryPanels[3]) - 8, 34);
-    lv_obj_set_style_bg_color(scanOpenBtn, lv_color_hex(0x2E5D8A), 0);
-    lv_obj_add_event_cb(scanOpenBtn, onWifiScanOpen, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *scanOpenLbl = lv_label_create(scanOpenBtn);
-    lv_label_set_text(scanOpenLbl, "Tim & ket noi WiFi");
-    lv_obj_center(scanOpenLbl);
-    y += 42;
-
-    lv_obj_t *staSsidLbl = lv_label_create(categoryPanels[3]);
-    lv_label_set_text(staSsidLbl, "Ten mang");
-    lv_obj_set_style_text_color(staSsidLbl, lv_color_hex(0xCCD6E0), 0);
-    staSsidTa = lv_textarea_create(categoryPanels[3]);
-    lv_textarea_set_one_line(staSsidTa, true);
-    lv_textarea_set_max_length(staSsidTa, sizeof(cfg.staSsid) - 1);
-    lv_textarea_set_text(staSsidTa, cfg.staSsid);
-    lv_textarea_set_placeholder_text(staSsidTa, "(de trong = tat)");
-    if (wifiTabNarrow) {
-        lv_obj_set_pos(staSsidLbl, 4, y);
-        lv_obj_set_pos(staSsidTa, 4, y + 18);
-        lv_obj_set_size(staSsidTa, lv_obj_get_width(categoryPanels[3]) - 8, 28);
-        y += 50;
-    } else {
-        lv_obj_set_pos(staSsidLbl, 4, y + 6);
-        lv_obj_set_pos(staSsidTa, 140, y);
-        lv_obj_set_size(staSsidTa, 220, 28);
-        y += 34;
-    }
-    lv_obj_add_event_cb(staSsidTa, onWifiTaClicked, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *staPassLbl = lv_label_create(categoryPanels[3]);
-    lv_label_set_text(staPassLbl, "Mat khau");
-    lv_obj_set_style_text_color(staPassLbl, lv_color_hex(0xCCD6E0), 0);
-    staPasswordTa = lv_textarea_create(categoryPanels[3]);
-    lv_textarea_set_one_line(staPasswordTa, true);
-    lv_textarea_set_password_mode(staPasswordTa, true);
-    lv_textarea_set_max_length(staPasswordTa, sizeof(cfg.staPassword) - 1);
-    lv_textarea_set_placeholder_text(staPasswordTa, "(unchanged)");
-    if (wifiTabNarrow) {
-        lv_obj_set_pos(staPassLbl, 4, y);
-        lv_obj_set_pos(staPasswordTa, 4, y + 18);
-        lv_obj_set_size(staPasswordTa, lv_obj_get_width(categoryPanels[3]) - 8, 28);
-        y += 50;
-    } else {
-        lv_obj_set_pos(staPassLbl, 4, y + 6);
-        lv_obj_set_pos(staPasswordTa, 140, y);
-        lv_obj_set_size(staPasswordTa, 220, 28);
-        y += 34;
-    }
-    lv_obj_add_event_cb(staPasswordTa, onWifiTaClicked, LV_EVENT_CLICKED, NULL);
-
-    staStatusVal = addWideReadonlyRow(categoryPanels[3], y, "Internet");
-
-    // --- Online data update section ---
-    lv_obj_t *duHdr = lv_label_create(categoryPanels[3]);
-    lv_label_set_text(duHdr, "Cap nhat du lieu ban do");
-    lv_obj_set_style_text_color(duHdr, lv_color_hex(0x6FB4FF), 0);
-    lv_obj_set_pos(duHdr, 4, y + 4);
-    y += 26;
-
-    // Online data update (2026-09-25): pulls new map/warning data from GitHub
-    // (cfg.dataUpdateUrl) over the internet. Needs WiFi station connected.
-    lv_obj_t *duBtn = lv_button_create(categoryPanels[3]);
-    lv_obj_set_pos(duBtn, 0, y);
-    lv_obj_set_size(duBtn, lv_obj_get_width(categoryPanels[3]) - 8, 34);
-    lv_obj_set_style_bg_color(duBtn, lv_color_hex(0x2E5D8A), 0);
-    lv_obj_set_ext_click_area(duBtn, 8);
-    lv_obj_add_event_cb(duBtn, onDataUpdateBtnClicked, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *duLbl = lv_label_create(duBtn);
-    lv_label_set_text(duLbl, "Cap nhat du lieu online");
-    lv_obj_center(duLbl);
-    y += 42;
-    dataUpdateStatusVal = addWideReadonlyRow(categoryPanels[3], y, "Update");
 
     // NOT called eagerly here: buildSettingsScreen() runs before
     // sharedStateInit() in main_ui_demo.cpp's setup(), so
@@ -1320,6 +1342,17 @@ void buildSettingsScreen() {
     // fires from loop() well after sharedStateInit() has run, so the rows
     // just start blank for under a second instead.
     lv_timer_create(refreshSensorsPanel, 500, NULL); // live values only need to be as fresh as a human reads them
+    // Phone-update progress pill: runs on EVERY screen (refreshSensorsPanel bails
+    // out unless Settings is showing), cheap no-op while no phone is updating.
+    lv_timer_create(
+        [](lv_timer_t *) {
+            refreshBridgeToast();
+            if (connToast && connToastUntilMs && (int32_t)(millis() - connToastUntilMs) >= 0) {
+                connToastUntilMs = 0;
+                lv_obj_add_flag(connToast, LV_OBJ_FLAG_HIDDEN);
+            }
+        },
+        500, NULL);
     lv_timer_create(checkIdleReturnToDashboard, 1000, NULL);
 
     selectCategory(0);

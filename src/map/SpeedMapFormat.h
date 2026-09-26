@@ -102,6 +102,12 @@ enum RoadDirection : uint8_t {
 
 // bit flags for RoadSegment::flags
 #define SEGFLAG_HAS_CONDITIONAL 0x01 // OSM maxspeed:conditional existed but isn't evaluated in V1 (spec section 12) — kept so it isn't silently lost
+// Grade-separation flags (2026-09-26, elevated-road matching — map/TrackContinuity.h).
+// Set by the data builders from OSM tags; absent (0) on older cards, where the
+// matcher falls back to topology-only continuity.
+#define SEGFLAG_BRIDGE 0x04 // on a bridge/viaduct/flyover (OSM bridge=* other than "no", or layer >= 1)
+#define SEGFLAG_TUNNEL 0x08 // in a tunnel/underpass (OSM tunnel=* other than "no", or layer <= -1)
+#define SEGFLAG_LINK 0x10   // a ramp/slip road (OSM highway=*_link) — how traffic changes level
 #define SEGFLAG_ONEWAY 0x02          // a real legal one-way restriction (OSM oneway=yes), not just "this record only carries one direction's speed" — see SpeedLimitManager.cpp's matcher for why this is distinct from `direction`
 
 enum SpeedSource : uint8_t {

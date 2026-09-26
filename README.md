@@ -47,10 +47,21 @@ No radar, no cellular/SIM card, no cloud dependency needed while driving — eve
 | `seg_names.bin` | ~355.9 KB | Ánh xạ định danh phân đoạn đường sang tên phố |
 | `sounds/` | ~3.0 MB | Thư viện file âm thanh cảnh báo MP3 tiếng Việt |
 
-### Cách cập nhật dữ liệu OTA trên thiết bị:
-1. Kết nối VietHUD vào Hotspot Wi-Fi của điện thoại (hoặc Wi-Fi nhà).
-2. Dùng điện thoại truy cập WebPortal tại `http://192.168.4.1` (hoặc `http://viethud.local`).
-3. Dán URL trên vào ô **Data Update URL** và bấm **Lưu & Kiểm tra cập nhật**. Thiết bị sẽ tự động tải các file thay đổi, ghi vào thẻ nhớ và khởi động lại.
+### Cách cập nhật dữ liệu trên thiết bị (firmware 2.1.0+)
+
+**Cách chính — qua điện thoại, không cần Wi-Fi nhà (Phone Update Bridge):**
+1. Trên VietHUD: **Settings → WiFi**. Màn hình hiện mã QR Wi-Fi.
+2. Quét mã QR bằng Camera để vào Wi-Fi `VietHUD-XXXX` (mật khẩu riêng của từng máy, đã nằm trong QR).
+3. Mở `http://192.168.4.1` bằng **Safari/Chrome** (không dùng cửa sổ "Captive Wi-Fi" tự bật — cửa sổ đó không có 4G).
+4. Trang tự kiểm tra bản mới; bấm **Cập nhật**. Điện thoại tải dữ liệu từ GitHub bằng 4G/5G, kiểm tra SHA-256, truyền sang VietHUD; VietHUD kiểm tra chữ ký + SHA-256 rồi khởi động lại để cài.
+
+Không có Internet trên điện thoại: **Hệ thống → Cài dữ liệu từ tệp** (chọn `manifest.txt`, `manifest.txt.sig` và các `.bin`).
+VietHUD có Wi-Fi Internet riêng (mục **Wi-Fi Internet**, tùy chọn): nút **"Để VietHUD tự tải cập nhật qua Wi-Fi"**. Chỉ cập nhật khi bản phát hành **mới hơn** dữ liệu đang dùng.
+
+**An toàn:** dữ liệu chỉ được cài khi `manifest.txt` có chữ ký hợp lệ (`manifest.txt.sig`, ECDSA P-256).
+Cài đặt là nguyên tử (journal lúc khởi động); nếu dữ liệu mới không đọc được, VietHUD tự khôi phục bản cũ.
+Mỗi lần phát hành `speedmap/manifest.txt` mới **phải ký**: `python tools/sign_manifest.py speedmap/manifest.txt`
+(khóa riêng ở `~/.viethud/manifest_signing_key.pem`, không commit). Chi tiết: `docs/WIFI_PORTAL_UPDATE_BRIDGE_PLAN.md`.
 
 ---
 

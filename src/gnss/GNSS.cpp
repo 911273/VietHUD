@@ -9,6 +9,8 @@
 #include <freertos/task.h>
 #include <esp_task_wdt.h>
 #include <math.h>
+#include <string.h> // memcpy (UBX MON-VER)
+#include <stdlib.h> // atoi (GSV counts)
 
 // Confirmed on real hardware 2026-09-15 by sweeping candidate bauds and
 // dumping raw bytes: this specific M10N breakout is NOT the common
@@ -85,6 +87,154 @@ static bool computeDaytime(float latDeg, float lonDeg, int year, int month, int 
     return nowUtc >= sunriseUtc && nowUtc < sunsetUtc;
 }
 
+// ---------------------------------------------------------------------------
+// u-blox UBX configuration (2026-09-26). Until now the module ran on its
+// factory defaults (NMEA only, "portable" dynamics). At every boot we now:
+//   * poll UBX-MON-VER (firmware + supported GNSS, logged for diagnosis);
+//   * set the AUTOMOTIVE dynamic model (smoother, road-constrained fixes);
+//   * enable AssistNow Autonomous (on-chip orbit prediction = A-GNSS without
+//     internet; survives power-off only if the breakout has a backup supply);
+//   * enable GPS + BeiDou (B1I) + Galileo (+ QZSS, SBAS) — see kSignals.
+// Written to the RAM layer only: nothing persists in the module, so a power
+// cycle always returns it to its known factory state.
+// ---------------------------------------------------------------------------
+struct UbxKv {
+    uint32_t key;
+    uint8_t size; // value bytes: 1, 2 or 4
+    uint32_t val;
+};
+
+static void ubxSend(uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t len) {
+    uint8_t hdr[6] = {0xB5, 0x62, cls, id, (uint8_t)(len & 0xFF), (uint8_t)(len >> 8)};
+    uint8_t a = 0, b = 0;
+    for (int i = 2; i < 6; i++) { a += hdr[i]; b += a; }
+    for (uint16_t i = 0; i < len; i++) { a += pl[i]; b += a; }
+    uint8_t ck[2] = {a, b};
+    Serial2.write(hdr, 6);
+    if (len) Serial2.write(pl, len);
+    Serial2.write(ck, 2);
+}
+
+static void ubxValset(const UbxKv *kv, int n) {
+    static uint8_t pl[4 + 16 * 8];
+    int len = 0;
+    pl[len++] = 0x00; // version
+    pl[len++] = 0x01; // layers: RAM only
+    pl[len++] = 0x00;
+    pl[len++] = 0x00;
+    for (int i = 0; i < n && len + 8 <= (int)sizeof(pl); i++) {
+        for (int k = 0; k < 4; k++) pl[len++] = (uint8_t)(kv[i].key >> (8 * k));
+        for (int k = 0; k < kv[i].size; k++) pl[len++] = (uint8_t)(kv[i].val >> (8 * k));
+    }
+    ubxSend(0x06, 0x8A, pl, len); // UBX-CFG-VALSET
+}
+
+// Minimal UBX frame receiver interleaved with the NMEA stream (0xB5 never
+// occurs in NMEA ASCII, so UBX bytes are cleanly separable from TinyGPS input).
+static volatile int8_t sValsetAck = 0; // 0 pending, 1 ACK, -1 NAK
+static bool ubxFeed(uint8_t c) {
+    static uint8_t st = 0, cls, id, ckA, ckB;
+    static uint16_t len, got;
+    static uint8_t buf[200];
+    switch (st) {
+    case 0: if (c == 0xB5) { st = 1; return true; } return false;
+    case 1: if (c == 0x62) { st = 2; ckA = ckB = 0; return true; } st = 0; return false;
+    case 2: cls = c; ckA += c; ckB += ckA; st = 3; return true;
+    case 3: id = c; ckA += c; ckB += ckA; st = 4; return true;
+    case 4: len = c; ckA += c; ckB += ckA; st = 5; return true;
+    case 5:
+        len |= (uint16_t)c << 8; ckA += c; ckB += ckA; got = 0;
+        st = len ? 6 : 7;
+        return true;
+    case 6:
+        if (got < sizeof(buf)) buf[got] = c;
+        got++; ckA += c; ckB += ckA;
+        if (got >= len) st = 7;
+        return true;
+    case 7: st = (c == ckA) ? 8 : 0; return true;
+    case 8: {
+        st = 0;
+        if (c != ckB) return true;
+        uint16_t n = len < sizeof(buf) ? len : sizeof(buf);
+        if (cls == 0x05 && n >= 2 && buf[0] == 0x06 && buf[1] == 0x8A) {
+            sValsetAck = (id == 0x01) ? 1 : -1; // ACK-ACK / ACK-NAK for CFG-VALSET
+        } else if (cls == 0x0A && id == 0x04 && n >= 40) { // MON-VER
+            char sw[31], hw[11];
+            memcpy(sw, buf, 30); sw[30] = 0;
+            memcpy(hw, buf + 30, 10); hw[10] = 0;
+            for (char *q = sw; *q; q++) if (*q < 0x20 || *q > 0x7E) *q = '?';
+            for (char *q = hw; *q; q++) if (*q < 0x20 || *q > 0x7E) *q = '?';
+            Serial.printf("[gnss] module: sw=\"%s\" hw=\"%s\"\n", sw, hw);
+            for (uint16_t o = 40; o + 30 <= n; o += 30) {
+                char ext[31];
+                memcpy(ext, buf + o, 30); ext[30] = 0;
+                Serial.printf("[gnss]   %s\n", ext);
+            }
+        }
+        return true;
+    }
+    }
+    st = 0;
+    return false;
+}
+
+// Runs the configuration steps; called every loop tick until done.
+static void ubxConfigStep(uint32_t sinceBootMs) {
+    static int step = 0;
+    static uint32_t sentAt = 0;
+    static const UbxKv kBase[] = {
+        {0x20110021, 1, 4}, // CFG-NAVSPG-DYNMODEL = 4 (automotive)
+        {0x10230001, 1, 1}, // CFG-ANA-USE_ANA = 1 (AssistNow Autonomous)
+    };
+    // GPS + BeiDou B1I + Galileo (+ QZSS, SBAS). Verified on this module
+    // (PROTVER 34.10): adding GLONASS is REJECTED — the M10's single RF path
+    // can't receive GLONASS L1 (1602 MHz) together with BeiDou B1I (1561 MHz).
+    // For Vietnam B1I is the better pick: it includes BeiDou's GEO/IGSO
+    // satellites that sit permanently over Asia (GLONASS adds little here).
+    static const UbxKv kSignals[] = {
+        {0x1031001f, 1, 1}, {0x10310001, 1, 1}, // GPS L1C/A
+        {0x10310022, 1, 1}, {0x1031000d, 1, 1}, // BeiDou B1I
+        {0x10310021, 1, 1}, {0x10310007, 1, 1}, // Galileo E1
+        {0x10310025, 1, 0},                     // GLONASS off (see above)
+        {0x10310024, 1, 1}, {0x10310012, 1, 1}, // QZSS L1C/A
+        {0x10310020, 1, 1}, {0x10310005, 1, 1}, // SBAS L1C/A
+    };
+    auto waitAck = [&](const char *what) -> int { // 1 ack, -1 nak/timeout, 0 still waiting
+        if (sValsetAck == 0 && sinceBootMs - sentAt < 1500) return 0;
+        int r = sValsetAck == 1 ? 1 : -1;
+        Serial.printf("[gnss] config %s: %s\n", what, r == 1 ? "OK" : (sValsetAck == -1 ? "REJECTED" : "no answer"));
+        return r;
+    };
+    switch (step) {
+    case 0:
+        if (sinceBootMs < 800) return;
+        ubxSend(0x0A, 0x04, nullptr, 0); // poll MON-VER
+        sentAt = sinceBootMs;
+        step = 1;
+        return;
+    case 1:
+        if (sinceBootMs - sentAt < 400) return;
+        sValsetAck = 0; ubxValset(kBase, 2); sentAt = sinceBootMs; step = 2;
+        return;
+    case 2:
+        if (!waitAck("automotive + AssistNow Autonomous")) return;
+        sValsetAck = 0; ubxValset(kSignals, sizeof(kSignals) / sizeof(kSignals[0])); sentAt = sinceBootMs; step = 3;
+        return;
+    case 3:
+        if (!waitAck("GPS+BeiDou+Galileo+QZSS+SBAS")) return;
+        step = 99;
+        return;
+    default:
+        return;
+    }
+}
+
+// Satellites IN VIEW per constellation (GSV field 3), for diagnostics — shows
+// whether BeiDou/Galileo/GLONASS are actually being tracked.
+static TinyGPSCustom gsvGps(gps, "GPGSV", 3), gsvGlo(gps, "GLGSV", 3), gsvGal(gps, "GAGSV", 3),
+    gsvBds(gps, "GBGSV", 3), gsvQzs(gps, "GQGSV", 3);
+static int gsvCount(TinyGPSCustom &c) { return c.isValid() ? atoi(c.value()) : 0; }
+
 // File-scope (not function-local) so gnssMsSinceStationary() below can read
 // it — see GNSS.h's comment on that function for what this tracks.
 static uint32_t lastMovingMs = 0;
@@ -95,6 +245,7 @@ static void gnssTaskFn(void *) {
     Serial2.begin(kGnssBaud, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
 
     SpeedFilter speedFilter;
+    const uint32_t taskStartMs = millis();
     esp_task_wdt_add(NULL);
     uint32_t lastFixMs = 0;
     uint32_t lastValidSentenceMs = 0;
@@ -113,8 +264,10 @@ static void gnssTaskFn(void *) {
 
     for (;;) {
         while (Serial2.available()) {
-            gps.encode(Serial2.read());
+            uint8_t c = (uint8_t)Serial2.read();
+            if (!ubxFeed(c)) gps.encode((char)c); // UBX replies are consumed here, NMEA goes to TinyGPS
         }
+        ubxConfigStep(millis() - taskStartMs);
 
         uint32_t passedChecksum = gps.passedChecksum();
         if (passedChecksum != lastPassedChecksum) {
@@ -124,7 +277,11 @@ static void gnssTaskFn(void *) {
         bool linkAlive = lastValidSentenceMs != 0 && (millis() - lastValidSentenceMs) < kLinkTimeoutMs;
 
         bool freshFix = gps.location.isValid() && gps.location.isUpdated();
-        if (freshFix) lastFixMs = millis();
+        static uint32_t sFixSeq = 0;
+        if (freshFix) {
+            lastFixMs = millis();
+            sFixSeq++;
+        }
         // GNSS considered "lost" if no fresh fix for this long — spec
         // section 23: never hold/assume a stale speed once lost, disable
         // the audio gate, show fault. Tunable from Settings > Sensors.
@@ -148,6 +305,8 @@ static void gnssTaskFn(void *) {
             snap.egoSpeedKmh = 0; // consumers must gate on .fix, never trust this while !fix
         }
         snap.satCount = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+        snap.hdop = gps.hdop.isValid() ? (float)gps.hdop.hdop() : 0.0f;
+        snap.fixSeq = sFixSeq;
 
         // Position, independent of time/date validity — map/SpeedLimitMap.cpp
         // (added 2026-09-15) needs lat/lon whenever there's a fix at all, not
@@ -163,6 +322,10 @@ static void gnssTaskFn(void *) {
         if (haveRecentFix && gps.location.isValid()) {
             snap.lonDeg = (float)gps.location.lng();
             snap.latDeg = (float)gps.location.lat();
+        }
+        if (haveRecentFix && gps.altitude.isValid()) {
+            snap.altitudeM = (float)gps.altitude.meters();
+            snap.altitudeValid = true;
         }
 
         // Course over ground (spec architecture note: "M10N xác định vị trí,
@@ -233,6 +396,12 @@ static void gnssTaskFn(void *) {
                           "failedChecksum=%lu\n",
                           snap.fix, snap.linkAlive, snap.satCount, (double)snap.egoSpeedKmh,
                           gps.charsProcessed(), gps.sentencesWithFix(), gps.failedChecksum());
+            static uint32_t sLastViewLogMs = 0;
+            if (now - sLastViewLogMs > 10000) {
+                sLastViewLogMs = now;
+                Serial.printf("[gnss] in view: GPS=%d BeiDou=%d Galileo=%d GLONASS=%d QZSS=%d\n", gsvCount(gsvGps),
+                              gsvCount(gsvBds), gsvCount(gsvGal), gsvCount(gsvGlo), gsvCount(gsvQzs));
+            }
         }
 
         esp_task_wdt_reset();
@@ -244,4 +413,5 @@ static void gnssTaskFn(void *) {
 // audit): high-water mark never dropped below ~1944 bytes free of 4096, i.e. never used
 // more than ~2152 bytes, leaving a comfortable ~920-byte (~30%) margin at
 // 3072.
-void gnssTaskStart() { xTaskCreatePinnedToCore(gnssTaskFn, "gnssTask", 3072, NULL, 2, NULL, 0); }
+// 4096 since 2026-09-26: UBX configuration + MON-VER logging added to this task.
+void gnssTaskStart() { xTaskCreatePinnedToCore(gnssTaskFn, "gnssTask", 4096, NULL, 2, NULL, 0); }

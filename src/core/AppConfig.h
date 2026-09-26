@@ -3,7 +3,7 @@
 #include <math.h> // isfinite() — see sanitizeConfig() below
 
 // User-tunable settings, persisted to NVS (core/NvsStore.cpp) and edited
-// from ui/Settings.cpp and net/WebPortal.cpp's /config page. Trimmed
+// from ui/Settings.cpp and net/WebPortal.cpp's /api/v1/config. Trimmed
 // 2026-09-21 to VietHUD's actual scope (GPS-only offline speed-limit/
 // camera/sign warnings) when radar was removed entirely — every field that
 // only ever fed the HLK-LD2451/target tracking/TTC risk engine (max range,
@@ -29,7 +29,7 @@ struct AppConfig {
     // Speaker volume 0-100% (audio/AudioPlayer.cpp audioSetVolume). Defaults to
     // 100 = loudest the NS4168 + full-scale digital path allow (raised from the
     // old hard-coded 80% default 2026-09-24). Applied in applyConfig(),
-    // adjustable in Settings > Display and web /config.
+    // adjustable in Settings > Display and web portal (Cài đặt).
     float audioVolume = 100;
 
     // Real GNSS calibration (gnss/GNSS.cpp reads these directly every tick —
@@ -52,7 +52,7 @@ struct AppConfig {
     // matching's heading-gate speed check) see the corrected value — there is
     // no separate "true" vs "displayed" speed anywhere else in this project.
     float gnssSpeedCalibrationPct = 0.0f;
-    float overspeedOffsetKmh = 1.0f; // overspeed warning fires when egoSpeed > limit + this (km/h). Clamp 0..10; user-tunable in Settings > Sensors and web /config.
+    float overspeedOffsetKmh = 1.0f; // overspeed warning fires when egoSpeed > limit + this (km/h). Clamp 0..10; user-tunable in Settings > Sensors and web portal (Cài đặt).
 
     // Ahead-warning lookahead/trigger distances (user-requested 2026-09-22)
     // — both used to be fixed constants in map/SpeedLimitManager.cpp
@@ -98,21 +98,38 @@ struct AppConfig {
     // staSsid is non-empty the device ALSO joins this network (AP+STA mode) to
     // get internet — used for NTP time sync (accurate clock without waiting for
     // a GPS fix), and a base for future online updates. Empty staSsid = AP-only,
-    // as before. Editable in web /config. Never auto-enables anything on its own.
+    // as before. Editable in web portal (Cài đặt). Never auto-enables anything on its own.
     char staSsid[32] = "";
     char staPassword[64] = "";
+
+    // WiFi Manager (2026-09-26): a small list of REMEMBERED station networks.
+    // When the user turns WiFi on, the web task scans and connects to the
+    // strongest SAVED network currently in range, rotating to the next candidate
+    // on failure (net/WebPortal.cpp). staSsid/staPassword above mirror whichever
+    // network is currently active — they're also how a pre-manager single-STA
+    // config is migrated in (NvsStore.cpp seeds savedNetworks[0] from them once).
+    // WiFi still starts OFF at boot; the manager only runs after a manual enable.
+    static const int kMaxSavedNetworks = 5;
+    struct WifiNetwork {
+        char ssid[32] = "";
+        char password[64] = "";
+    };
+    WifiNetwork savedNetworks[kMaxSavedNetworks];
+    int savedNetworkCount = 0;
 
     // Base URL the online data updater fetches from (net/DataUpdater.cpp, added
     // 2026-09-25). Points at the Raspberry Pi's public endpoint that serves the
     // map/warning data + manifest.txt (Pi bridges Google Drive via rclone).
-    // e.g. GitHub raw CDN. Must end with "/". Editable in web /config and
+    // e.g. GitHub raw CDN. Must end with "/". Editable in web portal (Cài đặt) and
     // Settings > WiFi. Default = the project's public GitHub release path so OTA
     // works out of the box (GitHub raw 301/302s to Fastly — DataUpdater follows
     // redirects). Empty = updater disabled.
     char dataUpdateUrl[128] = "https://raw.githubusercontent.com/911273/VietHUD/main/speedmap/";
-    // Auto-off the WiFi AP after this many minutes with NO client connected
-    // (0 = never). Saves power/heat/exposure on a windscreen device left with
-    // WiFi on. web /config + Settings; see WebPortal.cpp webTaskFn().
+    // Auto-off the WiFi AP after this many minutes with NO client connected.
+    // Always on (1..120 min, default 10 — user rule 2026-09-26: WiFi is OFF at
+    // boot and must switch itself off again when unused; the old 0 = "never"
+    // is gone). Saves power/heat/exposure on a windscreen device left with
+    // WiFi on. web portal (Cài đặt) + Settings; see WebPortal.cpp webTaskFn().
     float wifiAutoOffMin = 10;
 
     // Display settings (user-requested 2026-09-15). Both are floats used as
@@ -135,20 +152,15 @@ struct AppConfig {
     // runs regardless, since the sun icon and the local-time-from-longitude
     // estimate both still need it). Applies live, no restart needed.
     float themeMode = 0;
-    // Map settings: 0 = CartoDB Dark, 1 = OpenStreetMap (OSM), 2 = OSM Dark
-    float mapSource = 0;
-    bool showVectorRoads = true;
+    // Backlight mode (2026-09-26): 0 = Auto — at night (GNSS sunrise/sunset
+    // calc, same gnss.daytime as the Auto theme) the backlight is capped at
+    // kNightBrightnessPct; by day it uses `brightness`. 1 = Manual — always
+    // `brightness`. Float-as-enum like themeMode (choice row in Settings).
+    float brightnessMode = 0;
+    static constexpr float kNightBrightnessPct = 50.0f;
+    // Map display (vector only — the raster JPEG background was removed
+    // 2026-09-26; vector roads are always drawn).
     bool showVehicleTrail = true;
-    // Raster (JPEG tile) background on/off (2026-09-24, user-requested "bản đồ
-    // theo file jpeg hoặc theo vector"). Turn this OFF for a pure vector map
-    // (which needs only tiles.bin, not the 415MB maptiles.bin) — a reliable
-    // fallback if the raster tiles don't load. With showVectorRoads this gives
-    // the JPEG-vs-vector choice: both on = raster + roads; raster off = vector
-    // only; vector off = raster only.
-    // Default flipped to OFF 2026-09-25: the project moved to a VECTOR-ONLY map
-    // (the 448MB maptiles.bin is no longer shipped/updated online — vector roads
-    // + street names + all warnings come from the ~8MB core data instead).
-    bool showRasterMap = false;
     // Heading-up map rotation (2026-09-24). true = the whole map rotates so the
     // travel direction is always at 12 o'clock; false = north-up (map fixed,
     // north up) — the simpler, proven mode, and a fallback if rotation
@@ -179,12 +191,14 @@ inline void clampConfig(AppConfig &c) {
     c.overspeedOffsetKmh = constrain(c.overspeedOffsetKmh, 0.0f, 10.0f);
     c.defaultLimitKmh = constrain(c.defaultLimitKmh, 0.0f, 120.0f);
     c.audioVolume = constrain(c.audioVolume, 0.0f, 100.0f);
-    c.wifiAutoOffMin = constrain(c.wifiAutoOffMin, 0.0f, 120.0f);
+    c.wifiAutoOffMin = constrain(c.wifiAutoOffMin, 1.0f, 120.0f);
     c.aheadLimitWarnDistM = constrain(c.aheadLimitWarnDistM, 50.0f, 100.0f);
     c.cameraWarnDistM = constrain(c.cameraWarnDistM, 50.0f, 100.0f);
     c.screenRotation = constrain(c.screenRotation, 0.0f, 3.0f);
     c.themeMode = constrain(c.themeMode, 0.0f, 2.0f);
-    c.mapSource = constrain(c.mapSource, 0.0f, 2.0f);
+    c.brightnessMode = constrain(c.brightnessMode, 0.0f, 1.0f);
+    if (c.savedNetworkCount < 0) c.savedNetworkCount = 0;
+    if (c.savedNetworkCount > AppConfig::kMaxSavedNetworks) c.savedNetworkCount = AppConfig::kMaxSavedNetworks;
 }
 
 // Replaces any non-finite (NaN/Inf) field with AppConfig's own default —
@@ -211,5 +225,5 @@ inline void sanitizeConfig(AppConfig &c) {
     if (!isfinite(c.cameraWarnDistM)) c.cameraWarnDistM = d.cameraWarnDistM;
     if (!isfinite(c.screenRotation)) c.screenRotation = d.screenRotation;
     if (!isfinite(c.themeMode)) c.themeMode = d.themeMode;
-    if (!isfinite(c.mapSource)) c.mapSource = d.mapSource;
+    if (!isfinite(c.brightnessMode)) c.brightnessMode = d.brightnessMode;
 }

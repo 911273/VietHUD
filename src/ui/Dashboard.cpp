@@ -2,7 +2,6 @@
 #include <esp_task_wdt.h>
 #include "Dashboard.h"
 #include "map/MapRenderer.h"
-#include "map/RasterMapManager.h"
 #include "Settings.h" // settingsScreen, for the hold-to-open-Settings gesture
 #include "core/AppConfig.h"
 #include "core/NvsStore.h" // saveConfigToNVS()
@@ -13,8 +12,10 @@
 #include "net/WebPortal.h"
 #include "audio/AudioPlayer.h"
 
-LV_FONT_DECLARE(lv_font_montserrat_speed); // webPortalIsEnabled()/webPortalRequestEnable() — the 4s hold gesture toggles WiFi
+LV_FONT_DECLARE(lv_font_montserrat_speed); // big speed digits
+#include "driver/temp_sensor.h" // ESP32-S3 die sensor with selectable range (readDieTempC)
 LV_FONT_DECLARE(lv_font_vn_14); // Vietnamese-capable text font (Arial 14px, ASCII+VN); drop-in for montserrat_14
+LV_FONT_DECLARE(lv_font_vn_20); // same at 20px — landscape top bar (matches the 20px bottom-corner readouts)
 
 // Copies a UTF-8 road name into `out`, abbreviating a leading Vietnamese
 // "Đường " to "Đ. " (user-requested 2026-09-24 — street names from the OSM DB
@@ -80,9 +81,21 @@ static const int kPixelShiftOffsets[4][2] = {{0, 0}, {2, 0}, {2, 2}, {0, 2}};
 static int pixelShiftIdx = 0;
 static uint32_t lastTouchMs = 0;
 static bool screenDimmed = false;
+static bool gThermalDimmed = false; // die temp critical -> backlight forced low (see the temperature block)
+// Night per GNSS sunrise/sunset, cached by refreshDashboard(). applyConfig() is
+// also called early in setup(), BEFORE sharedStateInit() creates the mutex
+// gnssSnapshot() takes — so it must not call gnssSnapshot() itself.
+static bool gIsNight = false;
 
+// The ONE place that decides the backlight level, in priority order:
+// thermal protection > stationary auto-dim > night cap (Auto mode) > the
+// configured brightness.
 void applyConfig() {
-    float level = screenDimmed ? 12.0f : cfg.brightness;
+    float level = cfg.brightness;
+    if (cfg.brightnessMode < 0.5f && gIsNight && level > AppConfig::kNightBrightnessPct)
+        level = AppConfig::kNightBrightnessPct; // Auto: night -> at most 50 %
+    if (screenDimmed) level = 12.0f;
+    if (gThermalDimmed) level = 16.0f;       // ~16 % to shed heat
     backlightWrite((uint32_t)(level / 100.0f * 255.0f));
     audioSetVolume((uint8_t)cfg.audioVolume); // push the configured speaker volume to the audio driver
 }
@@ -181,6 +194,11 @@ static uint32_t lastDrawnMapGeneration = 0xFFFFFFFFu;
 static bool mapDimmed = false;
 static int egoAnchorX = 240, egoAnchorY = 213;
 static int gCanvasW = 480, gCanvasH = 320;
+// Landscape status bars: top (GNSS / street / clock / WiFi / settings) and the
+// bottom one holding the heading letter + board temperature — both 20px text,
+// both marked by the same 1px line.
+static const int kTopBarH = 40;
+static const int kBottomBarH = 40;
 static int gMapSideS = 578, gMapCenter = 289; // oversized heading-up canvas: square side + its center (rotation pivot)
 static int gRefMinDim = 160;                  // on-screen minDim framing the zoom (see buildMapCanvas)
 static float gMapZoomScale = 1.0f; // Default 2.0x digital zoom (~2.2m/px)
@@ -319,10 +337,9 @@ static lv_obj_t *bottomInfoLabel;
 // refreshDashboard()'s own comment on this overlay.
 static lv_obj_t *speedingFlashOverlay;
 
-// --- WiFi on/off gesture toast (see onDashLongPressedRepeat()/showWifiToast() below) ---
+// --- Small centred toast (map zoom level) ---
 static lv_obj_t *wifiToastLabel;
 static uint32_t wifiToastUntilMs = 0;
-static void showWifiToast(bool on); // defined below buildDashboard(), called from onDashLongPressedRepeat() above it
 
 // Long-press-to-open-Settings feedback: a ring that sweeps closed over the
 // hold duration, so a press registers visually right away instead of the
@@ -338,15 +355,10 @@ static void hideHoldRing() {
     lv_obj_add_flag(holdRing, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Two gestures share the same press-and-hold on dashRoot, distinguished by
-// duration: ~1s (HOLD_PRESS_MS, the existing ring animation's own duration,
-// user-requested 2026-09-14) opens Settings; holding to 4s+ instead toggles
-// WiFi. The longer tier suppresses the shorter one on release — a 4s WiFi
-// hold doesn't ALSO open Settings. LVGL's indev only exposes ONE long-press
-// threshold directly (lv_indev_set_long_press_time(), already used for the
-// 1s point) — the 4s point is measured by hand from pressStartMs, sampled
-// on LV_EVENT_LONG_PRESSED_REPEAT (which LVGL fires periodically for as
-// long as the press continues past the 1s mark).
+// Dashboard touch: a short tap cycles the map zoom; holding ~1s
+// (HOLD_PRESS_MS, the ring animation's duration) opens Settings on release.
+// The old 4s hold that toggled WiFi was removed 2026-09-26 (user request) —
+// WiFi is switched only from Settings > WiFi now.
 //
 // A third tier (2s hold) and a double-tap gesture used to live here too,
 // both toggling cfg.simpleUiMode (a radar-target-distance display mode) —
@@ -354,8 +366,6 @@ static void hideHoldRing() {
 // out entirely (there's no more target distance for that mode to show).
 static uint32_t pressStartMs = 0;
 static bool longPressFired = false;    // past the 1s mark at least
-static bool wifiToggledThisPress = false; // past the 4s mark — latched so it can't fire twice for one press
-static const uint32_t kWifiHoldMs = 4000;
 
 // Guards onDashReleasedOrLost's body from running more than once per
 // physical press. LVGL can fire BOTH LV_EVENT_RELEASED and LV_EVENT_PRESS_LOST
@@ -382,29 +392,15 @@ static void onDashPressed(lv_event_t *e) {
 
     pressStartMs = millis();
     longPressFired = false;
-    wifiToggledThisPress = false;
     releaseHandledThisPress = false;
 }
 
 static void onDashLongPressed(lv_event_t *) { longPressFired = true; }
 
-static void onDashLongPressedRepeat(lv_event_t *) {
-    uint32_t heldMs = millis() - pressStartMs;
-    if (wifiToggledThisPress) return;
-    if (heldMs < kWifiHoldMs) return;
-    wifiToggledThisPress = true;
-    hideHoldRing();
-    bool nowOn = !webPortalIsEnabled();
-    webPortalRequestEnable(nowOn);
-    Serial.printf("[uidemo] WiFi %s via 4s hold gesture\n", nowOn ? "ON" : "OFF");
-    showWifiToast(nowOn);
-}
-
 static void onDashReleasedOrLost(lv_event_t *) {
     hideHoldRing();
     if (releaseHandledThisPress) return;
     releaseHandledThisPress = true;
-    if (wifiToggledThisPress) return;
     if (longPressFired) {
         lv_screen_load(settingsScreen);
         return;
@@ -417,8 +413,7 @@ static void onDashReleasedOrLost(lv_event_t *) {
     } else {
         gMapZoomScale = 1.5f;
     }
-    // Drive the unified zoom so BOTH the vector layer and the raster background
-    // change together (raster tracks the published zoomRadiusM). Force an
+    // Drive the map zoom (published zoomRadiusM). Force an
     // immediate redraw by invalidating the last-drawn generation.
     mapRendererSetZoomMultiplier(gMapZoomScale);
     lastDrawnMapGeneration = 0;
@@ -436,7 +431,7 @@ static void onDashReleasedOrLost(lv_event_t *) {
 // columns. Transparent/borderless so it's invisible except for its children.
 
 // ---------------------------------------------------------------------
-// Full-Screen Map Canvas (Raster Background + Vector Overlays)
+// Full-Screen Map Canvas (vector roads + markers + trail)
 // ---------------------------------------------------------------------
 
 
@@ -530,7 +525,6 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
 
     mapRendererSetGeometry(S, S / 2, S / 2, gRefMinDim);
     mapRendererSetZoomMultiplier(gMapZoomScale);
-    RasterMapManager::instance().setMapSource((uint8_t)(int)cfg.mapSource);
 
     int anchorX = screenAnchorX;
     int anchorY = screenAnchorY;
@@ -602,7 +596,7 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
     // current travel direction as a compass letter (N/NE/E/SE/S/SW/W/NW),
     // updated from GNSS heading in refreshDashboard().
     northCx = 34;
-    northCy = gCanvasH - 34;
+    northCy = gCanvasH - kBottomBarH / 2; // centred in the bottom bar (line at gCanvasH - kBottomBarH)
     compassLabel = lv_label_create(parent);
     lv_label_set_text(compassLabel, "N");
     lv_obj_set_style_text_font(compassLabel, &lv_font_montserrat_20, 0); // bigger heading letter (2026-09-25)
@@ -612,7 +606,7 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
 
     // Board temperature readout, bottom-right corner (mirror of the compass).
     tempCx = gCanvasW - 34;
-    tempCy = gCanvasH - 34;
+    tempCy = gCanvasH - kBottomBarH / 2;
     tempLabel = lv_label_create(parent);
     lv_label_set_text(tempLabel, "--\xC2\xB0" "C"); // "--°C" until the first reading (°=U+00B0, UTF-8 C2 B0)
     lv_obj_set_style_text_font(tempLabel, &lv_font_montserrat_20, 0);
@@ -623,35 +617,6 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
     lv_obj_set_width(tempLabel, 72);
     lv_obj_set_style_text_align(tempLabel, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_pos(tempLabel, gCanvasW - 8 - 72, tempCy - 11); // right edge ~8px from the screen edge
-}
-
-// Chooses the raster tile zoom and the LVGL tile scale so the raster's
-// meters-per-pixel equals the vector layer's (pxPerM = gRefMinDim/radiusM) —
-// that's what makes raster roads sit under the vector roads at every zoom. Also
-// the FIX for the coverage gaps found 2026-09-24: it starts at max zoom and
-// falls BACK to a lower zoom when no tile covers the center (dropping a level
-// doubles groundRes, so the scale doubles to keep the same m/px), instead of
-// the old code that always asked for max zoom and drew nothing where max-zoom
-// tiles were missing. Returns false only if NO zoom has a tile there.
-static bool rasterZoomAndScale(float lat, float lon, float pxPerM, uint8_t &outZoom, float &outScale) {
-    RasterMapManager &rm = RasterMapManager::instance();
-    uint8_t minz = rm.getMinZoom(), maxz = rm.getMaxZoom();
-    if (maxz < minz || maxz == 0) { minz = 9; maxz = 15; }
-    for (int z = maxz; z >= (int)minz; z--) {
-        uint32_t tx, ty; float sx, sy;
-        RasterMapManager::latLonToTile(lat, lon, (uint8_t)z, tx, ty, sx, sy);
-        const lv_image_dsc_t *dsc = nullptr;
-        if (rm.getTileDsc((uint8_t)z, tx, ty, &dsc)) {
-            float groundRes = 156543.03f * cosf(lat * (float)M_PI / 180.0f) / (float)(1u << z);
-            float scale = pxPerM * groundRes;
-            if (scale < 0.25f) scale = 0.25f;
-            if (scale > 8.0f) scale = 8.0f;
-            outZoom = (uint8_t)z;
-            outScale = scale;
-            return true;
-        }
-    }
-    return false;
 }
 
 static void updateMapCanvas() {
@@ -680,33 +645,13 @@ static void updateMapCanvas() {
         sLastMapLon = (float)gnss.lonDeg;
     }
 
-    // Lazy initialization / retry of raster map source if not yet loaded
-    if (!RasterMapManager::instance().isLoaded()) {
-        static uint32_t sLastLoadAttemptMs = 0;
-        uint32_t now = millis();
-        if (now - sLastLoadAttemptMs > 1500) {
-            sLastLoadAttemptMs = now;
-            RasterMapManager::instance().setMapSource((uint8_t)(int)cfg.mapSource);
-        }
-    }
-
-    // When GPS has no fix yet, draw initial background map ONCE and return
+    // No GPS fix yet: clear the canvas to the map background once (vector-only
+    // map — there is nothing to draw until a position arrives), then wait.
     if (!v.valid) {
-        if (!sMapDrawnOnce && cfg.showRasterMap && RasterMapManager::instance().isLoaded()) {
+        if (!sMapDrawnOnce) {
             sMapDrawnOnce = true;
             lv_canvas_fill_bg(mapCanvas, lv_color_hex(0x04060A), LV_OPA_COVER);
-            lv_layer_t layer;
-            lv_canvas_init_layer(mapCanvas, &layer);
-            float pxPerM0 = (float)gRefMinDim / 300.0f; // default 300m radius until a real zoom arrives
-            uint8_t z0; float rscale0;
-            if (rasterZoomAndScale(sLastMapLat, sLastMapLon, pxPerM0, z0, rscale0)) {
-                RasterMapManager::instance().renderBackground(
-                    &layer, sLastMapLat, sLastMapLon, z0, gMapSideS, gMapSideS,
-                    gMapCenter, gMapCenter, rscale0);
-            }
-            lv_canvas_finish_layer(mapCanvas, &layer);
-            lv_image_set_rotation(mapCanvas, 0); // north-up until we have a heading
-            esp_task_wdt_reset();
+            lv_image_set_rotation(mapCanvas, 0);
         }
         return;
     }
@@ -718,9 +663,7 @@ static void updateMapCanvas() {
 
     uint32_t drawStartUs = micros();
 
-    // Center the raster at the SAME snapped point the vector layer was
-    // projected about (v.egoLat/LonDeg), at the SAME pixels-per-meter
-    // (gRefMinDim / zoomRadiusM), so raster roads sit under the vector roads.
+    // Map centre = the snapped ego point the vector layer was projected about.
     float centerLat = (v.egoLatDeg > 1.0f) ? v.egoLatDeg : sLastMapLat;
     float centerLon = (v.egoLonDeg > 1.0f) ? v.egoLonDeg : sLastMapLon;
     if (v.egoLatDeg > 1.0f) { sLastMapLat = v.egoLatDeg; sLastMapLon = v.egoLonDeg; }
@@ -732,69 +675,26 @@ static void updateMapCanvas() {
     lv_layer_t layer;
     lv_canvas_init_layer(mapCanvas, &layer);
 
-    // Pass 0: Raster Map Tiles Background or Tactical Radar Rings Fallback
-    bool rasterDrawn = false;
-    if (cfg.showRasterMap && RasterMapManager::instance().isLoaded()) {
-        uint8_t z; float rscale;
-        if (rasterZoomAndScale(centerLat, centerLon, pxPerM, z, rscale)) {
-            RasterMapManager::instance().renderBackground(
-                &layer, centerLat, centerLon, z, gMapSideS, gMapSideS,
-                gMapCenter, gMapCenter, rscale);
-            rasterDrawn = true;
-        }
-    }
-    if (!rasterDrawn && !cfg.showRasterMap) {
-        // Vector-only mode (raster off) — leave the plain dark background so the
-        // vector roads/markers below stand on their own; no tactical rings.
-    } else if (!rasterDrawn) {
-        // Tactical range rings and crosshair grid when raster tiles are missing / in demo without SD
-        lv_draw_arc_dsc_t ringDsc;
-        lv_draw_arc_dsc_init(&ringDsc);
-        ringDsc.color = lv_color_hex(0x101C2B);
-        ringDsc.width = 1;
-        ringDsc.center.x = gMapCenter;
-        ringDsc.center.y = gMapCenter;
-        ringDsc.start_angle = 0;
-        ringDsc.end_angle = 360;
+    esp_task_wdt_reset();
 
-        int r1 = (int)(75.0f * pxPerM);
-        int r2 = (int)(150.0f * pxPerM);
-        int r3 = (int)(250.0f * pxPerM);
-
-        if (r1 > 10 && r1 < gMapSideS) { ringDsc.radius = r1; lv_draw_arc(&layer, &ringDsc); }
-        if (r2 > 10 && r2 < gMapSideS) { ringDsc.radius = r2; lv_draw_arc(&layer, &ringDsc); }
-        if (r3 > 10 && r3 < gMapSideS) { ringDsc.radius = r3; lv_draw_arc(&layer, &ringDsc); }
-
-        lv_draw_line_dsc_t chDsc;
-        lv_draw_line_dsc_init(&chDsc);
-        chDsc.color = lv_color_hex(0x0C1520);
-        chDsc.width = 1;
-        chDsc.p1.x = gMapCenter; chDsc.p1.y = 0;
-        chDsc.p2.x = gMapCenter; chDsc.p2.y = gMapSideS;
-        lv_draw_line(&layer, &chDsc);
-        chDsc.p1.x = 0; chDsc.p1.y = gMapCenter;
-        chDsc.p2.x = gMapSideS; chDsc.p2.y = gMapCenter;
-        lv_draw_line(&layer, &chDsc);
-    }
+    // Pass 1: Vector Road Lines (the map — vector only, always drawn)
     esp_task_wdt_reset();
 
     // Pass 1: Vector Road Lines
     lv_draw_line_dsc_t lineDsc;
-    if (cfg.showVectorRoads) {
-        for (int i = 0; i < v.lineCount; i++) {
-            const MapLine &ln = v.lines[i];
-            RoadClassStyle style = mapClassStyle(ln.roadClass);
-            lv_draw_line_dsc_init(&lineDsc);
-            lineDsc.color = style.color;
-            lineDsc.width = style.width;
-            lineDsc.round_start = 1;
-            lineDsc.round_end = 1;
-            lineDsc.p1.x = ln.x1;
-            lineDsc.p1.y = ln.y1;
-            lineDsc.p2.x = ln.x2;
-            lineDsc.p2.y = ln.y2;
-            lv_draw_line(&layer, &lineDsc);
-        }
+    for (int i = 0; i < v.lineCount; i++) {
+        const MapLine &ln = v.lines[i];
+        RoadClassStyle style = mapClassStyle(ln.roadClass);
+        lv_draw_line_dsc_init(&lineDsc);
+        lineDsc.color = style.color;
+        lineDsc.width = style.width;
+        lineDsc.round_start = 1;
+        lineDsc.round_end = 1;
+        lineDsc.p1.x = ln.x1;
+        lineDsc.p1.y = ln.y1;
+        lineDsc.p2.x = ln.x2;
+        lineDsc.p2.y = ln.y2;
+        lv_draw_line(&layer, &lineDsc);
     }
 
     // Pass 2: Breadcrumb trail (Polyline track)
@@ -848,17 +748,15 @@ static void updateMapCanvas() {
 
     // Periodic map-render diagnostics (every ~3s) so the map pipeline is
     // visible over the serial monitor when the screen shows nothing — added
-    // 2026-09-24 after a "maps don't display" report. Tells apart raster-not-
-    // loaded vs. no-tile-at-position vs. nothing-to-draw.
+    // 2026-09-24 after a "maps don't display" report.
     {
         static uint32_t sLastMapDbgMs = 0;
         uint32_t nowDbg = millis();
         if (nowDbg - sLastMapDbgMs > 3000) {
             sLastMapDbgMs = nowDbg;
-            Serial.printf("[mapui] mode raster=%d(loaded=%d drawn=%d) vector=%d lines=%d markers=%d "
+            Serial.printf("[mapui] lines=%d markers=%d "
                           "headingUp=%d rot=%.0f center=%.5f,%.5f pxPerM=%.3f bufOK=%d\n",
-                          cfg.showRasterMap, RasterMapManager::instance().isLoaded(), rasterDrawn,
-                          cfg.showVectorRoads, v.lineCount, v.markerCount, cfg.mapHeadingUp,
+                          v.lineCount, v.markerCount, cfg.mapHeadingUp,
                           (double)v.headingUpDeg, (double)centerLat, (double)centerLon, (double)pxPerM,
                           mapCanvasBuf != nullptr);
         }
@@ -908,7 +806,7 @@ static lv_obj_t *makeIcon(lv_obj_t *parent, const lv_image_dsc_t *src) {
 // ---------------------------------------------------------------------
 static void buildDashboardLandscape(lv_obj_t *scr) {
     const int scrW = 480, scrH = 320;
-    const int topH = 34;
+    const int topH = kTopBarH;
 
     // ---------------- Top status bar (Full width 480, Glassmorphism) ----------------
     lv_obj_t *topBar = makePane(scr, 0, 0, scrW, topH);
@@ -919,57 +817,52 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 
     // Left: GNSS status
     gnssIcon = lv_label_create(topBar);
+    lv_obj_set_style_text_font(gnssIcon, &lv_font_montserrat_20, 0);
     lv_label_set_text(gnssIcon, LV_SYMBOL_GPS);
     lv_obj_align(gnssIcon, LV_ALIGN_LEFT_MID, 12, 0);
 
     gnssCaption = lv_label_create(topBar);
-    lv_obj_set_style_text_font(gnssCaption, &lv_font_vn_14, 0);
+    lv_obj_set_style_text_font(gnssCaption, &lv_font_vn_20, 0);
     lv_label_set_text(gnssCaption, "--");
     lv_obj_align_to(gnssCaption, gnssIcon, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
 
-    // Right: time & settings
-    gearIcon = lv_label_create(topBar);
-    lv_label_set_text(gearIcon, LV_SYMBOL_SETTINGS);
-    lv_obj_align(gearIcon, LV_ALIGN_RIGHT_MID, -12, 0);
-
-    wifiTopIcon = lv_label_create(topBar);
-    lv_label_set_text(wifiTopIcon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x00E5FF), 0);
-    lv_obj_align_to(wifiTopIcon, gearIcon, LV_ALIGN_OUT_LEFT_MID, -10, 0);
-    lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
-
+    // Right corner: clock only. (Settings gear and sun/moon icons removed from
+    // the landscape bar 2026-09-26 per user; the objects still exist, hidden,
+    // because the theme and day/night code update them.)
     clockLabel = lv_label_create(topBar);
-    lv_obj_set_style_text_font(clockLabel, &lv_font_vn_14, 0);
-    lv_obj_align_to(clockLabel, wifiTopIcon, LV_ALIGN_OUT_LEFT_MID, -12, 0);
+    lv_obj_set_style_text_font(clockLabel, &lv_font_vn_20, 0);
     lv_label_set_text(clockLabel, "--:--");
+    lv_obj_align(clockLabel, LV_ALIGN_RIGHT_MID, -12, 0); // style-based align: stays flush right as the text changes
 
+    gearIcon = lv_label_create(topBar);
+    lv_obj_add_flag(gearIcon, LV_OBJ_FLAG_HIDDEN);
     sunIcon = makeIcon(topBar, &sun_icon);
-    lv_obj_align_to(sunIcon, clockLabel, LV_ALIGN_OUT_LEFT_MID, -6, 0);
+    lv_obj_add_flag(sunIcon, LV_OBJ_FLAG_HIDDEN);
 
     // Center: Street Name Badge (Glassmorphism Pill)
     streetNameBadge = lv_obj_create(topBar);
-    lv_obj_set_size(streetNameBadge, 220, 24);
-    lv_obj_align(streetNameBadge, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_size(streetNameBadge, 300, 30);
+    lv_obj_align(streetNameBadge, LV_ALIGN_CENTER, 0, 0); // centred; clears the GNSS block (left) and clock (right)
     lv_obj_set_style_bg_color(streetNameBadge, lv_color_hex(0x0C1522), 0);
     lv_obj_set_style_bg_opa(streetNameBadge, LV_OPA_80, 0);
     lv_obj_set_style_border_color(streetNameBadge, lv_color_hex(0x1F314A), 0);
     lv_obj_set_style_border_width(streetNameBadge, 1, 0);
-    lv_obj_set_style_radius(streetNameBadge, 12, 0);
+    lv_obj_set_style_radius(streetNameBadge, 15, 0);
     lv_obj_set_style_pad_all(streetNameBadge, 0, 0);
     lv_obj_clear_flag(streetNameBadge, LV_OBJ_FLAG_SCROLLABLE);
 
     streetNameIcon = lv_label_create(streetNameBadge);
+    lv_obj_set_style_text_font(streetNameIcon, &lv_font_montserrat_20, 0);
     lv_label_set_text(streetNameIcon, LV_SYMBOL_RIGHT);
     lv_obj_set_style_text_color(streetNameIcon, lv_color_hex(0x00E5FF), 0);
     lv_obj_align(streetNameIcon, LV_ALIGN_LEFT_MID, 8, 0);
 
     streetNameLabel = lv_label_create(streetNameBadge);
-    lv_obj_set_style_text_font(streetNameLabel, &lv_font_vn_14, 0);
+    lv_obj_set_style_text_font(streetNameLabel, &lv_font_vn_20, 0);
     lv_obj_set_style_text_color(streetNameLabel, lv_color_hex(0xF0F4F8), 0);
     lv_label_set_long_mode(streetNameLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(streetNameLabel, 180);
-    lv_obj_align(streetNameLabel, LV_ALIGN_LEFT_MID, 24, 0);
+    lv_obj_set_width(streetNameLabel, 260);
+    lv_obj_align(streetNameLabel, LV_ALIGN_LEFT_MID, 30, 0);
     lv_label_set_text(streetNameLabel, "");
     lv_obj_add_flag(streetNameBadge, LV_OBJ_FLAG_HIDDEN);
 
@@ -1033,7 +926,25 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     // (legacy floating warning banners removed — see comment near the top of this file)
 
     // ---------------- Bottom row: Cảnh báo phụ (Traffic Card) ----------------
-    midCol = makePane(scr, (scrW - 270) / 2, 246, 270, 60);
+    lv_obj_t *bottomBar = makePane(scr, 0, scrH - kBottomBarH, scrW, kBottomBarH);
+    lv_obj_set_style_border_color(bottomBar, lv_color_hex(0x182232), 0); // same line as the top bar
+    lv_obj_set_style_border_width(bottomBar, 1, 0);
+    lv_obj_set_style_border_side(bottomBar, LV_BORDER_SIDE_TOP, 0);
+
+    // WiFi status icon, centre of the bottom bar (heading letter left, board
+    // temperature right): hidden = WiFi off, grey = hotspot on, green
+    // "WiFi ✓" = a phone is connected (refreshDashboard, state-change only).
+    wifiTopIcon = lv_label_create(bottomBar);
+    lv_obj_set_style_text_font(wifiTopIcon, &lv_font_montserrat_20, 0);
+    lv_label_set_text(wifiTopIcon, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x7C8A9A), 0);
+    lv_obj_set_width(wifiTopIcon, 60);
+    lv_obj_set_style_text_align(wifiTopIcon, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(wifiTopIcon, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
+
+    midCol = makePane(scr, (scrW - 270) / 2, scrH - kBottomBarH - 6 - 60, 270, 60);
     buildTrafficCard(midCol, 270, 60);
 
     // Bottom info bar (hidden)
@@ -1079,7 +990,11 @@ static void buildDashboardPortrait(lv_obj_t *scr) {
 
     wifiTopIcon = lv_label_create(topBar);
     lv_label_set_text(wifiTopIcon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x7C8A9A), 0);
+    // Fixed width, right-aligned: the text grows to "WiFi ✓" when a phone joins,
+    // and the clock is aligned to this box once at build time.
+    lv_obj_set_width(wifiTopIcon, 44);
+    lv_obj_set_style_text_align(wifiTopIcon, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_align_to(wifiTopIcon, gearIcon, LV_ALIGN_OUT_LEFT_MID, -8, 0);
     lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
@@ -1207,7 +1122,6 @@ void buildDashboard() {
     lv_obj_add_flag(dashRoot, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(dashRoot, onDashPressed, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(dashRoot, onDashLongPressed, LV_EVENT_LONG_PRESSED, NULL);
-    lv_obj_add_event_cb(dashRoot, onDashLongPressedRepeat, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
     lv_obj_add_event_cb(dashRoot, onDashReleasedOrLost, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(dashRoot, onDashReleasedOrLost, LV_EVENT_PRESS_LOST, NULL);
 
@@ -1296,11 +1210,6 @@ void buildDashboard() {
     applyTheme(true); // initial default matches GnssSnapshot's own daytime=true default, until a real fix says otherwise
 }
 
-static void showWifiToast(bool on) {
-    lv_label_set_text(wifiToastLabel, on ? "WiFi ON" : "WiFi OFF");
-    lv_obj_clear_flag(wifiToastLabel, LV_OBJ_FLAG_HIDDEN);
-    wifiToastUntilMs = millis() + 1500;
-}
 
 // Day/Night color theme for the chrome — background, captions, primary
 // readouts, gear icon, column dividers, bottom info bar (user-requested
@@ -1372,7 +1281,7 @@ static void queueSpeedVoice(float kmh) {
 }
 
 void refreshDashboard() {
-    // Auto-hide the WiFi toggle toast (see showWifiToast()) — checked here
+    // Auto-hide the zoom-level toast — checked here
     // rather than a dedicated timer since refreshDashboard() already runs
     // every 150ms while the Dashboard is visible, same reasoning as every
     // other "reuse the existing tick" gate in this function.
@@ -1418,16 +1327,40 @@ void refreshDashboard() {
     // re-applied only when it actually changes, so normal operation never forces
     // a full-screen redraw on the map beneath (only the rare critical blink does).
     if (tempLabel) {
+        // Arduino's temperatureRead() always uses the sensor's default range
+        // (-10..80 C); above that it SATURATES (read a flat "110.0 C" on a hot
+        // windscreen, 2026-09-26). Read with the range that fits: -10..80 C
+        // (+-1 C), 20..100 C (+-2 C) or 50..125 C (+-3 C), with hysteresis, and
+        // re-read at once in the higher range if the current one saturated.
+        auto readDieTempC = []() -> float {
+            static temp_sensor_dac_offset_t range = TSENS_DAC_L2;
+            auto readIn = [](temp_sensor_dac_offset_t r) {
+                float c = NAN;
+                temp_sensor_config_t t = TSENS_CONFIG_DEFAULT();
+                t.dac_offset = r;
+                temp_sensor_set_config(t);
+                temp_sensor_start();
+                temp_sensor_read_celsius(&c);
+                temp_sensor_stop();
+                return c;
+            };
+            float c = readIn(range);
+            if (range == TSENS_DAC_L2 && !(c < 80.0f)) c = readIn(range = TSENS_DAC_L1);
+            if (range == TSENS_DAC_L1 && !(c < 100.0f)) c = readIn(range = TSENS_DAC_L0);
+            if (range == TSENS_DAC_L2 && c >= 75.0f) range = TSENS_DAC_L1;       // next read: wider range
+            else if (range == TSENS_DAC_L1 && c < 65.0f) range = TSENS_DAC_L2;   // cooled: back to the precise one
+            else if (range == TSENS_DAC_L0 && c < 90.0f) range = TSENS_DAC_L1;
+            return c;
+        };
         static uint32_t sLastTempMs = 0;
         static float sTempC = -999.0f;
         static int sLastTier = 0;
         static uint32_t sLastCritAlarmMs = 0;
         static uint32_t sLastTempColor = 0xFFFFFFFFu;
-        static bool sThermalDimmed = false;
         uint32_t nowT = millis();
         if (sTempC < -900.0f || nowT - sLastTempMs > 2000) {
             sLastTempMs = nowT;
-            sTempC = temperatureRead(); // ESP32-S3 internal die temperature, degrees C
+            sTempC = readDieTempC(); // ESP32-S3 internal die temperature, degrees C (range-adaptive)
             g_boardTempC = sTempC;      // publish for the web telemetry (net/WebPortal.cpp)
             char buf[16];
             snprintf(buf, sizeof(buf), "%.0f\xC2\xB0" "C", (double)sTempC); // "NN°C"
@@ -1455,9 +1388,9 @@ void refreshDashboard() {
         sLastTier = tier;
         if (tier == 2) {
             if (nowT - sLastCritAlarmMs > 15000) { sLastCritAlarmMs = nowT; audioPlayOverspeedAlert(); }
-            if (!sThermalDimmed) { sThermalDimmed = true; backlightWrite(40); } // ~16% to cut heat
-        } else if (sThermalDimmed) {
-            sThermalDimmed = false;
+            if (!gThermalDimmed) { gThermalDimmed = true; applyConfig(); } // ~16% to cut heat
+        } else if (gThermalDimmed) {
+            gThermalDimmed = false;
             applyConfig(); // cooled below critical — restore the configured brightness
         }
     }
@@ -1529,17 +1462,32 @@ void refreshDashboard() {
     }
     lv_label_set_text(gnssCaption, gBuf); // text itself set once at build — see buildDashboard()
 
-    // WiFi icon — shown only while actually on (net/WebPortal.h). Gated on
-    // an actual state CHANGE, not called unconditionally every tick, same
-    // discipline as lastDaytime/lastCriticalState below — a HIDDEN-flag
-    // toggle is cheap on its own, but there's no reason to touch it 6-7x/s
-    // for a value that only ever changes on a user gesture.
-    static bool lastWifiOn = false;
-    bool wifiOn = webPortalIsEnabled();
-    if (wifiOn != lastWifiOn) {
-        lastWifiOn = wifiOn;
-        if (wifiOn) lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
+    // WiFi icon, three states: hidden (WiFi off), grey (hotspot on, waiting),
+    // green "WiFi ✓" (a phone is connected to the hotspot). Touched only on a
+    // state CHANGE — a style/text write always invalidates, and this runs 6-7x/s.
+    // State 1 BLINKS (amber, ~1 Hz) so "hotspot on, no phone yet" is noticeable;
+    // only the small icon area is invalidated, and only at the blink edges.
+    static int lastWifiState = 0; // 0 off, 1 on/waiting (blinking), 2 phone connected
+    int wifiState = !webPortalIsEnabled() ? 0 : (webPortalClientCount() > 0 ? 2 : 1);
+    static bool sWifiBlinkOn = true;
+    if (wifiState != lastWifiState) {
+        lastWifiState = wifiState;
+        sWifiBlinkOn = true;
+        if (wifiState == 0) {
+            lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_label_set_text(wifiTopIcon, wifiState == 2 ? LV_SYMBOL_WIFI " " LV_SYMBOL_OK : LV_SYMBOL_WIFI);
+            lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(wifiState == 2 ? 0x3CC46E : 0xE5B53A), 0);
+            lv_obj_set_style_opa(wifiTopIcon, LV_OPA_COVER, 0);
+            lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (wifiState == 1) {
+        bool on = (millis() / 500) % 2 == 0;
+        if (on != sWifiBlinkOn) {
+            sWifiBlinkOn = on;
+            lv_obj_set_style_opa(wifiTopIcon, on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+        }
     }
 
     // Real local time from the GNSS fix (spec section 15.2 wants sunrise/
@@ -1581,6 +1529,19 @@ void refreshDashboard() {
     // or cfg.themeMode itself changing) — touching lv_obj_set_style_*
     // unconditionally every 150ms would mean re-invalidating the whole
     // screen background + every themed label on every tick for nothing.
+    // Auto brightness: re-apply the backlight when day/night flips or the mode
+    // changes (applyConfig() itself applies the 50 % night cap).
+    {
+        static int sLastBriNight = -1;
+        gIsNight = !gnss.daytime;
+        int briNight = (cfg.brightnessMode < 0.5f && gIsNight) ? 1 : 0;
+        if (briNight != sLastBriNight) {
+            sLastBriNight = briNight;
+            applyConfig();
+            Serial.printf("[display] brightness %s\n", briNight ? "night cap 50%" : "normal");
+        }
+    }
+
     bool effectiveDaytime = cfg.themeMode == 1.0f    ? true
                              : cfg.themeMode == 2.0f ? false
                                                       : gnss.daytime; // 0 = Auto
