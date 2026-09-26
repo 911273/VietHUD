@@ -576,6 +576,24 @@ void loop() {
             float a = 0, b = 0, h = 0, v = 0, t = 0;
             if (sscanf(line.c_str(), "%f %f %f %f %f", &a, &b, &h, &v, &t) >= 5) gnssSimStart(a, b, h, v, t);
             else gnssSimStart(0, 0, 0, 0, 0);
+        } else if (c == 'W') {
+            // Bench: drive a polyline — "W kmh lat lon lat lon ..." (up to 48 points).
+            String line = Serial.readStringUntil('\n');
+            static float wl[48], wo[48];
+            const char *q = line.c_str();
+            char *end;
+            float kmh = strtof(q, &end);
+            int n = 0;
+            while (n < 48) {
+                q = end;
+                float a = strtof(q, &end);
+                if (end == q) break;
+                q = end;
+                float b = strtof(q, &end);
+                if (end == q) break;
+                wl[n] = a; wo[n] = b; n++;
+            }
+            if (n >= 2) gnssSimRoute(wl, wo, n, kmh);
         } else if (c == 'u') {
             // Bench trigger for the OTA data update. Uses the SAME reliable path
             // as the web + on-screen buttons: set the NVS flag and reboot into

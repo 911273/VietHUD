@@ -1133,6 +1133,34 @@ static const float kCameraBearingToleranceDeg = 60.0f; // how far off dead-ahead
 // bend. The lateral tolerance keeps a camera on a parallel/adjacent road from
 // being picked up. Falls back to the old bearing-cone scan when there's no
 // usable route.
+// Number shown on the camera card (2026-09-27, bench check against the card's
+// data: a camera tagged 60 showed "40"). Source data often has the same camera
+// twice a few metres apart, one copy with the limit and one without — and the
+// copy without it can be the one that sits on our road. So: the camera's own
+// limit; else a same-direction duplicate within 30 m that has one; else the
+// current road limit ONLY if it comes from a real sign/tag (never a road-class
+// DEFAULT guess); else -1 (card shows the camera icon alone).
+static float cameraCardLimit(const CamPt *best, const CamPt *cams, int camCount, const RoadInfoSnapshot &road) {
+    if (best->speedLimitKmh > 0) return (float)best->speedLimitKmh;
+    const int32_t dLat = (int32_t)(30.0f / 110540.0f * 1e7f);
+    float bLat = best->latE7 / 1e7f, bLon = best->lonE7 / 1e7f;
+    float bestD = 31.0f, lim = -1.0f;
+    for (int i = pointsLatBegin(cams, camCount, best->latE7 - dLat); i < camCount && cams[i].latE7 <= best->latE7 + dLat; i++) {
+        const CamPt &c = cams[i];
+        if (&c == best || c.speedLimitKmh <= 0) continue;
+        if (best->directionDeg != 0xFFFF && c.directionDeg != 0xFFFF &&
+            angularDiffDeg((float)best->directionDeg, (float)c.directionDeg) > 45.0f)
+            continue;
+        Vec2 v = toLocalMeters(c.latE7 / 1e7f, c.lonE7 / 1e7f, bLat, bLon);
+        float d = sqrtf(v.x * v.x + v.y * v.y);
+        if (d < bestD) { bestD = d; lim = (float)c.speedLimitKmh; }
+    }
+    if (lim > 0) return lim;
+    if (road.valid && road.speedLimitKmh > 0 && road.source != SPEED_SOURCE_DEFAULT && road.source != SPEED_SOURCE_UNKNOWN)
+        return road.speedLimitKmh;
+    return -1.0f;
+}
+
 static void matchCameraAheadRoute(const GnssSnapshot &gnss, const RoadInfoSnapshot &roadMatch, RoadInfoSnapshot &out) {
     const CamPt *cams;
     int camCount;
@@ -1172,8 +1200,7 @@ static void matchCameraAheadRoute(const GnssSnapshot &gnss, const RoadInfoSnapsh
 
     out.cameraAheadValid = true;
     out.cameraAheadDistanceM = bestAheadDistM;
-    out.cameraSpeedLimitKmh = (best->speedLimitKmh >= 0) ? (float)best->speedLimitKmh
-                               : (roadMatch.valid ? roadMatch.speedLimitKmh : -1.0f);
+    out.cameraSpeedLimitKmh = cameraCardLimit(best, cams, camCount, roadMatch);
 }
 
 static void matchCameraAheadStraight(const GnssSnapshot &gnss, const RoadInfoSnapshot &roadMatch, RoadInfoSnapshot &out) {
@@ -1201,8 +1228,7 @@ static void matchCameraAheadStraight(const GnssSnapshot &gnss, const RoadInfoSna
 
     out.cameraAheadValid = true;
     out.cameraAheadDistanceM = bestDistM;
-    out.cameraSpeedLimitKmh = (best->speedLimitKmh >= 0) ? (float)best->speedLimitKmh
-                               : (roadMatch.valid ? roadMatch.speedLimitKmh : -1.0f);
+    out.cameraSpeedLimitKmh = cameraCardLimit(best, cams, camCount, roadMatch);
 }
 
 static void matchCameraAhead(const GnssSnapshot &gnss, const RoadInfoSnapshot &roadMatch, RoadInfoSnapshot &out) {
@@ -1679,6 +1705,23 @@ static void speedLimitTaskFn(void *) {
             // downloaded region" apart from "in region but not matching"
             // apart from a genuine bug).
             uint32_t now = millis();
+            // Warning state, 1/s while moving — what the Dashboard is being told
+            // (bench verification of camera/sign/limit-ahead warnings).
+            static uint32_t sLastWarnLogMs = 0;
+            if (gnss.fix && gnss.egoSpeedKmh > kGnssMotionThresholdKmh && now - sLastWarnLogMs >= 1000) {
+                sLastWarnLogMs = now;
+                Serial.printf("[warn] lat=%.6f lon=%.6f road=%lu lim=%.0f(%s) cam=%s%.0fm/%.0f sign=%u@%.0fm limAhead=%s%.0f@%.0fm "
+                              "res=%d nov=%d toll=%d light=%d danger=%d\n",
+                              (double)gnss.latDeg, (double)gnss.lonDeg, (unsigned long)out.roadId,
+                              (double)out.speedLimitKmh, speedSourceStr(out.source), out.cameraAheadValid ? "" : "-",
+                              (double)(out.cameraAheadValid ? out.cameraAheadDistanceM : 0),
+                              (double)(out.cameraAheadValid ? out.cameraSpeedLimitKmh : 0), (unsigned)out.nextSignType,
+                              (double)(out.nextSignType ? out.nextSignDistanceM : 0), out.aheadLimitValid ? "" : "-",
+                              (double)(out.aheadLimitValid ? out.aheadSpeedLimitKmh : 0),
+                              (double)(out.aheadLimitValid ? out.aheadDistanceM : 0), out.residentAreaAheadValid,
+                              out.noOvertakingAheadValid, out.tollBoothAheadValid, out.trafficLightAheadValid,
+                              out.dangerAheadValid);
+            }
             if (now - lastDebugMs > 3000) {
                 lastDebugMs = now;
                 Serial.printf("[map] fix=%d lat=%.6f lon=%.6f valid=%d roadId=%lu conf=%.2f distM=%.1f "
