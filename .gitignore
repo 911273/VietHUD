@@ -31,3 +31,12 @@ tools/tilemaker_v24/
 tools/fonts/__pycache__/
 *.osm
 *.osm.pbf
+
+# pipeline runtime dirs / caches / secrets
+tools/viethud-pipeline/__pycache__/
+tools/viethud-pipeline/vhpack/__pycache__/
+tools/viethud-pipeline/build/
+tools/viethud-pipeline/data/
+tools/viethud-pipeline/logs/
+tools/viethud-pipeline/.env
+*.pem

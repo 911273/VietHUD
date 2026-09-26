@@ -1,0 +1,13 @@
+# /etc/logrotate.d/viethud-pipeline
+# Keeps the pipeline log small to spare disk/SD. (The pipeline also writes to the
+# systemd journal, which is size-capped separately; see README.)
+/opt/viethud-pipeline/logs/*.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su admin admin
+}

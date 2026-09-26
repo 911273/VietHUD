@@ -44,3 +44,15 @@ bool dataUpdatePending();
 
 // Snapshot of the current progress/result for the web + on-screen UI.
 DataUpdateStatus dataUpdateGetStatus();
+
+// OTA auto-check (2026-09-26): fetch ONLY the remote manifest.txt and compare its
+// version line to the copy on the SD card. Cheap, downloads nothing else, never
+// reboots. dataUpdateCheckStart() runs it in the background (no-op unless WiFi
+// station is connected and a URL is set); the getters feed the on-screen + web
+// "update available" indicator. Applying an update is still the manual
+// dataUpdateSchedule() path.
+bool dataUpdateCheckStart();
+bool dataUpdateAvailable();
+bool dataUpdateCheckInProgress();
+const char *dataUpdateRemoteVersion();
+const char *dataUpdateLocalVersion();

@@ -102,6 +102,21 @@ struct AppConfig {
     char staSsid[32] = "";
     char staPassword[64] = "";
 
+    // WiFi Manager (2026-09-26): a small list of REMEMBERED station networks.
+    // When the user turns WiFi on, the web task scans and connects to the
+    // strongest SAVED network currently in range, rotating to the next candidate
+    // on failure (net/WebPortal.cpp). staSsid/staPassword above mirror whichever
+    // network is currently active — they're also how a pre-manager single-STA
+    // config is migrated in (NvsStore.cpp seeds savedNetworks[0] from them once).
+    // WiFi still starts OFF at boot; the manager only runs after a manual enable.
+    static const int kMaxSavedNetworks = 5;
+    struct WifiNetwork {
+        char ssid[32] = "";
+        char password[64] = "";
+    };
+    WifiNetwork savedNetworks[kMaxSavedNetworks];
+    int savedNetworkCount = 0;
+
     // Base URL the online data updater fetches from (net/DataUpdater.cpp, added
     // 2026-09-25). Points at the Raspberry Pi's public endpoint that serves the
     // map/warning data + manifest.txt (Pi bridges Google Drive via rclone).
@@ -185,6 +200,8 @@ inline void clampConfig(AppConfig &c) {
     c.screenRotation = constrain(c.screenRotation, 0.0f, 3.0f);
     c.themeMode = constrain(c.themeMode, 0.0f, 2.0f);
     c.mapSource = constrain(c.mapSource, 0.0f, 2.0f);
+    if (c.savedNetworkCount < 0) c.savedNetworkCount = 0;
+    if (c.savedNetworkCount > AppConfig::kMaxSavedNetworks) c.savedNetworkCount = AppConfig::kMaxSavedNetworks;
 }
 
 // Replaces any non-finite (NaN/Inf) field with AppConfig's own default —

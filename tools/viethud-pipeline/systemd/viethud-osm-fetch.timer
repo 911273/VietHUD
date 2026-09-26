@@ -1,0 +1,13 @@
+[Unit]
+Description=VietHUD - monthly OSM PBF fetch (01st, 13:00 local)
+
+[Timer]
+# 1st of each month at 13:00 local time.
+OnCalendar=*-*-01 13:00:00
+# Catch up if the Pi was off at the scheduled time.
+Persistent=true
+# Spread load a little so it doesn't hit Geofabrik exactly on the minute.
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

@@ -63,6 +63,61 @@ int webPortalScanResult(int i, char *ssid, size_t cap, int *rssi, bool *locked) 
 }
 void webPortalReconnectSta() { g_staReconnectReq = true; }
 
+// ---- WiFi Manager: saved-network list (multiple remembered STA networks) ----
+// Runtime candidate state (web task only): the saved-network indices found in
+// the last scan, ordered best-RSSI first, and which one we're currently trying.
+static int g_wmCand[AppConfig::kMaxSavedNetworks];
+static int g_wmCandCount = 0;
+static int g_wmTry = -1;            // index into g_wmCand; -1 => (re)scan needed
+static uint32_t g_wmAttemptMs = 0;
+static uint32_t g_nextOtaCheckMs = 0; // when to next run the OTA manifest auto-check
+
+int webPortalSavedCount() { return cfg.savedNetworkCount; }
+
+bool webPortalSavedNetwork(int i, char *ssid, size_t cap) {
+    if (i < 0 || i >= cfg.savedNetworkCount || cap == 0) return false;
+    strncpy(ssid, cfg.savedNetworks[i].ssid, cap - 1);
+    ssid[cap - 1] = '\0';
+    return true;
+}
+
+bool webPortalAddNetwork(const char *ssid, const char *password) {
+    if (!ssid || !ssid[0]) return false;
+    int slot = -1;
+    for (int i = 0; i < cfg.savedNetworkCount; i++)
+        if (strncmp(cfg.savedNetworks[i].ssid, ssid, 31) == 0) { slot = i; break; }
+    if (slot < 0) {
+        if (cfg.savedNetworkCount >= AppConfig::kMaxSavedNetworks)
+            slot = AppConfig::kMaxSavedNetworks - 1;  // list full: replace the last
+        else
+            slot = cfg.savedNetworkCount++;
+    }
+    strncpy(cfg.savedNetworks[slot].ssid, ssid, sizeof(cfg.savedNetworks[slot].ssid) - 1);
+    cfg.savedNetworks[slot].ssid[sizeof(cfg.savedNetworks[slot].ssid) - 1] = '\0';
+    strncpy(cfg.savedNetworks[slot].password, password ? password : "",
+            sizeof(cfg.savedNetworks[slot].password) - 1);
+    cfg.savedNetworks[slot].password[sizeof(cfg.savedNetworks[slot].password) - 1] = '\0';
+    saveConfigToNVS(cfg);
+    g_wmTry = -1; g_wmAttemptMs = 0;   // force a fresh manager cycle to try it now
+    g_staReconnectReq = true;
+    Serial.printf("[wm] saved network \"%s\" (slot %d, %d total)\n", ssid, slot, cfg.savedNetworkCount);
+    return true;
+}
+
+bool webPortalDeleteNetwork(int idx) {
+    if (idx < 0 || idx >= cfg.savedNetworkCount) return false;
+    for (int i = idx; i < cfg.savedNetworkCount - 1; i++)
+        cfg.savedNetworks[i] = cfg.savedNetworks[i + 1];
+    cfg.savedNetworkCount--;
+    cfg.savedNetworks[cfg.savedNetworkCount].ssid[0] = '\0';
+    cfg.savedNetworks[cfg.savedNetworkCount].password[0] = '\0';
+    saveConfigToNVS(cfg);
+    g_wmTry = -1; g_wmAttemptMs = 0;
+    g_staReconnectReq = true;
+    Serial.printf("[wm] deleted saved network #%d (%d left)\n", idx, cfg.savedNetworkCount);
+    return true;
+}
+
 // wifiEnabledRequest: what the UI wants (written by webPortalRequestEnable(),
 // read by webTaskFn()). wifiActuallyEnabled: what's actually been applied
 // (written only by applyWifiState(), inside the web task). Two separate
@@ -86,6 +141,37 @@ void webPortalStatusText(char *buf, size_t cap) {
                  (int)WiFi.softAPgetStationNum());
     else
         snprintf(buf, cap, "OFF");
+}
+
+// The AP SSID this device uses — a user-set custom name, else "VietHUD-XXXX"
+// (last 2 MAC bytes). Computed the SAME way applyWifiState() sets g_apSsid, so
+// it's correct even before the AP has been brought up (the QR setup screen needs
+// it to build the join code). See Settings.cpp's wifiQrRebuild().
+void webPortalApSsid(char *buf, size_t cap) {
+    if (cap == 0) return;
+    if (cfg.wifiSsid[0] && strcmp(cfg.wifiSsid, "VietHUD") != 0) {
+        strncpy(buf, cfg.wifiSsid, cap - 1);
+        buf[cap - 1] = '\0';
+    } else {
+        uint8_t mac[6];
+        WiFi.macAddress(mac);
+        snprintf(buf, cap, "VietHUD-%02X%02X", mac[4], mac[5]);
+    }
+}
+
+// The device's IP on the joined WiFi (station), for prominent on-screen display
+// after a successful connect — the user can then reach the web portal at this
+// address (or http://viethud.local) from any device on the same network. Returns
+// false (buf empty) when the station isn't connected.
+bool webPortalStaIp(char *buf, size_t cap) {
+    if (cap == 0) return false;
+    buf[0] = '\0';
+    if (WiFi.status() != WL_CONNECTED) return false;
+    IPAddress ip = WiFi.localIP();
+    if (ip == IPAddress(0, 0, 0, 0)) return false;
+    strncpy(buf, ip.toString().c_str(), cap - 1);
+    buf[cap - 1] = '\0';
+    return true;
 }
 
 // STA (internet) connection line for the on-screen Settings + web. Decodes the
@@ -148,6 +234,17 @@ nav a{color:#4AA3FF;margin-right:16px;font-size:13px;text-decoration:none}
 .ctl{margin:14px 0}.ctl button{background:#1E2A38;color:#CFE0F0;border:1px solid #2E3F52;border-radius:6px;padding:8px 12px;margin:4px 6px 0 0;font-size:13px;cursor:pointer}
 .ctl button:hover{background:#28394C}.ctl button.danger{border-color:#7A2E2E;color:#FF9A9A}
 #msg{color:#7C8A9A;font-size:12px;margin-left:6px}
+h2{font-size:15px;color:#fff;margin:0 0 8px}
+.wm{background:#151C24;border-radius:8px;padding:10px;margin:12px 0}
+.wm input{background:#0B0F14;color:#fff;border:1px solid #2E3F52;border-radius:6px;padding:8px;margin:4px 6px 0 0;font-size:13px}
+.wmrow{display:flex;flex-wrap:wrap;align-items:center;margin-top:6px}
+.net{display:flex;justify-content:space-between;align-items:center;background:#0F1620;border:1px solid #24303E;border-radius:6px;padding:7px 10px;margin:4px 0;cursor:pointer}
+.net:hover{background:#182230}.net .r{color:#7C8A9A;font-size:12px}
+.net b{color:#fff;font-weight:600}
+.net .del{color:#FF9A9A;border:1px solid #7A2E2E;border-radius:5px;padding:2px 8px;font-size:12px;cursor:pointer}
+.ota{border-radius:8px;padding:10px 12px;margin:10px 0;font-size:14px;display:none}
+.ota.show{display:block}.ota.new{background:#1E3A24;border:1px solid #2E7D40;color:#9EE6B0}
+.ota button{background:#2E7D40;color:#fff;border:0;border-radius:6px;padding:7px 12px;margin-left:8px;cursor:pointer;font-size:13px}
 </style></head><body>
 <nav><a href="/">Live</a><a href="/triplog">Trip logs</a><a href="/config">Config</a><a href="/update">OTA Update</a></nav>
 <h1>VietHUD - Live Telemetry</h1>
@@ -161,7 +258,50 @@ nav a{color:#4AA3FF;margin-right:16px;font-size:13px;text-decoration:none}
   <span id="msg"></span>
 </div>
 <div id="du" style="margin:8px 0;font-size:13px"></div>
+<div id="ota" class="ota"></div>
+<div class="wm">
+  <h2>WiFi Manager</h2>
+  <div id="wmsaved"></div>
+  <div class="wmrow"><button onclick="wscan(1)">&#128260; Scan WiFi</button><span id="wmmsg" style="color:#7C8A9A;font-size:12px;margin-left:8px"></span></div>
+  <div id="wmscan"></div>
+  <div class="wmrow">
+    <input id="wmssid" placeholder="Ten WiFi (SSID)" size="16">
+    <input id="wmpass" type="password" placeholder="Mat khau" size="14">
+    <button onclick="wadd()">&#10133; Luu &amp; ket noi</button>
+  </div>
+</div>
 <script>
+async function wsaved(){
+  try{const r=await fetch('/api/wifi/saved');const a=await r.json();
+  document.getElementById('wmsaved').innerHTML=a.length? a.map(n=>
+    '<div class="net"><span><b>'+n.ssid+'</b> <span class="r">(da luu)</span></span>'+
+    '<span class="del" onclick="wdel(event,'+n.i+')">Xoa</span></div>').join('')
+    : '<div class="r" style="color:#7C8A9A;font-size:12px">Chua luu mang nao</div>';}catch(e){}
+}
+async function wscan(go){
+  document.getElementById('wmmsg').textContent='dang quet...';
+  try{const r=await fetch('/api/wifi/scan'+(go?'?rescan=1':''));const d=await r.json();
+    if(d.state===-2){document.getElementById('wmmsg').textContent='dang quet...';setTimeout(()=>wscan(0),1200);return;}
+    document.getElementById('wmmsg').textContent=(d.results||[]).length+' mang';
+    document.getElementById('wmscan').innerHTML=(d.results||[]).map(n=>
+     '<div class="net" onclick="pick(\''+n.ssid.replace(/'/g,"\\'")+'\')"><span><b>'+n.ssid+'</b> '+(n.locked?'&#128274;':'&#128275;')+
+     '</span><span class="r">'+n.rssi+' dBm</span></div>').join('');
+  }catch(e){document.getElementById('wmmsg').textContent='loi quet';}
+}
+function pick(s){document.getElementById('wmssid').value=s;document.getElementById('wmpass').focus();}
+async function wadd(){
+  const ssid=document.getElementById('wmssid').value,pass=document.getElementById('wmpass').value;
+  if(!ssid){document.getElementById('wmmsg').textContent='nhap SSID';return;}
+  const b=new URLSearchParams();b.append('ssid',ssid);b.append('password',pass);
+  const r=await fetch('/api/wifi/add',{method:'POST',body:b});
+  document.getElementById('wmmsg').textContent=await r.text();
+  document.getElementById('wmpass').value='';wsaved();
+}
+async function wdel(ev,i){ev.stopPropagation();if(!confirm('Xoa mang da luu?'))return;
+  const b=new URLSearchParams();b.append('idx',i);
+  await fetch('/api/wifi/del',{method:'POST',body:b});wsaved();
+}
+wsaved();
 function card(label, value, cls) {
   return '<div class="card"><div class="label">' + label + '</div><div class="value ' + (cls||'') + '">' + value + '</div></div>';
 }
@@ -219,6 +359,13 @@ async function tick() {
     else if (u.state === 2) du = '<span class="ok">✅ ' + u.msg + '</span>';
     else if (u.state === 3) du = '<span class="bad">⚠ ' + u.msg + '</span>';
     document.getElementById('du').innerHTML = du;
+    // OTA "update available" banner (auto-check compares remote vs local version).
+    const o = d.ota, ob = document.getElementById('ota');
+    if (o && o.available) {
+      ob.className = 'ota new show';
+      ob.innerHTML = '&#127881; Co ban du lieu moi: <b>' + o.remote + '</b> (dang co <b>' + (o.local||'?') +
+        '</b>) <button onclick="if(confirm(\'Tai va ap dung ban cap nhat? Thiet bi se khoi dong lai.\'))act(\'dataupdate\')">Cap nhat ngay</button>';
+    } else { ob.className = 'ota'; ob.innerHTML = ''; }
   } catch (e) { /* transient fetch failure — next tick retries */ }
 }
 tick();
@@ -273,8 +420,9 @@ static void handleApiStatus() {
              "\"speedMap\":{\"loaded\":%s,\"limitValid\":%s,\"limitKmh\":%.0f},"
              "\"cameraAhead\":%s,"
              "\"wifi\":{\"on\":%s,\"apSsid\":\"%s\",\"apIp\":\"%s\",\"clients\":%d,\"staSsid\":\"%s\","
-             "\"staConnected\":%s,\"staIp\":\"%s\",\"rssi\":%d,\"staStatus\":%d,\"ntp\":%s},"
+             "\"staConnected\":%s,\"staIp\":\"%s\",\"rssi\":%d,\"staStatus\":%d,\"ntp\":%s,\"savedCount\":%d},"
              "\"dataUpdate\":{\"state\":%d,\"filesDone\":%d,\"filesTotal\":%d,\"percent\":%d,\"msg\":\"%s\"},"
+             "\"ota\":{\"available\":%s,\"checking\":%s,\"remote\":\"%s\",\"local\":\"%s\"},"
              "\"mem\":{\"freeInternalKB\":%u,\"minFreeInternalKBEver\":%u,\"freePsramKB\":%u}}",
              (unsigned long)millis(), (double)g_boardTempC, gnss.fix ? "true" : "false",
              gnss.linkAlive ? "true" : "false", gnss.satCount, (double)gnss.egoSpeedKmh, (double)gnss.rawSpeedKmh,
@@ -285,8 +433,10 @@ static void handleApiStatus() {
              wifiActuallyEnabled ? "true" : "false", g_apSsid, WiFi.softAPIP().toString().c_str(),
              (int)WiFi.softAPgetStationNum(), cfg.staSsid, staConnected ? "true" : "false",
              staConnected ? WiFi.localIP().toString().c_str() : "", staConnected ? (int)WiFi.RSSI() : 0,
-             (int)WiFi.status(), ntpSynced ? "true" : "false",
+             (int)WiFi.status(), ntpSynced ? "true" : "false", cfg.savedNetworkCount,
              (int)du.state, du.filesDone, du.filesTotal, du.percent, du.message,
+             dataUpdateAvailable() ? "true" : "false", dataUpdateCheckInProgress() ? "true" : "false",
+             dataUpdateRemoteVersion(), dataUpdateLocalVersion(),
              (unsigned)(freeInternal / 1024), (unsigned)(minFreeInternal / 1024), (unsigned)(ESP.getFreePsram() / 1024));
 
     server.send(200, "application/json", statusBuf);
@@ -644,6 +794,9 @@ static void handleApiAction() {
             delay(300);
             dataUpdateSchedule(); // sets NVS flag + reboots; download runs at next boot with RAM free for TLS
         }
+    } else if (a == "otacheck") {
+        server.send(200, "text/plain",
+                    dataUpdateCheckStart() ? "Checking for update..." : "Cannot check (WiFi off / no URL / busy)");
     } else if (a == "reboot") {
         server.sendHeader("Connection", "close");
         server.send(200, "text/plain", "Rebooting...");
@@ -652,6 +805,51 @@ static void handleApiAction() {
     } else {
         server.send(400, "text/plain", "unknown action");
     }
+}
+
+// ---- WiFi Manager web endpoints (2026-09-26) ----
+static String jsonEsc(const char *s) {
+    String o = s;
+    o.replace("\\", "\\\\");
+    o.replace("\"", "\\\"");
+    return o;
+}
+static void handleWifiScan() {
+    if (server.hasArg("rescan")) webPortalStartScan();
+    int st = webPortalScanState();
+    String out = "{\"state\":" + String(st) + ",\"results\":[";
+    if (st >= 0) {
+        for (int i = 0; i < st; i++) {
+            char ss[33]; int rssi = 0; bool locked = false;
+            webPortalScanResult(i, ss, sizeof(ss), &rssi, &locked);
+            if (i) out += ",";
+            out += "{\"ssid\":\"" + jsonEsc(ss) + "\",\"rssi\":" + String(rssi) +
+                   ",\"locked\":" + (locked ? "true" : "false") + "}";
+        }
+    }
+    out += "]}";
+    server.send(200, "application/json", out);
+}
+static void handleWifiSaved() {
+    String out = "[";
+    int n = webPortalSavedCount();
+    for (int i = 0; i < n; i++) {
+        char ss[33]; webPortalSavedNetwork(i, ss, sizeof(ss));
+        if (i) out += ",";
+        out += "{\"i\":" + String(i) + ",\"ssid\":\"" + jsonEsc(ss) + "\"}";
+    }
+    out += "]";
+    server.send(200, "application/json", out);
+}
+static void handleWifiAdd() {
+    String ssid = server.arg("ssid");
+    if (ssid.length() == 0) { server.send(400, "text/plain", "ssid required"); return; }
+    bool ok = webPortalAddNetwork(ssid.c_str(), server.arg("password").c_str());
+    server.send(ok ? 200 : 400, "text/plain", ok ? "Saved. Connecting..." : "Failed (list full?)");
+}
+static void handleWifiDel() {
+    bool ok = webPortalDeleteNetwork(server.arg("idx").toInt());
+    server.send(ok ? 200 : 400, "text/plain", ok ? "Deleted" : "Failed");
 }
 
 // Captive-portal catch-all (feature E): any URL the WebServer doesn't have a
@@ -668,12 +866,112 @@ static void handleCaptiveRedirect() {
 // WiFi.*()/server.begin()/server.stop(), and only ever from webTaskFn()'s
 // own context (see wifiEnabledRequest's comment above for why that
 // matters). A same-target call (already on, asked for on again) is a no-op.
+// Synchronous 2.4GHz scan into the shared g_scan* buffers (web task only). The
+// STA is briefly dropped so a station stuck associating to a missing hotspot
+// doesn't make the scan return 0 results. Returns the number of visible networks.
+static int doScan() {
+    Serial.println("[web] scanning nearby WiFi (2.4GHz)...");
+    esp_task_wdt_reset();
+    WiFi.disconnect(false, false);
+    delay(120);
+    int n = WiFi.scanNetworks(false /*sync*/, false /*skip hidden*/);
+    esp_task_wdt_reset();
+    int m = 0;
+    for (int i = 0; i < n && m < SCAN_MAX; i++) {
+        String ss = WiFi.SSID(i);
+        if (ss.length() == 0) continue;
+        strncpy(g_scanSsid[m], ss.c_str(), 32);
+        g_scanSsid[m][32] = '\0';
+        g_scanRssi[m] = (int8_t)WiFi.RSSI(i);
+        g_scanLocked[m] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) ? 1 : 0;
+        m++;
+    }
+    g_scanCount = m;
+    WiFi.scanDelete();
+    Serial.printf("[web] scan done: %d network(s)\n", m);
+    return m;
+}
+
+// WiFi Manager tick — called each loop while WiFi is on. Connects to the
+// strongest SAVED network currently in range, rotating to the next candidate
+// after ~12s without a link, and re-scanning once all candidates are exhausted.
+// Sets cfg.staSsid/staPassword to whichever network is being attempted so the
+// existing status/diagnostic code keeps reporting the active network.
+static void wmTick() {
+    if (cfg.savedNetworkCount <= 0) return;         // nothing to manage (AP only)
+    if (WiFi.status() == WL_CONNECTED) { g_wmTry = -1; g_wmAttemptMs = 0; return; }  // linked; reconnect fast if it drops
+    uint32_t now = millis();
+    // Rate-limit: while attempting a candidate, wait 12s for it to link; between
+    // (re)scans when nothing was connectable, back off 15s so we don't scan
+    // back-to-back (each scan is ~2-4s and disturbs the AP).
+    uint32_t waitMs = (g_wmTry >= 0) ? 12000 : 15000;
+    if (g_wmAttemptMs != 0 && (uint32_t)(now - g_wmAttemptMs) < waitMs) return;
+
+    if (g_wmTry < 0 || g_wmTry + 1 >= g_wmCandCount) {
+        // (Re)build the candidate list: saved networks present in a fresh scan,
+        // ordered by RSSI (strongest first).
+        int m = doScan();
+        int candRssi[AppConfig::kMaxSavedNetworks];
+        g_wmCandCount = 0;
+        for (int i = 0; i < cfg.savedNetworkCount; i++) {
+            int best = -999;
+            bool present = false;
+            for (int j = 0; j < m; j++) {
+                if (strncmp(cfg.savedNetworks[i].ssid, g_scanSsid[j], 31) == 0) {
+                    present = true;
+                    if (g_scanRssi[j] > best) best = g_scanRssi[j];
+                }
+            }
+            if (present) {
+                g_wmCand[g_wmCandCount] = i;
+                candRssi[g_wmCandCount] = best;
+                g_wmCandCount++;
+            }
+        }
+        // insertion sort by RSSI desc (n <= 5)
+        for (int a = 1; a < g_wmCandCount; a++) {
+            int vi = g_wmCand[a], vr = candRssi[a], b = a - 1;
+            while (b >= 0 && candRssi[b] < vr) {
+                g_wmCand[b + 1] = g_wmCand[b]; candRssi[b + 1] = candRssi[b]; b--;
+            }
+            g_wmCand[b + 1] = vi; candRssi[b + 1] = vr;
+        }
+        g_wmTry = -1;
+        if (g_wmCandCount == 0) {
+            static uint32_t sLastNoneMs = 0;
+            if (now - sLastNoneMs > 10000) {
+                sLastNoneMs = now;
+                Serial.printf("[wm] none of %d saved network(s) in range\n", cfg.savedNetworkCount);
+            }
+            g_wmAttemptMs = now;   // back off before the next scan
+            return;
+        }
+    }
+
+    g_wmTry++;
+    if (g_wmTry >= g_wmCandCount) g_wmTry = 0;
+    int ni = g_wmCand[g_wmTry];
+    strncpy(cfg.staSsid, cfg.savedNetworks[ni].ssid, sizeof(cfg.staSsid) - 1);
+    cfg.staSsid[sizeof(cfg.staSsid) - 1] = '\0';
+    strncpy(cfg.staPassword, cfg.savedNetworks[ni].password, sizeof(cfg.staPassword) - 1);
+    cfg.staPassword[sizeof(cfg.staPassword) - 1] = '\0';
+    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(cfg.staSsid, cfg.staPassword);
+    configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
+    staConnected = false;
+    ntpSynced = false;
+    g_wmAttemptMs = now;
+    Serial.printf("[wm] trying \"%s\" (candidate %d/%d)\n", cfg.staSsid, g_wmTry + 1, g_wmCandCount);
+}
+
 static void applyWifiState(bool enable) {
     if (enable == wifiActuallyEnabled) return;
     if (enable) {
         // AP + optional STATION (feature F): if the user configured a station
         // SSID, join it too (AP_STA) for internet/NTP; otherwise plain AP.
-        bool wantSta = cfg.staSsid[0] != '\0';
+        // WiFi Manager: if any network is saved, come up in AP_STA and let
+        // wmTick() scan + connect to the strongest saved network in range.
+        bool wantSta = cfg.savedNetworkCount > 0 || cfg.staSsid[0] != '\0';
         WiFi.mode(wantSta ? WIFI_AP_STA : WIFI_AP);
         // AP SSID: a user-set custom name, else "VietHUD-XXXX" (last 4 MAC hex)
         // so multiple units don't collide (spec 2.1). "VietHUD" alone counts as
@@ -698,11 +996,11 @@ static void applyWifiState(bool enable) {
                           pwLen == 0 ? "empty" : "too short", (unsigned)pwLen);
         }
         if (wantSta) {
-            WiFi.begin(cfg.staSsid, cfg.staPassword);
             // VN UTC+7; NTP daemon fills the system clock in the background once
             // the station associates — webPortalLocalTime() reads it afterwards.
             configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
-            Serial.printf("[web] STA joining \"%s\" for internet/NTP\n", cfg.staSsid);
+            g_wmTry = -1; g_wmAttemptMs = 0;  // trigger wmTick() to scan + connect the best saved net
+            Serial.printf("[web] STA manager armed (%d saved network(s))\n", cfg.savedNetworkCount);
         }
         server.begin();
         MDNS.end();                 // in case a stale instance is lingering
@@ -745,6 +1043,10 @@ static void webTaskFn(void *) {
     server.on("/update", HTTP_GET, handleUpdateGet);
     server.on("/update", HTTP_POST, handleUpdatePost, handleUpdateUpload);
     server.on("/api/action", HTTP_POST, handleApiAction);       // feature G: control panel
+    server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);      // WiFi Manager: scan
+    server.on("/api/wifi/saved", HTTP_GET, handleWifiSaved);    // WiFi Manager: list saved
+    server.on("/api/wifi/add", HTTP_POST, handleWifiAdd);       // WiFi Manager: add/update
+    server.on("/api/wifi/del", HTTP_POST, handleWifiDel);       // WiFi Manager: delete
     // Common captive-portal probe URLs + a catch-all, all 302 -> portal root.
     server.on("/generate_204", HTTP_GET, handleCaptiveRedirect);       // Android
     server.on("/gen_204", HTTP_GET, handleCaptiveRedirect);           // Android (older)
@@ -766,47 +1068,15 @@ static void webTaskFn(void *) {
         if (wifiActuallyEnabled) {
             if (g_scanReq) {
                 g_scanReq = false;
-                // SYNCHRONOUS scan on the web task: async scanComplete() never
-                // returned while the STA was stuck associating to a missing
-                // hotspot. Blocking here (~2-4s) is fine — the UI is on Core 1.
-                Serial.println("[web] scanning nearby WiFi (2.4GHz)...");
-                esp_task_wdt_reset();
-                // Free the radio: a STA stuck retrying a missing hotspot makes the
-                // scan return 0 results. Disconnect STA (keeps the AP up), scan,
-                // then resume the STA connect if one is configured.
-                WiFi.disconnect(false, false);
-                delay(120);
-                int n = WiFi.scanNetworks(false /*sync*/, false /*skip hidden — blank names are useless to pick*/);
-                esp_task_wdt_reset();
-                if (cfg.staSsid[0]) WiFi.begin(cfg.staSsid, cfg.staPassword); // resume STA after scan
-                int m = 0;
-                for (int i = 0; i < n && m < SCAN_MAX; i++) {
-                    String ss = WiFi.SSID(i);
-                    if (ss.length() == 0) continue; // skip hidden/blank
-                    strncpy(g_scanSsid[m], ss.c_str(), 32);
-                    g_scanSsid[m][32] = '\0';
-                    g_scanRssi[m] = (int8_t)WiFi.RSSI(i);
-                    g_scanLocked[m] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) ? 1 : 0;
-                    m++;
-                }
-                g_scanCount = m;
-                Serial.printf("[web] scan done: %d network(s)\n", m);
-                for (int i = 0; i < m; i++)
-                    Serial.printf("  [%d] %s  %ddBm  %s\n", i, g_scanSsid[i], (int)g_scanRssi[i],
-                                  g_scanLocked[i] ? "locked" : "open");
-                WiFi.scanDelete();
+                doScan();                 // fills g_scan* for the UI picker
+                g_wmTry = -1; g_wmAttemptMs = 0;  // let wmTick() reconnect after the scan drop
             }
             if (g_staReconnectReq) {
                 g_staReconnectReq = false;
-                if (cfg.staSsid[0]) {
-                    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
-                    WiFi.begin(cfg.staSsid, cfg.staPassword);
-                    configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
-                    staConnected = false;
-                    ntpSynced = false;
-                    Serial.printf("[web] STA reconnecting to \"%s\"\n", cfg.staSsid);
-                }
+                g_wmTry = -1; g_wmAttemptMs = 0;  // force a fresh manager cycle (new/changed creds)
             }
+            // WiFi Manager: keep the strongest saved network connected.
+            wmTick();
         }
         if (wifiActuallyEnabled) {
             dnsServer.processNextRequest(); // feature E: captive portal DNS
@@ -819,6 +1089,20 @@ static void webTaskFn(void *) {
                 staConnected = sta;
                 Serial.printf("[web] STA %s%s\n", sta ? "connected, IP=" : "disconnected",
                               sta ? WiFi.localIP().toString().c_str() : "");
+                if (sta) {
+                    // OTA auto-check on connect: probe the remote manifest version
+                    // (downloads nothing else, never reboots). Give the link a
+                    // moment to settle + NTP; a small delay before the first check
+                    // is handled by the periodic timer below rather than blocking here.
+                    g_nextOtaCheckMs = millis() + 8000;
+                }
+            }
+            // OTA auto-check: on connect (above) and then every ~30 min while online.
+            if (sta && cfg.dataUpdateUrl[0] && (int32_t)(millis() - g_nextOtaCheckMs) >= 0) {
+                if (dataUpdateCheckStart())
+                    g_nextOtaCheckMs = millis() + 30UL * 60UL * 1000UL;
+                else
+                    g_nextOtaCheckMs = millis() + 60UL * 1000UL; // busy/not-ready: retry in 1 min
             }
             // Diagnostic: while a station is configured but NOT connected, log the
             // reason every ~5s. WL_NO_SSID_AVAIL usually means the hotspot is off,
