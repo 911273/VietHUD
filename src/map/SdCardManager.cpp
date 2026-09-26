@@ -94,9 +94,16 @@ static int trafficSignCount = 0;
 // segNameWidth records how wide each seg_names.bin entry is (2 for legacy v1
 // cards, 4 for v2), so an old card still reads correctly. See the names.bin
 // loader for the exact v1/v2 header layouts.
+//
+// NOT loaded into PSRAM any more (2026-09-26): the nationwide names.bin is a
+// ~1.7 MB pool + ~0.25 MB offsets, which filled PSRAM so completely that
+// allocations spilled into internal RAM and the WiFi driver could no longer
+// start (esp_wifi_init ESP_ERR_NO_MEM, then a crash in hostap attach). The only
+// consumer is the current-road label, which changes a few times a minute and
+// is cached per segment, so each name is read straight from the card instead.
 static uint32_t roadNameCount = 0;
-static uint32_t *roadNameOffsets = NULL;
-static char *roadNamePool = NULL;
+static uint32_t roadNameOffsetsBase = 0; // file offset of the u32 offsets table
+static uint32_t roadNamePoolBase = 0;    // file offset of the UTF-8 string pool
 static size_t roadNamePoolSize = 0;
 static uint8_t segNameWidth = 2; // bytes per seg_names.bin entry: v1=2, v2=4
 
@@ -349,12 +356,9 @@ bool sdMgrMount() {
     }
     Serial.printf("[sdmgr] signs.bin: %d traffic sign(s) loaded\n", trafficSignCount);
 
-    // names.bin - loaded into PSRAM for road name display
-    if (roadNameOffsets) { heap_caps_free(roadNameOffsets); roadNameOffsets = NULL; }
-    if (roadNamePool) { heap_caps_free(roadNamePool); roadNamePool = NULL; }
+    // names.bin — header only; names are read on demand (sdMgrGetRoadName).
     roadNameCount = 0;
     roadNamePoolSize = 0;
-
     segNameWidth = 2;
     File nameFile = SD_MMC.open("/speedmap/names.bin");
     if (nameFile) {
@@ -363,7 +367,7 @@ bool sdMgrMount() {
         uint32_t count = 0, totalBytes = 0;
         if (nameFile.read((uint8_t *)magic, 4) == 4 && memcmp(magic, "VNNM", 4) == 0) {
             nameFile.read((uint8_t *)&version, 2);
-            // Header layouts, both 16 bytes total after magic+version:
+            // Header layouts, both 16 bytes total including magic+version:
             //   v1: count(u16) totalBytes(u32) reserved(u32)   — seg_names entries are u16
             //   v2: count(u32) totalBytes(u32) reserved(u16)   — seg_names entries are u32
             // v2 lifts the 65 535-name ceiling for the full-VN dataset. Old v1
@@ -383,36 +387,20 @@ bool sdMgrMount() {
                 count = count16;
                 segNameWidth = 2;
             }
-
-            // Sanity ceilings (raised for v2): a corrupt header must not trigger a
-            // wild allocation. Real full-VN data stays far below these; if it ever
-            // legitimately exceeds PSRAM the heap_caps_malloc NULL-check below
-            // fails gracefully (names simply don't load) rather than crashing.
-            if (count > 0 && totalBytes > 0 && count < 5000000u && totalBytes < 16000000u) {
-                roadNameOffsets = (uint32_t *)heap_caps_malloc(count * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
-                roadNamePool = (char *)heap_caps_malloc(totalBytes, MALLOC_CAP_SPIRAM);
-                if (roadNameOffsets && roadNamePool) {
-                    nameFile.read((uint8_t *)roadNameOffsets, count * sizeof(uint32_t));
-                    nameFile.read((uint8_t *)roadNamePool, totalBytes);
-                    // Defensive: force a terminator on the very last byte so any
-                    // string returned by sdMgrGetRoadName() (which only checks that
-                    // its START offset is < poolSize) is guaranteed to be
-                    // NUL-terminated within the buffer. Without this, a truncated
-                    // or corrupt names.bin (e.g. an interrupted OTA) whose last
-                    // string lacks a terminator would let strncpy/label rendering
-                    // read past the pool end — an OOB read on the constantly-used
-                    // road-name display path. Costs one string entry at worst.
-                    roadNamePool[totalBytes - 1] = '\0';
-                    roadNameCount = count;
-                    roadNamePoolSize = totalBytes;
-                    Serial.printf("[sdmgr] names.bin v%u: %u street names loaded (%u bytes string pool, seg id width %uB)\n",
-                                  (unsigned)version, (unsigned)roadNameCount, (unsigned int)roadNamePoolSize,
-                                  (unsigned)segNameWidth);
-                } else {
-                    if (roadNameOffsets) { heap_caps_free(roadNameOffsets); roadNameOffsets = NULL; }
-                    if (roadNamePool) { heap_caps_free(roadNamePool); roadNamePool = NULL; }
-                    Serial.println("[sdmgr] PSRAM allocation for road names failed");
-                }
+            // Sanity: the file must actually contain the table + pool it declares
+            // (a truncated/corrupt names.bin simply disables street names).
+            uint32_t offBase = 16, poolBase = 16 + count * 4;
+            if (count > 0 && totalBytes > 0 && count < 5000000u && totalBytes < 16000000u &&
+                nameFile.size() >= (size_t)poolBase + totalBytes) {
+                roadNameCount = count;
+                roadNameOffsetsBase = offBase;
+                roadNamePoolBase = poolBase;
+                roadNamePoolSize = totalBytes;
+                Serial.printf("[sdmgr] names.bin v%u: %u street names (read on demand, %u KB on card, seg id width %uB)\n",
+                              (unsigned)version, (unsigned)roadNameCount, (unsigned)(roadNamePoolSize / 1024),
+                              (unsigned)segNameWidth);
+            } else {
+                Serial.println("[sdmgr] names.bin header/size mismatch — street names disabled");
             }
         }
         nameFile.close();
@@ -766,15 +754,25 @@ bool sdMgrFindTileEntry(uint32_t tileId, TileIndexEntry *outEntry) {
     return found;
 }
 
+// Returns a pointer to a static buffer, valid until the next call (the only
+// caller, sdMgrGetSegmentRoadName, copies it immediately). Two small SD reads:
+// the u32 offset, then up to 95 bytes of the NUL-terminated UTF-8 string.
 const char *sdMgrGetRoadName(uint32_t nameId) {
-    if (nameId == 0 || nameId > roadNameCount || !roadNameOffsets || !roadNamePool) {
-        return "";
+    static char buf[96];
+    buf[0] = '\0';
+    if (nameId == 0 || nameId > roadNameCount) return buf;
+    uint32_t offset = 0;
+    if (!sdMgrReadBytes("/speedmap/names.bin", roadNameOffsetsBase + (nameId - 1) * 4, (uint8_t *)&offset, 4) ||
+        offset >= roadNamePoolSize)
+        return buf;
+    size_t n = roadNamePoolSize - offset;
+    if (n > sizeof(buf) - 1) n = sizeof(buf) - 1;
+    if (!sdMgrReadBytes("/speedmap/names.bin", roadNamePoolBase + offset, (uint8_t *)buf, n)) {
+        buf[0] = '\0';
+        return buf;
     }
-    uint32_t offset = roadNameOffsets[nameId - 1];
-    if (offset < roadNamePoolSize) {
-        return roadNamePool + offset;
-    }
-    return "";
+    buf[n] = '\0'; // strings are NUL-terminated in the pool; this bounds a corrupt one
+    return buf;
 }
 
 // Copy up to dstCap-1 bytes of a UTF-8 string, but never split a multi-byte

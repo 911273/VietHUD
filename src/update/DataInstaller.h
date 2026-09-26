@@ -97,3 +97,6 @@ bool installerVerifySignature(const char *text, size_t len, const char *sigB64);
 
 bool installerRolledBackThisBoot();   // a crash-loop rollback happened in bootApply()
 bool installerTakeWifiOnRequest();    // read-and-clear: bring WiFi up after an install reboot
+
+// "YYYY.MM.DD.HHMM..." release ordering: true only if both are dated and a < b.
+bool installerVersionOlder(const char *a, const char *b);

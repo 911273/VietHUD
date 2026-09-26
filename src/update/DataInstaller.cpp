@@ -10,6 +10,7 @@
 #include <mbedtls/sha256.h>
 #include <string.h>
 #include <strings.h>      // strcasecmp()
+#include <ctype.h>        // isdigit()
 
 // Public half of the manifest signing key (private half: ~/.viethud/
 // manifest_signing_key.pem on the PC / the Pi pipeline — tools/sign_manifest.py).
@@ -305,6 +306,12 @@ int installerOpenSession(const char *text, size_t len, const char *sigB64, char 
     if (sdMgrExists(APPLIED)) return fail(409, "Đang xác nhận bản vừa cài — thử lại sau 1 phút");
     if (!text || len == 0 || len > kMaxManifest) return fail(400, "Manifest không hợp lệ");
     if (!installerVerifySignature(text, len, sigB64)) return fail(401, "Chữ ký dữ liệu không hợp lệ");
+    {   // Never downgrade: release versions are "YYYY.MM.DD.HHMM" (lexicographic = chronological).
+        char rv[24] = "", lv[24] = "";
+        sscanf(text, "version %23s", rv);
+        installerLocalVersion(lv, sizeof(lv));
+        if (installerVersionOlder(rv, lv)) return fail(409, "Bản phát hành cũ hơn dữ liệu đang dùng");
+    }
 
     char mSha[65];
     sha256Hex(text, len, mSha);
@@ -757,6 +764,16 @@ void installerLocalVersion(char *out, size_t cap) {
         strncpy(out, v, cap - 1);
         out[cap - 1] = '\0';
     }
+}
+
+// True only when BOTH are dated release versions ("2026.09.26.0221...") and a < b.
+// Anything else (missing local manifest, hand-made version) is not "older".
+bool installerVersionOlder(const char *a, const char *b) {
+    auto dated = [](const char *v) {
+        return strlen(v) >= 10 && isdigit((unsigned char)v[0]) && isdigit((unsigned char)v[3]) && v[4] == '.' &&
+               v[7] == '.';
+    };
+    return a && b && dated(a) && dated(b) && strcmp(a, b) < 0;
 }
 
 int installerDatasetCount() { return kDatasetCount; }

@@ -281,7 +281,10 @@ static void checkTask(void *) {
     readLocalVersion(s_localVersion, sizeof(s_localVersion));
     if (httpGetText(base + DU_MANIFEST_NAME, remoteText)) {
         extractVersion(remoteText.c_str(), s_remoteVersion, sizeof(s_remoteVersion));
-        bool newer = s_remoteVersion[0] && strcmp(s_remoteVersion, s_localVersion) != 0;
+        // "Update available" only for a NEWER release — a card carrying a more
+        // recent local build must not be nagged into a downgrade.
+        bool newer = s_remoteVersion[0] && strcmp(s_remoteVersion, s_localVersion) != 0 &&
+                     !installerVersionOlder(s_remoteVersion, s_localVersion);
         s_updateAvailable = newer;
         Serial.printf("[dataupd] check: local=\"%s\" remote=\"%s\" -> %s\n",
                       s_localVersion, s_remoteVersion,
