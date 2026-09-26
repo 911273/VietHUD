@@ -12,7 +12,7 @@
 #include "net/WebPortal.h"
 #include "audio/AudioPlayer.h"
 
-LV_FONT_DECLARE(lv_font_montserrat_speed); // webPortalIsEnabled()/webPortalRequestEnable() — the 4s hold gesture toggles WiFi
+LV_FONT_DECLARE(lv_font_montserrat_speed); // big speed digits
 #include "driver/temp_sensor.h" // ESP32-S3 die sensor with selectable range (readDieTempC)
 LV_FONT_DECLARE(lv_font_vn_14); // Vietnamese-capable text font (Arial 14px, ASCII+VN); drop-in for montserrat_14
 LV_FONT_DECLARE(lv_font_vn_20); // same at 20px — landscape top bar (matches the 20px bottom-corner readouts)
@@ -337,10 +337,9 @@ static lv_obj_t *bottomInfoLabel;
 // refreshDashboard()'s own comment on this overlay.
 static lv_obj_t *speedingFlashOverlay;
 
-// --- WiFi on/off gesture toast (see onDashLongPressedRepeat()/showWifiToast() below) ---
+// --- Small centred toast (map zoom level) ---
 static lv_obj_t *wifiToastLabel;
 static uint32_t wifiToastUntilMs = 0;
-static void showWifiToast(bool on); // defined below buildDashboard(), called from onDashLongPressedRepeat() above it
 
 // Long-press-to-open-Settings feedback: a ring that sweeps closed over the
 // hold duration, so a press registers visually right away instead of the
@@ -356,15 +355,10 @@ static void hideHoldRing() {
     lv_obj_add_flag(holdRing, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Two gestures share the same press-and-hold on dashRoot, distinguished by
-// duration: ~1s (HOLD_PRESS_MS, the existing ring animation's own duration,
-// user-requested 2026-09-14) opens Settings; holding to 4s+ instead toggles
-// WiFi. The longer tier suppresses the shorter one on release — a 4s WiFi
-// hold doesn't ALSO open Settings. LVGL's indev only exposes ONE long-press
-// threshold directly (lv_indev_set_long_press_time(), already used for the
-// 1s point) — the 4s point is measured by hand from pressStartMs, sampled
-// on LV_EVENT_LONG_PRESSED_REPEAT (which LVGL fires periodically for as
-// long as the press continues past the 1s mark).
+// Dashboard touch: a short tap cycles the map zoom; holding ~1s
+// (HOLD_PRESS_MS, the ring animation's duration) opens Settings on release.
+// The old 4s hold that toggled WiFi was removed 2026-09-26 (user request) —
+// WiFi is switched only from Settings > WiFi now.
 //
 // A third tier (2s hold) and a double-tap gesture used to live here too,
 // both toggling cfg.simpleUiMode (a radar-target-distance display mode) —
@@ -372,8 +366,6 @@ static void hideHoldRing() {
 // out entirely (there's no more target distance for that mode to show).
 static uint32_t pressStartMs = 0;
 static bool longPressFired = false;    // past the 1s mark at least
-static bool wifiToggledThisPress = false; // past the 4s mark — latched so it can't fire twice for one press
-static const uint32_t kWifiHoldMs = 4000;
 
 // Guards onDashReleasedOrLost's body from running more than once per
 // physical press. LVGL can fire BOTH LV_EVENT_RELEASED and LV_EVENT_PRESS_LOST
@@ -400,29 +392,15 @@ static void onDashPressed(lv_event_t *e) {
 
     pressStartMs = millis();
     longPressFired = false;
-    wifiToggledThisPress = false;
     releaseHandledThisPress = false;
 }
 
 static void onDashLongPressed(lv_event_t *) { longPressFired = true; }
 
-static void onDashLongPressedRepeat(lv_event_t *) {
-    uint32_t heldMs = millis() - pressStartMs;
-    if (wifiToggledThisPress) return;
-    if (heldMs < kWifiHoldMs) return;
-    wifiToggledThisPress = true;
-    hideHoldRing();
-    bool nowOn = !webPortalIsEnabled();
-    webPortalRequestEnable(nowOn);
-    Serial.printf("[uidemo] WiFi %s via 4s hold gesture\n", nowOn ? "ON" : "OFF");
-    showWifiToast(nowOn);
-}
-
 static void onDashReleasedOrLost(lv_event_t *) {
     hideHoldRing();
     if (releaseHandledThisPress) return;
     releaseHandledThisPress = true;
-    if (wifiToggledThisPress) return;
     if (longPressFired) {
         lv_screen_load(settingsScreen);
         return;
@@ -1144,7 +1122,6 @@ void buildDashboard() {
     lv_obj_add_flag(dashRoot, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(dashRoot, onDashPressed, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(dashRoot, onDashLongPressed, LV_EVENT_LONG_PRESSED, NULL);
-    lv_obj_add_event_cb(dashRoot, onDashLongPressedRepeat, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
     lv_obj_add_event_cb(dashRoot, onDashReleasedOrLost, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(dashRoot, onDashReleasedOrLost, LV_EVENT_PRESS_LOST, NULL);
 
@@ -1233,11 +1210,6 @@ void buildDashboard() {
     applyTheme(true); // initial default matches GnssSnapshot's own daytime=true default, until a real fix says otherwise
 }
 
-static void showWifiToast(bool on) {
-    lv_label_set_text(wifiToastLabel, on ? "WiFi ON" : "WiFi OFF");
-    lv_obj_clear_flag(wifiToastLabel, LV_OBJ_FLAG_HIDDEN);
-    wifiToastUntilMs = millis() + 1500;
-}
 
 // Day/Night color theme for the chrome — background, captions, primary
 // readouts, gear icon, column dividers, bottom info bar (user-requested
@@ -1309,7 +1281,7 @@ static void queueSpeedVoice(float kmh) {
 }
 
 void refreshDashboard() {
-    // Auto-hide the WiFi toggle toast (see showWifiToast()) — checked here
+    // Auto-hide the zoom-level toast — checked here
     // rather than a dedicated timer since refreshDashboard() already runs
     // every 150ms while the Dashboard is visible, same reasoning as every
     // other "reuse the existing tick" gate in this function.
