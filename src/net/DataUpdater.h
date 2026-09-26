@@ -22,7 +22,7 @@ enum DataUpdateState : uint8_t {
 
 struct DataUpdateStatus {
     DataUpdateState state;
-    char message[64];  // human-readable current step or error reason
+    char message[96];  // human-readable current step or error reason (UTF-8 Vietnamese)
     int filesTotal;    // files that need updating this run
     int filesDone;     // files completed so far
     int percent;       // 0..100 progress of the CURRENT file

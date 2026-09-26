@@ -140,3 +140,17 @@ int sdMgrDeleteAllTripLogs();
 bool sdMgrAppendBytes(const char *path, const uint8_t *buf, size_t len);
 bool sdMgrRemove(const char *path);              // true if gone (incl. already-absent)
 bool sdMgrRename(const char *from, const char *to); // removes an existing target first
+
+// ---- Data-install primitives (Phone Update Bridge / online update) ----
+// See src/update/DataInstaller.cpp. One streaming writer at a time.
+bool sdMgrWriterOpen(const char *path, bool append);
+bool sdMgrWriterWrite(const uint8_t *buf, size_t len);
+void sdMgrWriterClose();
+int64_t sdMgrFileSize(const char *path);   // -1 if missing
+bool sdMgrExists(const char *path);
+bool sdMgrMkdir(const char *path);         // true if it exists afterwards
+bool sdMgrMove(const char *from, const char *to); // plain rename, never deletes the target
+uint64_t sdMgrFreeBytes();
+bool sdMgrWriteSmallFile(const char *path, const void *data, size_t len); // truncate + write
+bool sdMgrSha256File(const char *path, uint8_t out[32], void (*tick)());  // readback hash
+int sdMgrClearDir(const char *dir);             // remove all files in dir (non-recursive)

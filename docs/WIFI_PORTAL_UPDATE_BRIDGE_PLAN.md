@@ -597,3 +597,54 @@ Mục đích: biết iPhone của bạn xử lý trường hợp **xấu nhất*
 Còn phải kiểm (test 1b, không cần flash): đóng sheet CNA (chọn "Dùng không có Internet"), rồi mở **cả hai URL trong Safari**, xác nhận thanh trạng thái vẫn "4G". Lý do: bản thân CNA chỉ đi qua Wi-Fi nên **không được** chạy cập nhật trong đó; và cần biết iOS có đổi primary sang Wi-Fi sau khi đóng CNA hay không. Kết quả 1b sẽ chốt profile: nếu vẫn "4G" thì có thể giữ captive (có popup tự mở) cho phần cấu hình, chỉ cần trang trong CNA hướng người dùng mở Safari để cập nhật; nếu đổi sang Wi-Fi thì chuyển sang profile Bridge (§19.3).
 
 Phụ: ảnh Live cho thấy STA đang "dang ket noi \"VuPQ\"..." trong lúc test → `wmTick()` đang quét/nối lại (điểm C2). Nó không làm hỏng test này, nhưng phải chặn khi có phiên upload.
+
+---
+
+## 20. Trạng thái triển khai (2026-09-26, firmware 2.1.0, branch `feature/update-bridge`)
+
+Test 1b trên iPhone (người dùng xác nhận): mở portal bằng Safari sau khi đóng cửa sổ Captive → vẫn dùng 4G ⇒ **giữ captive profile** (popup tự mở cho phần cấu hình), cập nhật chạy trong Safari; không cần đổi DHCP.
+
+### Đã làm
+
+| Hạng mục | File |
+|---|---|
+| Staging + chữ ký ECDSA P-256 + commit journal + cài lúc boot + rollback (mount lỗi / 3 lần boot không xác nhận) + xác nhận sau 30 s | `src/update/DataInstaller.{h,cpp}` |
+| API `/api/v1/{ping, update/state, update/session (POST/GET/DELETE), update/file (PUT raw), update/commit, update/direct}` + CSRF header `X-VietHUD` | `src/net/UpdateApi.{h,cpp}` |
+| Portal SPA mới (Dữ liệu / Trạng thái / Cài đặt / Wi-Fi / Hệ thống), SHA-256 JS, upload resumable, B3 chọn tệp | `src/net/PortalPage.h` |
+| Mode A dùng chung installer (chữ ký, Range resume, staging) + màn update-mode tiếng Việt có thanh tiến độ, thử lần lượt mọi mạng đã lưu | `src/net/DataUpdater.cpp`, `src/main_viethud.cpp` |
+| SD: writer giữ handle, gom ghi 32 KB PSRAM, readback SHA, free space, clear dir | `src/map/SdCardManager.cpp` |
+| C2/C6: tạm dừng wmTick + scan + auto-off khi đang cập nhật; WDT feed trong raw handler; webTask stack 8→12 KB; `WiFi.setSleep(false)` | `src/net/WebPortal.cpp` |
+| Mật khẩu AP ngẫu nhiên thay `12345678` (migration cfgVer 3) | `src/core/NvsStore.cpp` |
+| Màn QR 2 mã (vào Wi-Fi / mở trang) + trạng thái nhận dữ liệu + thanh tiến độ; nhãn tiến độ nổi trên Dashboard; màn "ĐÃ CẬP NHẬT / KHÔI PHỤC DỮ LIỆU CŨ" lúc boot | `src/ui/Settings.cpp`, `src/main_viethud.cpp` |
+| Firmware OTA rollback (`verifyRollbackLater` + mark valid sau 30 s) | `src/main_viethud.cpp` |
+| Ký manifest: `tools/sign_manifest.py`; pipeline OSM tự ký; `speedmap/manifest.txt.sig` đã publish | `tools/`, GitHub `main` |
+
+### Phát hiện khi test trên thiết bị thật (đã sửa)
+
+- **Mỗi request upload tốn cố định ~5 s**: WebServer đọc body bằng `readBytes(buf,1436)` và chờ hết timeout 5 s cho phần đuôi < 1436 B. Sửa: client gửi chunk bội số 1436 B; thiết bị hạ timeout đọc còn 800 ms (`PortalServer::setCurrentReadTimeoutMs`). 64 KB: 5,4 s → 0,33 s.
+- **Modem sleep STA** làm RTT 27–191 ms → `WiFi.setSleep(false)` khi Wi-Fi bật (RTT còn ~9 ms).
+- Ghi SD từng mảnh 1,4 KB → gom 32 KB.
+- Sau rollback+reboot không hiện thông báo → cờ NVS `rbShow`.
+
+### Kết quả test (PC đóng vai điện thoại qua hotspot 2.4 GHz; JS portal thật chạy trong Node)
+
+| Ca | Kết quả |
+|---|---|
+| Không header CSRF / chữ ký sai / manifest bị sửa | 403 / 401 / 401 ✓ |
+| Tệp đúng kích thước nhưng sai nội dung | commit 422, part bị xoá, gửi lại ✓ |
+| Rớt kết nối giữa chunk (đóng socket ở 50 KB) | giữ 312 144 B, resume đúng offset; offset cũ → 409 ✓ |
+| Cài qua journal + reboot + Wi-Fi tự bật lại + portal báo hoàn tất | ✓ (2 MB: 45 s tổng, gồm reboot) |
+| `metadata.bin` hỏng nhưng ký hợp lệ | mount lỗi → tự rollback → dữ liệu gốc, màn "KHÔI PHỤC" ✓ |
+| Manifest mới, dữ liệu giống hệt | adopt manifest, không truyền gì ✓ |
+| Mode A (VietHUD tự tải qua Wi-Fi) | update-mode → chữ ký → tải 1,9 MB/33 s → cài lúc boot ✓ |
+| B3 (chọn tệp, không Internet) | ✓ |
+| Điện thoại không có Internet | "Không có Internet — cấu hình vẫn dùng bình thường", không lỗi ✓ |
+| Crash / reset ngoài ý muốn trong toàn bộ phiên test | 0 |
+
+Thông lượng upload (qua STA/hotspot PC): ~170–220 KB/s mạng, ~110 KB/s tính cả ghi SD. Qua AP trực tiếp với điện thoại dự kiến ≥ mức này.
+
+### Còn lại / lưu ý vận hành
+
+- **Mọi lần phát hành `manifest.txt` phải ký** (`tools/sign_manifest.py`). Job phát hành tự động trên Pi (`/home/admin/viethud-pipeline`, 02:00 hằng ngày) hiện chưa ký ⇒ sau lần chạy tới, VietHUD sẽ từ chối bản mới ("Chữ ký dữ liệu không hợp lệ") cho tới khi manifest được ký lại. Pipeline OSM/ODbL (`tools/viethud-pipeline`) đã tự ký.
+- Chưa làm: chữ ký cho firmware OTA (`/update` vẫn nhận `.bin` không ký — đã có rollback), gói `.vhpkg` một tệp (B3 hiện chọn nhiều tệp), B2 (không cần vì iPhone chạy B1).
+- Chưa test trên Android thật.

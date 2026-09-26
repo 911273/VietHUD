@@ -9,6 +9,8 @@
 #include "map/SpeedLimitManager.h" // speedSourceStr() — Speed Map group in the Sensors tab
 #include "net/WebPortal.h"    // webPortalIsEnabled()/webPortalRequestEnable() — WiFi tab
 #include "net/DataUpdater.h"  // dataUpdateStart()/GetStatus() — WiFi tab "Update data" button
+#include "net/UpdateApi.h"    // updateApiBusy() — a phone is pushing data right now
+#include "update/DataInstaller.h" // installerProgress() — phone->device transfer progress
 #include <string.h>
 
 // ---------------------------------------------------------------------
@@ -235,116 +237,210 @@ static void onWifiScanClose(lv_event_t *) {
     lv_screen_load(dashboardScreen);
 }
 
+// Layout for the 480x320 landscape panel:
+//   [QR1 join WiFi][QR2 open portal][ device WiFi name / password / address ]
+//   [ status line (phone connected / receiving 62% / verifying ...)  ][ Đóng ]
+//   [ progress bar                                                    ]
+static lv_obj_t *wifiQrUrlObj = nullptr;      // second QR: http://192.168.4.1
+static lv_obj_t *bridgeBar = nullptr;         // phone -> device transfer progress
+static lv_obj_t *bridgeToast = nullptr;       // small pill on lv_layer_top() while a phone is updating
+
+static lv_obj_t *makeQrCaption(lv_obj_t *parent, const char *txt, int x, int y, int w) {
+    lv_obj_t *l = lv_label_create(parent);
+    lv_obj_set_width(l, w);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(0xCCD6E0), 0);
+    lv_label_set_text(l, txt);
+    lv_obj_set_pos(l, x, y);
+    return l;
+}
+
+static lv_obj_t *makeQr(lv_obj_t *parent, int size, int x, int y) {
+    lv_obj_t *q = lv_qrcode_create(parent);
+    lv_qrcode_set_size(q, size);
+    lv_qrcode_set_dark_color(q, lv_color_black());
+    lv_qrcode_set_light_color(q, lv_color_white());
+    lv_obj_set_style_border_color(q, lv_color_white(), 0);
+    lv_obj_set_style_border_width(q, 5, 0); // quiet zone so phone cameras lock on
+    lv_obj_set_pos(q, x, y);
+    return q;
+}
+
 static void buildWifiScanOverlay(lv_obj_t *parent) {
+    int W = gfx->width(), Hh = gfx->height();
     wifiScanOverlay = lv_obj_create(parent);
     lv_obj_set_pos(wifiScanOverlay, 0, 0);
-    lv_obj_set_size(wifiScanOverlay, gfx->width(), gfx->height());
+    lv_obj_set_size(wifiScanOverlay, W, Hh);
     lv_obj_set_style_bg_color(wifiScanOverlay, lv_color_hex(0x0B0F14), 0);
     lv_obj_set_style_bg_opa(wifiScanOverlay, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(wifiScanOverlay, 0, 0);
     lv_obj_set_style_radius(wifiScanOverlay, 0, 0);
+    lv_obj_set_style_pad_all(wifiScanOverlay, 0, 0);
     lv_obj_clear_flag(wifiScanOverlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *title = lv_label_create(wifiScanOverlay);
-    lv_label_set_text(title, "Cai WiFi bang dien thoai");
+    lv_label_set_text(title, LV_SYMBOL_WIFI "  Kết nối điện thoại");
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_set_pos(title, 8, 6);
+    lv_obj_set_pos(title, 12, 8);
 
-    // QR (left): the phone camera scans this to JOIN the device's own hotspot.
-    int qsz = gfx->height() - 78;
-    if (qsz > 208) qsz = 208;
-    if (qsz < 120) qsz = 120;
-    wifiQrObj = lv_qrcode_create(wifiScanOverlay);
-    lv_qrcode_set_size(wifiQrObj, qsz);
-    lv_qrcode_set_dark_color(wifiQrObj, lv_color_black());
-    lv_qrcode_set_light_color(wifiQrObj, lv_color_white());
-    lv_obj_set_style_border_color(wifiQrObj, lv_color_white(), 0);
-    lv_obj_set_style_border_width(wifiQrObj, 4, 0); // quiet zone so scanners lock on
-    lv_obj_set_pos(wifiQrObj, 10, 32);
+    // Two QRs side by side: (1) join the device hotspot, (2) open the portal in
+    // the REAL browser (Camera -> Safari), not the captive mini-window, which on
+    // iPhone has no 4G access and can't run the data update.
+    int qsz = (Hh - 150);
+    if (qsz > 140) qsz = 140;
+    if (qsz < 96) qsz = 96;
+    int qy = 36, gap = 18;
+    wifiQrObj = makeQr(wifiScanOverlay, qsz, 12, qy);
     lv_qrcode_update(wifiQrObj, "WIFI:;", 6); // placeholder until wifiQrRebuild()
+    wifiQrUrlObj = makeQr(wifiScanOverlay, qsz, 12 + qsz + 10 + gap, qy);
+    static const char kPortalUrl[] = "http://192.168.4.1";
+    lv_qrcode_update(wifiQrUrlObj, kPortalUrl, strlen(kPortalUrl));
+    int capY = qy + qsz + 14;
+    makeQrCaption(wifiScanOverlay, "1. Quét để vào Wi-Fi", 2, capY, qsz + 20);
+    makeQrCaption(wifiScanOverlay, "2. Quét để mở trang", 12 + qsz + 10 + gap - 10, capY, qsz + 20);
 
-    // Right column: numbered steps + live AP/connection info + saved list.
-    int rx = qsz + 26;
-    int rw = gfx->width() - rx - 8;
-
-    lv_obj_t *steps = lv_label_create(wifiScanOverlay);
-    lv_label_set_long_mode(steps, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(steps, rw);
-    lv_obj_set_style_text_color(steps, lv_color_hex(0xCCD6E0), 0);
-    lv_label_set_text(steps,
-        "1. Quet ma QR bang camera dien thoai de vao WiFi cua thiet bi.\n"
-        "2. Trinh duyet tu mo trang cai (neu khong, vao 192.168.4.1).\n"
-        "3. Chon WiFi cua ban + nhap mat khau tren dien thoai.\n"
-        "4. Xong: thiet bi TU ket noi & kiem tra cap nhat.");
-    lv_obj_set_pos(steps, rx, 32);
-
-    // AP credentials (for manual join) + live STA connection status.
-    scanConnLbl = lv_label_create(wifiScanOverlay);
-    lv_label_set_long_mode(scanConnLbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(scanConnLbl, rw);
-    lv_obj_set_style_text_color(scanConnLbl, lv_color_hex(0x66CC88), 0);
-    lv_obj_set_pos(scanConnLbl, rx, 148);
-
+    // Right column: the same credentials in text, for a manual join.
+    int rx = 12 + 2 * (qsz + 10) + gap + 14;
+    int rw = W - rx - 10;
     scanSavedLbl = lv_label_create(wifiScanOverlay);
     lv_label_set_long_mode(scanSavedLbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(scanSavedLbl, rw);
-    lv_obj_set_style_text_color(scanSavedLbl, lv_color_hex(0x8FA0B4), 0);
-    lv_obj_set_pos(scanSavedLbl, rx, 214);
+    lv_obj_set_style_text_color(scanSavedLbl, lv_color_hex(0xCCD6E0), 0);
+    lv_obj_set_style_text_line_space(scanSavedLbl, 3, 0);
+    lv_obj_set_pos(scanSavedLbl, rx, qy);
+
+    // Bottom: live status (phone connected / transfer progress / VietHUD's own
+    // internet), a progress bar for the phone->device transfer, and Close.
+    int by = capY + 26;
+    int btnW = rw > 120 ? rw : 120;
+    scanConnLbl = lv_label_create(wifiScanOverlay);
+    lv_label_set_long_mode(scanConnLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(scanConnLbl, W - btnW - 34);
+    lv_obj_set_style_text_color(scanConnLbl, lv_color_hex(0x8FA0B4), 0);
+    lv_obj_set_pos(scanConnLbl, 12, by);
+
+    bridgeBar = lv_bar_create(wifiScanOverlay);
+    lv_obj_set_size(bridgeBar, W - btnW - 34, 10);
+    lv_obj_set_pos(bridgeBar, 12, Hh - 22);
+    lv_obj_set_style_bg_color(bridgeBar, lv_color_hex(0x1E2A38), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bridgeBar, lv_color_hex(0x3DA5FF), LV_PART_INDICATOR);
+    lv_bar_set_range(bridgeBar, 0, 100);
+    lv_obj_add_flag(bridgeBar, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *closeBtn = lv_button_create(wifiScanOverlay);
-    lv_obj_set_size(closeBtn, rw, 32);
-    lv_obj_set_pos(closeBtn, rx, gfx->height() - 40);
-    lv_obj_set_style_bg_color(closeBtn, lv_color_hex(0x44505C), 0);
+    lv_obj_set_size(closeBtn, btnW, 40);
+    lv_obj_set_pos(closeBtn, W - btnW - 10, Hh - 50);
+    lv_obj_set_style_bg_color(closeBtn, lv_color_hex(0x2A3644), 0);
+    lv_obj_set_style_radius(closeBtn, 10, 0);
     lv_obj_add_event_cb(closeBtn, onWifiScanClose, LV_EVENT_CLICKED, NULL);
     lv_obj_t *closeLbl = lv_label_create(closeBtn);
-    lv_label_set_text(closeLbl, "Dong");
+    lv_label_set_text(closeLbl, "Đóng");
     lv_obj_center(closeLbl);
 }
 
+// Human text for the phone-update (bridge) state; returns true while a phone
+// update is in progress so the caller can show the progress bar.
+static bool bridgeStatusText(char *buf, size_t cap, int *pct) {
+    InstallerProgress p = installerProgress();
+    bool active = updateApiBusy() && (p.state == INST_RECEIVING || p.state == INST_READY ||
+                                      p.state == INST_VERIFYING || p.state == INST_COMMITTED);
+    *pct = p.bytesTotal ? (int)((uint64_t)p.bytesDone * 100 / p.bytesTotal) : 0;
+    if (!active) return false;
+    switch (p.state) {
+    case INST_VERIFYING: snprintf(buf, cap, LV_SYMBOL_REFRESH " Đang kiểm tra dữ liệu..."); break;
+    case INST_COMMITTED: snprintf(buf, cap, LV_SYMBOL_OK " Dữ liệu hợp lệ — khởi động lại để cài"); break;
+    default:
+        snprintf(buf, cap, LV_SYMBOL_DOWNLOAD " Đang nhận dữ liệu từ điện thoại  %d%%\n%u / %u KB · tệp %u/%u", *pct,
+                 (unsigned)(p.bytesDone / 1024), (unsigned)(p.bytesTotal / 1024),
+                 (unsigned)(p.filesDone < p.filesTotal ? p.filesDone + 1 : p.filesTotal), (unsigned)p.filesTotal);
+    }
+    return true;
+}
+
+// Small pill on the top layer so the driver sees a phone update progressing
+// even with this overlay closed (Dashboard showing). Only text changes -> only
+// the pill's own area is redrawn.
+static void refreshBridgeToast() {
+    bool overlayOpen = wifiScanOverlay && !lv_obj_has_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
+    char b[120];
+    int pct = 0;
+    bool active = bridgeStatusText(b, sizeof(b), &pct) && !overlayOpen;
+    if (!active) {
+        if (bridgeToast && !lv_obj_has_flag(bridgeToast, LV_OBJ_FLAG_HIDDEN)) lv_obj_add_flag(bridgeToast, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    if (!bridgeToast) {
+        bridgeToast = lv_label_create(lv_layer_top());
+        lv_obj_set_style_bg_color(bridgeToast, lv_color_hex(0x0F2238), 0);
+        lv_obj_set_style_bg_opa(bridgeToast, LV_OPA_90, 0);
+        lv_obj_set_style_border_color(bridgeToast, lv_color_hex(0x3DA5FF), 0);
+        lv_obj_set_style_border_width(bridgeToast, 1, 0);
+        lv_obj_set_style_radius(bridgeToast, 14, 0);
+        lv_obj_set_style_pad_hor(bridgeToast, 12, 0);
+        lv_obj_set_style_pad_ver(bridgeToast, 5, 0);
+        lv_obj_set_style_text_color(bridgeToast, lv_color_hex(0xDCEBFA), 0);
+        lv_obj_align(bridgeToast, LV_ALIGN_BOTTOM_MID, 0, -6);
+    }
+    InstallerProgress p = installerProgress();
+    char t[64];
+    if (p.state == INST_VERIFYING) snprintf(t, sizeof(t), LV_SYMBOL_REFRESH " Đang kiểm tra dữ liệu...");
+    else if (p.state == INST_COMMITTED) snprintf(t, sizeof(t), LV_SYMBOL_OK " Sắp khởi động lại để cài dữ liệu");
+    else snprintf(t, sizeof(t), LV_SYMBOL_DOWNLOAD " Nhận dữ liệu từ điện thoại %d%%", pct);
+    if (strcmp(lv_label_get_text(bridgeToast), t) != 0) lv_label_set_text(bridgeToast, t);
+    if (lv_obj_has_flag(bridgeToast, LV_OBJ_FLAG_HIDDEN)) lv_obj_clear_flag(bridgeToast, LV_OBJ_FLAG_HIDDEN);
+}
+
 // Called from refreshSensorsPanel while the overlay is open: keep the QR current
-// (AP creds can change) and show live AP info + STA connection + saved list.
+// (AP creds can change) and show the device hotspot creds + live status.
 static void refreshScanListIfOpen() {
     if (!wifiScanOverlay || lv_obj_has_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN)) return;
     wifiQrRebuild();
 
-    // scanConnLbl (green): STA connection state — and PROMINENTLY the device IP
-    // once connected, so the user can open the web portal at that address from
-    // any device on the same network.
-    if (scanConnLbl) {
-        char ip[24];
-        char buf[260];
-        if (webPortalStaIp(ip, sizeof(ip))) {
-            DataUpdateStatus du = dataUpdateGetStatus();
-            char upd[80] = "";
-            if (du.state == DU_RUNNING)
-                snprintf(upd, sizeof(upd), "\nDang cap nhat: %d/%d (%d%%)", du.filesDone, du.filesTotal, du.percent);
-            else if (dataUpdateAvailable())
-                snprintf(upd, sizeof(upd), "\nCo ban cap nhat moi: %s", dataUpdateRemoteVersion());
-            else if (dataUpdateCheckInProgress())
-                snprintf(upd, sizeof(upd), "\nDang kiem tra cap nhat...");
-            snprintf(buf, sizeof(buf),
-                     "DA KET NOI: %s\nIP thiet bi: %s\n(mo trinh duyet toi IP nay hoac viethud.local)%s",
-                     cfg.staSsid, ip, upd);
-            lv_obj_set_style_text_color(scanConnLbl, lv_color_hex(0x33CC66), 0);
-        } else {
-            char sta[96];
-            webPortalStaInfo(sta, sizeof(sta));
-            snprintf(buf, sizeof(buf), "Trang thai: %s", sta);
-            lv_obj_set_style_text_color(scanConnLbl, lv_color_hex(0xE0C020), 0);
-        }
-        lv_label_set_text(scanConnLbl, buf);
-    }
-    // scanSavedLbl (grey): the device AP creds, for a manual join if the QR can't
-    // be scanned.
     if (scanSavedLbl) {
         char ap[40];
         webPortalApSsid(ap, sizeof(ap));
         bool secured = strlen(cfg.wifiPassword) >= 8;
-        char buf[120];
-        snprintf(buf, sizeof(buf), "Neu khong quet duoc QR:\nWiFi thiet bi: %s  (mk: %s)",
-                 ap, secured ? cfg.wifiPassword : "(mo)");
-        lv_label_set_text(scanSavedLbl, buf);
+        char buf[200];
+        snprintf(buf, sizeof(buf), "Wi-Fi VietHUD:\n  %s\nMật khẩu:\n  %s\nTrang cài đặt:\n  192.168.4.1",
+                 ap, secured ? cfg.wifiPassword : "(không có)");
+        if (strcmp(lv_label_get_text(scanSavedLbl), buf) != 0) lv_label_set_text(scanSavedLbl, buf);
+    }
+
+    if (scanConnLbl) {
+        char buf[200];
+        int pct = 0;
+        bool bridging = bridgeStatusText(buf, sizeof(buf), &pct);
+        uint32_t color = 0x3DA5FF;
+        if (!bridging) {
+            int clients = webPortalClientCount();
+            char ip[24];
+            char inet[80] = "";
+            if (webPortalStaIp(ip, sizeof(ip))) {
+                if (dataUpdateAvailable())
+                    snprintf(inet, sizeof(inet), "\nCó dữ liệu mới %s — mở trang để cập nhật", dataUpdateRemoteVersion());
+                else
+                    snprintf(inet, sizeof(inet), "\nVietHUD có Internet qua \"%s\"", cfg.staSsid);
+            }
+            if (clients > 0) {
+                snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Điện thoại đã kết nối (%d)\nMở trang → Dữ liệu → Kiểm tra cập nhật%s",
+                         clients, inet);
+                color = 0x34C46A;
+            } else {
+                snprintf(buf, sizeof(buf), "Chờ điện thoại kết nối...\nKhông cần Wi-Fi nhà để cập nhật dữ liệu.%s", inet);
+                color = 0x8FA0B4;
+            }
+        }
+        lv_obj_set_style_text_color(scanConnLbl, lv_color_hex(color), 0);
+        if (strcmp(lv_label_get_text(scanConnLbl), buf) != 0) lv_label_set_text(scanConnLbl, buf);
+        if (bridgeBar) {
+            if (bridging) {
+                lv_obj_clear_flag(bridgeBar, LV_OBJ_FLAG_HIDDEN);
+                lv_bar_set_value(bridgeBar, pct, LV_ANIM_OFF);
+            } else if (!lv_obj_has_flag(bridgeBar, LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_add_flag(bridgeBar, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
     }
 }
 
@@ -1173,7 +1269,7 @@ void buildSettingsScreen() {
         lv_label_set_long_mode(wifiHint, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(wifiHint, lv_obj_get_width(categoryPanels[3]) - 8);
         lv_obj_set_style_text_color(wifiHint, lv_color_hex(0xCCD6E0), 0);
-        lv_label_set_text(wifiHint, "Dang mo ma QR de cai WiFi bang dien thoai...");
+        lv_label_set_text(wifiHint, "Đang mở mã QR để kết nối điện thoại...");
         lv_obj_set_pos(wifiHint, 6, 8);
     }
 
@@ -1185,6 +1281,9 @@ void buildSettingsScreen() {
     // fires from loop() well after sharedStateInit() has run, so the rows
     // just start blank for under a second instead.
     lv_timer_create(refreshSensorsPanel, 500, NULL); // live values only need to be as fresh as a human reads them
+    // Phone-update progress pill: runs on EVERY screen (refreshSensorsPanel bails
+    // out unless Settings is showing), cheap no-op while no phone is updating.
+    lv_timer_create([](lv_timer_t *) { refreshBridgeToast(); }, 500, NULL);
     lv_timer_create(checkIdleReturnToDashboard, 1000, NULL);
 
     selectCategory(0);

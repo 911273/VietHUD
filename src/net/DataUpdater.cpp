@@ -1,6 +1,7 @@
 #include "DataUpdater.h"
 #include "core/AppConfig.h"
 #include "map/SdCardManager.h"
+#include "update/DataInstaller.h" // staging + signature + atomic boot-time install
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -39,58 +40,10 @@ static void setStatus(DataUpdateState st, const char *msg) {
     Serial.printf("[dataupd] %s\n", s_status.message);
 }
 
-struct MFile {
-    char name[40];
-    char sha[65];
-};
-
-// Parse a manifest text blob: a "version <x>" line plus "<name> <size> <sha>"
-// lines. Fills out[] (name+sha only; size is informational) and returns count.
-static int parseManifest(const char *text, MFile *out, int maxN, char *verOut, size_t verCap) {
-    int n = 0;
-    if (verOut && verCap) verOut[0] = '\0';
-    const char *p = text;
-    while (*p && n < maxN) {
-        // one line into a temp
-        char line[160];
-        int i = 0;
-        while (*p && *p != '\n' && i < (int)sizeof(line) - 1) line[i++] = *p++;
-        line[i] = '\0';
-        if (*p == '\n') p++;
-        if (line[0] == '\0' || line[0] == '#') continue;
-        char a[48], b[24], c[80];
-        if (sscanf(line, "%47s %23s %79s", a, b, c) == 3) {
-            if (strcmp(a, "version") == 0) continue; // "version <x> <y>" unlikely, but guard
-            strncpy(out[n].name, a, sizeof(out[n].name) - 1);
-            out[n].name[sizeof(out[n].name) - 1] = '\0';
-            strncpy(out[n].sha, c, sizeof(out[n].sha) - 1);
-            out[n].sha[sizeof(out[n].sha) - 1] = '\0';
-            n++;
-        } else if (sscanf(line, "version %79s", c) == 1 && verOut) {
-            strncpy(verOut, c, verCap - 1);
-            verOut[verCap - 1] = '\0';
-        }
-    }
-    return n;
-}
-
-static const char *shaFor(const MFile *arr, int n, const char *name) {
-    for (int i = 0; i < n; i++)
-        if (strcmp(arr[i].name, name) == 0) return arr[i].sha;
-    return "";
-}
-
-static void hexEncode(const uint8_t *in, int len, char *out) {
-    static const char *h = "0123456789abcdef";
-    for (int i = 0; i < len; i++) {
-        out[i * 2] = h[in[i] >> 4];
-        out[i * 2 + 1] = h[in[i] & 0xF];
-    }
-    out[len * 2] = '\0';
-}
-
-// HTTP(S) GET into a String (small responses only — the manifest). Returns true
-// on 200. Uses an insecure TLS client for https (no cert store on-device).
+// HTTP(S) GET into a String (small responses only — manifest + signature).
+// Returns true on 200. Uses an insecure TLS client for https (no cert store
+// on-device) — acceptable because the manifest is ECDSA-signed and every file
+// is SHA-256 checked against it (a MITM can only cause a failed update).
 static bool httpGetText(const String &url, String &out) {
     Serial.printf("[dataupd] heap before TLS: free=%u biggest=%u\n",
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -113,195 +66,152 @@ static bool httpGetText(const String &url, String &out) {
     return ok;
 }
 
-// Downloads one file, streaming to /speedmap/<name>.tmp while hashing, verifies
-// SHA-256, then atomically renames over the live file. Returns true on success.
-static bool downloadFile(const String &base, const char *name, const char *expectSha, uint8_t *buf,
-                         size_t bufSize) {
-    String url = base + name;
-    char curPath[64], newPath[72];
-    snprintf(curPath, sizeof(curPath), DU_SPEEDMAP_DIR "%s", name);
-    snprintf(newPath, sizeof(newPath), DU_SPEEDMAP_DIR "%s.tmp", name);
-    sdMgrRemove(newPath); // clear any stale partial
+// Streams one file into the installer's staging part (/vhupd/<name>.part),
+// resuming from whatever is already on the card via an HTTP Range request.
+// Verification happens later, in installerCommit() (readback SHA-256).
+static bool downloadToStage(const String &base, int idx, uint8_t *buf, size_t bufSize) {
+    const char *name;
+    uint32_t size = 0, have = 0;
+    if (!installerFileInfo(idx, &name, &size, &have, nullptr)) return false;
+    if (have >= size) return true;
 
     WiFiClientSecure sclient;
     WiFiClient client;
+    String url = base + name;
     bool https = url.startsWith("https");
     if (https) sclient.setInsecure();
     HTTPClient http;
     if (!http.begin(https ? (WiFiClient &)sclient : client, url)) {
-        setStatus(DU_FAILED, "begin() failed");
+        setStatus(DU_FAILED, "Lỗi kết nối máy chủ");
         return false;
     }
-    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS); // GitHub raw 301/302s to the Fastly CDN
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
     http.setTimeout(15000);
+    if (have > 0) http.addHeader("Range", String("bytes=") + have + "-");
     int code = http.GET();
-    if (code != 200) {
+    if (code != 200 && code != 206) {
         char m[64];
-        snprintf(m, sizeof(m), "HTTP %d for %s", code, name);
+        snprintf(m, sizeof(m), "Lỗi tải %s (HTTP %d)", name, code);
         setStatus(DU_FAILED, m);
         http.end();
         return false;
     }
-    int contentLen = http.getSize(); // may be -1 (chunked)
+    uint32_t skip = (code == 200) ? have : 0; // server ignored Range: discard what we already have
+    uint32_t expected = 0;
+    if (installerWriteBegin(name, have, &expected) != 200) {
+        http.end();
+        return false;
+    }
     WiFiClient *stream = http.getStreamPtr();
-
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0); // 0 = SHA-256 (not 224)
-
-    int total = 0;
+    uint32_t got = have;
     uint32_t lastDataMs = millis();
     bool ok = true;
-    while (http.connected() && (contentLen < 0 || total < contentLen)) {
+    while (got < size && http.connected()) {
         size_t avail = stream->available();
-        if (avail) {
-            int r = stream->readBytes(buf, avail > bufSize ? bufSize : avail);
-            if (r > 0) {
-                mbedtls_sha256_update(&ctx, buf, r);
-                if (!sdMgrAppendBytes(newPath, buf, r)) {
-                    setStatus(DU_FAILED, "SD write failed");
-                    ok = false;
-                    break;
-                }
-                total += r;
-                lastDataMs = millis();
-                if (contentLen > 0) s_status.percent = (int)((int64_t)total * 100 / contentLen);
-            }
-        } else {
+        if (!avail) {
             if (millis() - lastDataMs > 15000) {
-                setStatus(DU_FAILED, "download stalled");
+                setStatus(DU_FAILED, "Mất kết nối khi đang tải");
                 ok = false;
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
         }
+        int r = stream->readBytes(buf, avail > bufSize ? bufSize : avail);
+        if (r <= 0) continue;
+        lastDataMs = millis();
+        const uint8_t *p = buf;
+        if (skip) {
+            uint32_t s = (uint32_t)r < skip ? (uint32_t)r : skip;
+            skip -= s;
+            p += s;
+            r -= s;
+            if (r == 0) continue;
+        }
+        if ((uint32_t)r > size - got) r = size - got;
+        if (!installerWriteData(p, r)) {
+            setStatus(DU_FAILED, "Lỗi ghi thẻ nhớ");
+            ok = false;
+            break;
+        }
+        got += r;
+        s_status.percent = (int)((int64_t)got * 100 / (size ? size : 1));
     }
     http.end();
-
-    uint8_t hash[32];
-    mbedtls_sha256_finish(&ctx, hash);
-    mbedtls_sha256_free(&ctx);
-    if (!ok) {
-        sdMgrRemove(newPath);
-        return false;
-    }
-    char got[65];
-    hexEncode(hash, 32, got);
-    if (strcasecmp(got, expectSha) != 0) {
-        setStatus(DU_FAILED, "checksum mismatch");
-        Serial.printf("[dataupd] %s sha got=%s want=%s\n", name, got, expectSha);
-        sdMgrRemove(newPath);
-        return false;
-    }
-    // Verified — atomically replace the live file.
-    if (!sdMgrRename(newPath, curPath)) {
-        setStatus(DU_FAILED, "rename failed");
-        sdMgrRemove(newPath);
-        return false;
-    }
-    Serial.printf("[dataupd] updated %s (%d bytes)\n", name, total);
-    return true;
+    uint32_t now = installerWriteEnd();
+    return ok && now >= size;
 }
 
-// Returns: 0 = failed, 1 = success WITH changes (caller reboots), 2 = success no
-// change. Work buffers are passed in (PSRAM, allocated by the task) so nothing
-// large sits in scarce internal RAM while WiFi/TLS is up.
-static int runUpdate(uint8_t *dlBuf, size_t dlBufSize, MFile *remote, MFile *local, uint8_t *lbuf,
-                     size_t lbufSize) {
+// Returns: 0 = failed, 1 = success WITH changes staged (caller reboots so the
+// boot-time installer swaps them in), 2 = success, nothing to update.
+static int runUpdate(uint8_t *dlBuf, size_t dlBufSize) {
     s_status.filesTotal = 0;
     s_status.filesDone = 0;
     s_status.percent = 0;
-    setStatus(DU_RUNNING, "Fetching manifest...");
+    setStatus(DU_RUNNING, "Đang tải danh sách dữ liệu...");
 
     String base = cfg.dataUpdateUrl;
     if (base.length() && !base.endsWith("/")) base += "/";
-
-    // Connectivity diagnostics: STA IP + a DNS test of the host, so a failure is
-    // pinpointed (DNS poisoned by our own captive server -> resolves to
-    // 192.168.4.1 = wrong; DNS ok but fetch fails = TLS/memory).
     Serial.printf("[dataupd] STA ip=%s dns=%s  url=%s\n", WiFi.localIP().toString().c_str(),
                   WiFi.dnsIP().toString().c_str(), (base + DU_MANIFEST_NAME).c_str());
-    {
-        // Extract host from the base URL for a DNS probe.
-        String host = base;
-        int p = host.indexOf("://");
-        if (p >= 0) host = host.substring(p + 3);
-        int slash = host.indexOf('/');
-        if (slash >= 0) host = host.substring(0, slash);
-        IPAddress ip;
-        if (WiFi.hostByName(host.c_str(), ip))
-            Serial.printf("[dataupd] DNS %s -> %s\n", host.c_str(), ip.toString().c_str());
-        else
-            Serial.printf("[dataupd] DNS FAILED for %s\n", host.c_str());
-    }
 
-    String remoteText;
-    if (!httpGetText(base + DU_MANIFEST_NAME, remoteText)) {
-        setStatus(DU_FAILED, "Cannot fetch manifest");
+    String manifest, sig;
+    if (!httpGetText(base + DU_MANIFEST_NAME, manifest)) {
+        setStatus(DU_FAILED, "Không tải được danh sách dữ liệu");
         return 0;
     }
-    char remoteVer[32];
-    int rn = parseManifest(remoteText.c_str(), remote, DU_MAX_FILES, remoteVer, sizeof(remoteVer));
-    if (rn == 0) {
-        setStatus(DU_FAILED, "Empty/invalid manifest");
+    if (!httpGetText(base + DU_MANIFEST_NAME ".sig", sig)) {
+        setStatus(DU_FAILED, "Bản cập nhật chưa được ký");
         return 0;
     }
-
-    // Local manifest (may be absent -> everything is "new").
-    int ln = 0;
-    int got = sdMgrReadFileChunk(DU_SPEEDMAP_DIR DU_MANIFEST_NAME, 0, lbuf, lbufSize - 1);
-    if (got > 0) {
-        lbuf[got] = '\0';
-        ln = parseManifest((const char *)lbuf, local, DU_MAX_FILES, nullptr, 0);
-    }
-
-    // Which files differ?
-    int need[DU_MAX_FILES], needN = 0;
-    for (int i = 0; i < rn; i++)
-        if (strcasecmp(remote[i].sha, shaFor(local, ln, remote[i].name)) != 0) need[needN++] = i;
-    s_status.filesTotal = needN;
-    if (needN == 0) {
-        setStatus(DU_SUCCESS, "Already up to date");
+    char err[80];
+    int rc = installerOpenSession(manifest.c_str(), manifest.length(), sig.c_str(), err, sizeof(err));
+    if (rc == 200) {
+        setStatus(DU_SUCCESS, "Dữ liệu đã là bản mới nhất");
         return 2;
     }
-
-    for (int k = 0; k < needN; k++) {
-        int idx = need[k];
+    if (rc != 201) {
+        setStatus(DU_FAILED, err);
+        return 0;
+    }
+    int n = installerFileCount();
+    s_status.filesTotal = n;
+    for (int k = 0; k < n; k++) {
+        const char *name = "";
+        installerFileInfo(k, &name, nullptr, nullptr, nullptr);
         s_status.filesDone = k;
         s_status.percent = 0;
         char m[64];
-        snprintf(m, sizeof(m), "Downloading %s (%d/%d)", remote[idx].name, k + 1, needN);
+        snprintf(m, sizeof(m), "Đang tải %s (%d/%d)", name, k + 1, n);
         setStatus(DU_RUNNING, m);
-        if (!downloadFile(base, remote[idx].name, remote[idx].sha, dlBuf, dlBufSize)) return 0; // FAILED set inside
+        bool ok = false;
+        for (int attempt = 0; attempt < 3 && !ok; attempt++) { // resumes via Range after a drop
+            if (attempt) vTaskDelay(pdMS_TO_TICKS(2000));
+            ok = downloadToStage(base, k, dlBuf, dlBufSize);
+        }
+        if (!ok) return 0; // FAILED set inside; parts stay on the card for the next try
         s_status.filesDone = k + 1;
     }
-
-    // Persist the new manifest so the next run diffs against it.
-    sdMgrRemove(DU_SPEEDMAP_DIR DU_MANIFEST_NAME);
-    sdMgrAppendBytes(DU_SPEEDMAP_DIR DU_MANIFEST_NAME, (const uint8_t *)remoteText.c_str(), remoteText.length());
-
+    setStatus(DU_RUNNING, "Đang kiểm tra dữ liệu...");
+    rc = installerCommit(false, err, sizeof(err));
+    if (rc != 200) {
+        setStatus(DU_FAILED, err);
+        return 0;
+    }
     char done[64];
-    snprintf(done, sizeof(done), "Updated %d file(s) - rebooting", needN);
+    snprintf(done, sizeof(done), "Đã tải %d tệp — khởi động lại để cài", n);
     setStatus(DU_SUCCESS, done);
     return 1;
 }
 
 static void dataUpdateTask(void *) {
-    // All big scratch in PSRAM so internal RAM stays free for WiFi/TLS.
+    // Download buffer in PSRAM so internal RAM stays free for WiFi/TLS.
     const size_t DL = 4096;
     uint8_t *dlBuf = (uint8_t *)heap_caps_malloc(DL, MALLOC_CAP_SPIRAM);
-    uint8_t *lbuf = (uint8_t *)heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
-    MFile *remote = (MFile *)heap_caps_malloc(sizeof(MFile) * DU_MAX_FILES, MALLOC_CAP_SPIRAM);
-    MFile *local = (MFile *)heap_caps_malloc(sizeof(MFile) * DU_MAX_FILES, MALLOC_CAP_SPIRAM);
-
     int result = 0;
-    if (dlBuf && lbuf && remote && local) result = runUpdate(dlBuf, DL, remote, local, lbuf, 2048);
-    else setStatus(DU_FAILED, "Out of memory");
-
+    if (dlBuf) result = runUpdate(dlBuf, DL);
+    else setStatus(DU_FAILED, "Hết bộ nhớ");
     if (dlBuf) heap_caps_free(dlBuf);
-    if (lbuf) heap_caps_free(lbuf);
-    if (remote) heap_caps_free(remote);
-    if (local) heap_caps_free(local);
 
     s_running = false;
     if (result == 1) {
@@ -320,7 +230,7 @@ void dataUpdateSchedule() {
     p.begin("dataupd", false);
     p.putBool("pending", true);
     p.end();
-    setStatus(DU_RUNNING, "Khoi dong lai de cap nhat...");
+    setStatus(DU_RUNNING, "Khởi động lại để cập nhật...");
     delay(700); // let the HTTP reply / UI update flush
     ESP.restart();
 }
@@ -403,16 +313,16 @@ const char *dataUpdateLocalVersion() { return s_localVersion; }
 bool dataUpdateStart() {
     if (s_running) return false;
     if (strlen(cfg.dataUpdateUrl) == 0) {
-        setStatus(DU_FAILED, "No update URL set (Config)");
+        setStatus(DU_FAILED, "Chưa đặt địa chỉ dữ liệu");
         return false;
     }
     if (WiFi.status() != WL_CONNECTED) {
-        setStatus(DU_FAILED, "No internet (WiFi station)");
+        setStatus(DU_FAILED, "VietHUD chưa có Internet");
         return false;
     }
     s_running = true;
-    // 8 KB stack: TLS + HTTPClient + the 4 KB download buffer is static, not on
-    // the stack. Core 0, low priority — it spends its life blocked on the network.
-    xTaskCreatePinnedToCore(dataUpdateTask, "dataUpd", 8192, NULL, 1, NULL, 0);
+    // 12 KB stack: TLS + HTTPClient + ECDSA signature verify (the download buffer
+    // is in PSRAM, not on the stack). Core 0, low priority — it spends its life blocked on the network.
+    xTaskCreatePinnedToCore(dataUpdateTask, "dataUpd", 12288, NULL, 1, NULL, 0);
     return true;
 }
