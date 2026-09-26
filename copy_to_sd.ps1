@@ -27,10 +27,9 @@ if (-not (Test-Path $destDir)) {
 $srcDir = "C:\Users\phamq\radar_car\data\speedmap"
 Write-Host "`nDang copy du lieu tu $srcDir sang $destDir ..." -ForegroundColor Cyan
 
-# VECTOR-ONLY (2026-09-25): the 448MB raster maptiles*.bin are no longer copied.
-# The device shows a vector map (roads + street names) + all traffic warnings
-# from this ~8MB core set. Re-add maptiles.bin here only if you deliberately
-# want the raster photo background back (and set showRasterMap on).
+# VECTOR-ONLY: the device shows a vector map (roads + street names) + all
+# traffic warnings from this ~8MB core set (the raster background was removed
+# from the firmware 2026-09-26).
 $files = @(
     "metadata.bin",
     "cameras.bin",

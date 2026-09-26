@@ -71,10 +71,7 @@ void loadConfigFromNVS(AppConfig &cfg) {
     cfg.dataUpdateUrl[sizeof(cfg.dataUpdateUrl) - 1] = '\0';
     cfg.screenRotation = prefs.getFloat("screenRot", cfg.screenRotation);
     cfg.themeMode = prefs.getFloat("themeMode", cfg.themeMode);
-    cfg.mapSource = prefs.getFloat("mapSource", cfg.mapSource);
-    cfg.showVectorRoads = prefs.getBool("showVecRoads", cfg.showVectorRoads);
     cfg.showVehicleTrail = prefs.getBool("showTrail", cfg.showVehicleTrail);
-    cfg.showRasterMap = prefs.getBool("showRaster", cfg.showRasterMap);
     cfg.mapHeadingUp = prefs.getBool("mapHeadUp", cfg.mapHeadingUp);
     cfg.defaultLimitKmh = prefs.getFloat("defLimitKmh", cfg.defaultLimitKmh);
 
@@ -138,10 +135,7 @@ void saveConfigToNVS(const AppConfig &cfg) {
     prefs.putString("dataUrl", cfg.dataUpdateUrl);
     prefs.putFloat("screenRot", cfg.screenRotation);
     prefs.putFloat("themeMode", cfg.themeMode);
-    prefs.putFloat("mapSource", cfg.mapSource);
-    prefs.putBool("showVecRoads", cfg.showVectorRoads);
     prefs.putBool("showTrail", cfg.showVehicleTrail);
-    prefs.putBool("showRaster", cfg.showRasterMap);
     prefs.putBool("mapHeadUp", cfg.mapHeadingUp);
     prefs.putFloat("defLimitKmh", cfg.defaultLimitKmh);
     prefs.end();

@@ -69,8 +69,8 @@ LV_IMAGE_DECLARE(logo_vre);
 // sketch can override it — this is that override. Raised to 16384
 // 2026-09-22 after a REAL, reproducible crash on hardware: "Guru Meditation
 // Error: Core 1 panic'ed (Unhandled debug exception) — Stack canary
-// watchpoint triggered (loopTask)" while map/RasterMapManager.cpp's
-// renderBackground() retried a failed SD read every 2s directly from
+// watchpoint triggered (loopTask)" while the (since removed, 2026-09-26)
+// raster-map background retried a failed SD read every 2s directly from
 // updateMapCanvas() (ui/Dashboard.cpp), itself called every ~150ms tick from
 // this file's own loop() — i.e. loopTask, the Arduino default/UI task this
 // whole file's setup()/loop() runs as (see this file's own header comment).
@@ -80,9 +80,8 @@ LV_IMAGE_DECLARE(logo_vre);
 // then became a real one. Doubling to 16384 is the standard, minimal-risk
 // fix for genuine stack pressure (loopTask is UI-only work, not a
 // tightly-budgeted small task like the sensor tasks elsewhere in this
-// project) — it does not touch or explain away whatever in
-// RasterMapManager.cpp/SD_MMC's own call depth is actually consuming that
-// much stack, which is a separate thing worth understanding on its own.
+// project). Kept at 16384 after the raster code was removed: the vector map
+// draw + SD tile reads still run from this task.
 size_t getArduinoLoopTaskStackSize(void) { return 16384; }
 
 static lv_display_t *lvDisplay;

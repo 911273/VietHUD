@@ -9,9 +9,7 @@
 // card, verified, then atomically renamed over the live file. See the approved
 // plan and net/DataUpdater.cpp for the full flow.
 //
-// Data is VECTOR-ONLY now: the ~8 MB core (tiles/index/metadata/names/
-// seg_names/signs/cameras) is what gets updated; the 448 MB raster maptiles.bin
-// is no longer shipped (see AppConfig::showRasterMap).
+// Data is vector-only: tiles/index/metadata/names/seg_names/signs/cameras.
 
 enum DataUpdateState : uint8_t {
     DU_IDLE = 0,   // never run this session, or finished a while ago

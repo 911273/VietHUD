@@ -150,20 +150,9 @@ struct AppConfig {
     // runs regardless, since the sun icon and the local-time-from-longitude
     // estimate both still need it). Applies live, no restart needed.
     float themeMode = 0;
-    // Map settings: 0 = CartoDB Dark, 1 = OpenStreetMap (OSM), 2 = OSM Dark
-    float mapSource = 0;
-    bool showVectorRoads = true;
+    // Map display (vector only — the raster JPEG background was removed
+    // 2026-09-26; vector roads are always drawn).
     bool showVehicleTrail = true;
-    // Raster (JPEG tile) background on/off (2026-09-24, user-requested "bản đồ
-    // theo file jpeg hoặc theo vector"). Turn this OFF for a pure vector map
-    // (which needs only tiles.bin, not the 415MB maptiles.bin) — a reliable
-    // fallback if the raster tiles don't load. With showVectorRoads this gives
-    // the JPEG-vs-vector choice: both on = raster + roads; raster off = vector
-    // only; vector off = raster only.
-    // Default flipped to OFF 2026-09-25: the project moved to a VECTOR-ONLY map
-    // (the 448MB maptiles.bin is no longer shipped/updated online — vector roads
-    // + street names + all warnings come from the ~8MB core data instead).
-    bool showRasterMap = false;
     // Heading-up map rotation (2026-09-24). true = the whole map rotates so the
     // travel direction is always at 12 o'clock; false = north-up (map fixed,
     // north up) — the simpler, proven mode, and a fallback if rotation
@@ -199,7 +188,6 @@ inline void clampConfig(AppConfig &c) {
     c.cameraWarnDistM = constrain(c.cameraWarnDistM, 50.0f, 100.0f);
     c.screenRotation = constrain(c.screenRotation, 0.0f, 3.0f);
     c.themeMode = constrain(c.themeMode, 0.0f, 2.0f);
-    c.mapSource = constrain(c.mapSource, 0.0f, 2.0f);
     if (c.savedNetworkCount < 0) c.savedNetworkCount = 0;
     if (c.savedNetworkCount > AppConfig::kMaxSavedNetworks) c.savedNetworkCount = AppConfig::kMaxSavedNetworks;
 }
@@ -228,5 +216,4 @@ inline void sanitizeConfig(AppConfig &c) {
     if (!isfinite(c.cameraWarnDistM)) c.cameraWarnDistM = d.cameraWarnDistM;
     if (!isfinite(c.screenRotation)) c.screenRotation = d.screenRotation;
     if (!isfinite(c.themeMode)) c.themeMode = d.themeMode;
-    if (!isfinite(c.mapSource)) c.mapSource = d.mapSource;
 }

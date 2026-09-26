@@ -8,7 +8,7 @@ echo      VIETHUD DATA BUILDER - BAN DO VECTOR TOI GIAN (VECTOR ONLY ~16MB)
 echo ===============================================================================
 echo.
 echo Dang dong goi ban do vector, ten duong, canh bao va am thanh...
-echo (Bo qua file anh raster maptiles.bin nang 448MB de chep cuc nhanh)
+echo (Ban do vector + canh bao + am thanh)
 echo.
 
 cd /d "%~dp0"

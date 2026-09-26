@@ -2,7 +2,6 @@
 #include <esp_task_wdt.h>
 #include "Dashboard.h"
 #include "map/MapRenderer.h"
-#include "map/RasterMapManager.h"
 #include "Settings.h" // settingsScreen, for the hold-to-open-Settings gesture
 #include "core/AppConfig.h"
 #include "core/NvsStore.h" // saveConfigToNVS()
@@ -424,8 +423,7 @@ static void onDashReleasedOrLost(lv_event_t *) {
     } else {
         gMapZoomScale = 1.5f;
     }
-    // Drive the unified zoom so BOTH the vector layer and the raster background
-    // change together (raster tracks the published zoomRadiusM). Force an
+    // Drive the map zoom (published zoomRadiusM). Force an
     // immediate redraw by invalidating the last-drawn generation.
     mapRendererSetZoomMultiplier(gMapZoomScale);
     lastDrawnMapGeneration = 0;
@@ -443,7 +441,7 @@ static void onDashReleasedOrLost(lv_event_t *) {
 // columns. Transparent/borderless so it's invisible except for its children.
 
 // ---------------------------------------------------------------------
-// Full-Screen Map Canvas (Raster Background + Vector Overlays)
+// Full-Screen Map Canvas (vector roads + markers + trail)
 // ---------------------------------------------------------------------
 
 
@@ -537,7 +535,6 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
 
     mapRendererSetGeometry(S, S / 2, S / 2, gRefMinDim);
     mapRendererSetZoomMultiplier(gMapZoomScale);
-    RasterMapManager::instance().setMapSource((uint8_t)(int)cfg.mapSource);
 
     int anchorX = screenAnchorX;
     int anchorY = screenAnchorY;
@@ -632,35 +629,6 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
     lv_obj_set_pos(tempLabel, gCanvasW - 8 - 72, tempCy - 11); // right edge ~8px from the screen edge
 }
 
-// Chooses the raster tile zoom and the LVGL tile scale so the raster's
-// meters-per-pixel equals the vector layer's (pxPerM = gRefMinDim/radiusM) —
-// that's what makes raster roads sit under the vector roads at every zoom. Also
-// the FIX for the coverage gaps found 2026-09-24: it starts at max zoom and
-// falls BACK to a lower zoom when no tile covers the center (dropping a level
-// doubles groundRes, so the scale doubles to keep the same m/px), instead of
-// the old code that always asked for max zoom and drew nothing where max-zoom
-// tiles were missing. Returns false only if NO zoom has a tile there.
-static bool rasterZoomAndScale(float lat, float lon, float pxPerM, uint8_t &outZoom, float &outScale) {
-    RasterMapManager &rm = RasterMapManager::instance();
-    uint8_t minz = rm.getMinZoom(), maxz = rm.getMaxZoom();
-    if (maxz < minz || maxz == 0) { minz = 9; maxz = 15; }
-    for (int z = maxz; z >= (int)minz; z--) {
-        uint32_t tx, ty; float sx, sy;
-        RasterMapManager::latLonToTile(lat, lon, (uint8_t)z, tx, ty, sx, sy);
-        const lv_image_dsc_t *dsc = nullptr;
-        if (rm.getTileDsc((uint8_t)z, tx, ty, &dsc)) {
-            float groundRes = 156543.03f * cosf(lat * (float)M_PI / 180.0f) / (float)(1u << z);
-            float scale = pxPerM * groundRes;
-            if (scale < 0.25f) scale = 0.25f;
-            if (scale > 8.0f) scale = 8.0f;
-            outZoom = (uint8_t)z;
-            outScale = scale;
-            return true;
-        }
-    }
-    return false;
-}
-
 static void updateMapCanvas() {
     if (!mapCanvas) return;
     esp_task_wdt_reset();
@@ -687,33 +655,13 @@ static void updateMapCanvas() {
         sLastMapLon = (float)gnss.lonDeg;
     }
 
-    // Lazy initialization / retry of raster map source if not yet loaded
-    if (!RasterMapManager::instance().isLoaded()) {
-        static uint32_t sLastLoadAttemptMs = 0;
-        uint32_t now = millis();
-        if (now - sLastLoadAttemptMs > 1500) {
-            sLastLoadAttemptMs = now;
-            RasterMapManager::instance().setMapSource((uint8_t)(int)cfg.mapSource);
-        }
-    }
-
-    // When GPS has no fix yet, draw initial background map ONCE and return
+    // No GPS fix yet: clear the canvas to the map background once (vector-only
+    // map — there is nothing to draw until a position arrives), then wait.
     if (!v.valid) {
-        if (!sMapDrawnOnce && cfg.showRasterMap && RasterMapManager::instance().isLoaded()) {
+        if (!sMapDrawnOnce) {
             sMapDrawnOnce = true;
             lv_canvas_fill_bg(mapCanvas, lv_color_hex(0x04060A), LV_OPA_COVER);
-            lv_layer_t layer;
-            lv_canvas_init_layer(mapCanvas, &layer);
-            float pxPerM0 = (float)gRefMinDim / 300.0f; // default 300m radius until a real zoom arrives
-            uint8_t z0; float rscale0;
-            if (rasterZoomAndScale(sLastMapLat, sLastMapLon, pxPerM0, z0, rscale0)) {
-                RasterMapManager::instance().renderBackground(
-                    &layer, sLastMapLat, sLastMapLon, z0, gMapSideS, gMapSideS,
-                    gMapCenter, gMapCenter, rscale0);
-            }
-            lv_canvas_finish_layer(mapCanvas, &layer);
-            lv_image_set_rotation(mapCanvas, 0); // north-up until we have a heading
-            esp_task_wdt_reset();
+            lv_image_set_rotation(mapCanvas, 0);
         }
         return;
     }
@@ -725,9 +673,7 @@ static void updateMapCanvas() {
 
     uint32_t drawStartUs = micros();
 
-    // Center the raster at the SAME snapped point the vector layer was
-    // projected about (v.egoLat/LonDeg), at the SAME pixels-per-meter
-    // (gRefMinDim / zoomRadiusM), so raster roads sit under the vector roads.
+    // Map centre = the snapped ego point the vector layer was projected about.
     float centerLat = (v.egoLatDeg > 1.0f) ? v.egoLatDeg : sLastMapLat;
     float centerLon = (v.egoLonDeg > 1.0f) ? v.egoLonDeg : sLastMapLon;
     if (v.egoLatDeg > 1.0f) { sLastMapLat = v.egoLatDeg; sLastMapLon = v.egoLonDeg; }
@@ -739,69 +685,26 @@ static void updateMapCanvas() {
     lv_layer_t layer;
     lv_canvas_init_layer(mapCanvas, &layer);
 
-    // Pass 0: Raster Map Tiles Background or Tactical Radar Rings Fallback
-    bool rasterDrawn = false;
-    if (cfg.showRasterMap && RasterMapManager::instance().isLoaded()) {
-        uint8_t z; float rscale;
-        if (rasterZoomAndScale(centerLat, centerLon, pxPerM, z, rscale)) {
-            RasterMapManager::instance().renderBackground(
-                &layer, centerLat, centerLon, z, gMapSideS, gMapSideS,
-                gMapCenter, gMapCenter, rscale);
-            rasterDrawn = true;
-        }
-    }
-    if (!rasterDrawn && !cfg.showRasterMap) {
-        // Vector-only mode (raster off) — leave the plain dark background so the
-        // vector roads/markers below stand on their own; no tactical rings.
-    } else if (!rasterDrawn) {
-        // Tactical range rings and crosshair grid when raster tiles are missing / in demo without SD
-        lv_draw_arc_dsc_t ringDsc;
-        lv_draw_arc_dsc_init(&ringDsc);
-        ringDsc.color = lv_color_hex(0x101C2B);
-        ringDsc.width = 1;
-        ringDsc.center.x = gMapCenter;
-        ringDsc.center.y = gMapCenter;
-        ringDsc.start_angle = 0;
-        ringDsc.end_angle = 360;
+    esp_task_wdt_reset();
 
-        int r1 = (int)(75.0f * pxPerM);
-        int r2 = (int)(150.0f * pxPerM);
-        int r3 = (int)(250.0f * pxPerM);
-
-        if (r1 > 10 && r1 < gMapSideS) { ringDsc.radius = r1; lv_draw_arc(&layer, &ringDsc); }
-        if (r2 > 10 && r2 < gMapSideS) { ringDsc.radius = r2; lv_draw_arc(&layer, &ringDsc); }
-        if (r3 > 10 && r3 < gMapSideS) { ringDsc.radius = r3; lv_draw_arc(&layer, &ringDsc); }
-
-        lv_draw_line_dsc_t chDsc;
-        lv_draw_line_dsc_init(&chDsc);
-        chDsc.color = lv_color_hex(0x0C1520);
-        chDsc.width = 1;
-        chDsc.p1.x = gMapCenter; chDsc.p1.y = 0;
-        chDsc.p2.x = gMapCenter; chDsc.p2.y = gMapSideS;
-        lv_draw_line(&layer, &chDsc);
-        chDsc.p1.x = 0; chDsc.p1.y = gMapCenter;
-        chDsc.p2.x = gMapSideS; chDsc.p2.y = gMapCenter;
-        lv_draw_line(&layer, &chDsc);
-    }
+    // Pass 1: Vector Road Lines (the map — vector only, always drawn)
     esp_task_wdt_reset();
 
     // Pass 1: Vector Road Lines
     lv_draw_line_dsc_t lineDsc;
-    if (cfg.showVectorRoads) {
-        for (int i = 0; i < v.lineCount; i++) {
-            const MapLine &ln = v.lines[i];
-            RoadClassStyle style = mapClassStyle(ln.roadClass);
-            lv_draw_line_dsc_init(&lineDsc);
-            lineDsc.color = style.color;
-            lineDsc.width = style.width;
-            lineDsc.round_start = 1;
-            lineDsc.round_end = 1;
-            lineDsc.p1.x = ln.x1;
-            lineDsc.p1.y = ln.y1;
-            lineDsc.p2.x = ln.x2;
-            lineDsc.p2.y = ln.y2;
-            lv_draw_line(&layer, &lineDsc);
-        }
+    for (int i = 0; i < v.lineCount; i++) {
+        const MapLine &ln = v.lines[i];
+        RoadClassStyle style = mapClassStyle(ln.roadClass);
+        lv_draw_line_dsc_init(&lineDsc);
+        lineDsc.color = style.color;
+        lineDsc.width = style.width;
+        lineDsc.round_start = 1;
+        lineDsc.round_end = 1;
+        lineDsc.p1.x = ln.x1;
+        lineDsc.p1.y = ln.y1;
+        lineDsc.p2.x = ln.x2;
+        lineDsc.p2.y = ln.y2;
+        lv_draw_line(&layer, &lineDsc);
     }
 
     // Pass 2: Breadcrumb trail (Polyline track)
@@ -855,17 +758,15 @@ static void updateMapCanvas() {
 
     // Periodic map-render diagnostics (every ~3s) so the map pipeline is
     // visible over the serial monitor when the screen shows nothing — added
-    // 2026-09-24 after a "maps don't display" report. Tells apart raster-not-
-    // loaded vs. no-tile-at-position vs. nothing-to-draw.
+    // 2026-09-24 after a "maps don't display" report.
     {
         static uint32_t sLastMapDbgMs = 0;
         uint32_t nowDbg = millis();
         if (nowDbg - sLastMapDbgMs > 3000) {
             sLastMapDbgMs = nowDbg;
-            Serial.printf("[mapui] mode raster=%d(loaded=%d drawn=%d) vector=%d lines=%d markers=%d "
+            Serial.printf("[mapui] lines=%d markers=%d "
                           "headingUp=%d rot=%.0f center=%.5f,%.5f pxPerM=%.3f bufOK=%d\n",
-                          cfg.showRasterMap, RasterMapManager::instance().isLoaded(), rasterDrawn,
-                          cfg.showVectorRoads, v.lineCount, v.markerCount, cfg.mapHeadingUp,
+                          v.lineCount, v.markerCount, cfg.mapHeadingUp,
                           (double)v.headingUpDeg, (double)centerLat, (double)centerLon, (double)pxPerM,
                           mapCanvasBuf != nullptr);
         }
