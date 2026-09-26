@@ -45,3 +45,7 @@ tools/viethud-pipeline/.env
 .venv/
 VietHUD_SDCard_Ready/
 tools/map_builder/mwm_data/
+ 
+tools/map_builder/*.wmap
+tools/map_builder/*.apk
+tools/map_builder/*.csv
