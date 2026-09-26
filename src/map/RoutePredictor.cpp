@@ -36,6 +36,7 @@ float angDiff(float a, float b) {
 
 void Route::reset() {
     count_ = 0;
+    forkAtM_ = 1e9f;
     originLat_ = 0;
     originLon_ = 0;
 }
@@ -43,6 +44,25 @@ void Route::reset() {
 float Route::totalLenM() const {
     if (count_ == 0) return 0.0f;
     return segs_[count_ - 1].startDistM + segs_[count_ - 1].lenM;
+}
+
+// Rank of a road class for continuity: 1 major < 2 main < 3 small; 0 (other/
+// unclassified) counts as small.
+static int classRank(uint8_t c) { return (c >= 1 && c <= 3) ? c : 3; }
+
+// Cost of continuing from the incoming road onto a candidate branch at a node
+// (degrees-equivalent; lowest wins). Pure geometry picks a straight side street
+// over a main road that bends — drivers overwhelmingly stay on the bigger road,
+// stay off exit ramps, and can't change level (flyover <-> road below) except
+// via a ramp.
+static float branchCost(float turnDeg, uint8_t inClass, uint8_t inFlags, uint8_t cClass, uint8_t cFlags) {
+    float cost = turnDeg;
+    int drop = classRank(cClass) - classRank(inClass);
+    if (drop > 0) cost += 25.0f * drop; // onto a smaller road
+    if ((cFlags & SEGFLAG_LINK) && !(inFlags & SEGFLAG_LINK)) cost += 20.0f; // taking an exit/entry ramp
+    bool inBridge = (inFlags & SEGFLAG_BRIDGE) != 0, cBridge = (cFlags & SEGFLAG_BRIDGE) != 0;
+    if (inBridge != cBridge && !((cFlags | inFlags) & SEGFLAG_LINK)) cost += 30.0f; // level change w/o ramp
+    return cost;
 }
 
 int Route::build(const RoadSegment &startSeg, float startHeadingDeg, float aheadM, SegmentProviderFn provider,
@@ -82,6 +102,7 @@ int Route::build(const RoadSegment &startSeg, float startHeadingDeg, float ahead
 
     int32_t nodeLat = sLat, nodeLon = sLon; // chain node = END of the last appended segment
     float incomingHeading = segHeading;
+    uint8_t incomingClass = startSeg.roadClass, incomingFlags = startSeg.flags;
     bool firstSeg = true;
 
     for (int step = 0; step < kMaxSegments; step++) {
@@ -104,7 +125,8 @@ int Route::build(const RoadSegment &startSeg, float startHeadingDeg, float ahead
             // segments; we orient each to start at the shared node.
             RoadSegment cand[kMaxNodeCandidates];
             int ncand = provider ? provider(nodeLat, nodeLon, cand, kMaxNodeCandidates, ctx) : 0;
-            float bestTurn = 1e9f;
+            float bestTurn = 1e9f; // lowest branch COST (turn angle + penalties, see branchCost)
+            int plausible = 0;     // branches continuing within kForkTurnDeg (fork detection)
             for (int c = 0; c < ncand; c++) {
                 const RoadSegment &seg = cand[c];
                 // Skip anything already on the route (prevents U-turns/loops).
@@ -148,8 +170,10 @@ int Route::build(const RoadSegment &startSeg, float startHeadingDeg, float ahead
                 if (!segNodesCoincide(cStartLat, cStartLon, nodeLat, nodeLon)) continue;
 
                 float turn = angDiff(incomingHeading, cHeading);
-                if (turn < bestTurn) {
-                    bestTurn = turn;
+                if (turn <= kForkTurnDeg) plausible++;
+                float cost = branchCost(turn, incomingClass, incomingFlags, seg.roadClass, seg.flags);
+                if (cost < bestTurn) {
+                    bestTurn = cost;
                     pick = seg;
                     pickStartLat = cStartLat; pickStartLon = cStartLon;
                     pickEndLat = cEndLat; pickEndLon = cEndLon;
@@ -158,6 +182,7 @@ int Route::build(const RoadSegment &startSeg, float startHeadingDeg, float ahead
                 }
             }
             if (!havePick) break; // dead end (cul-de-sac) — route ends here, which is fine
+            if (plausible >= 2 && forkAtM_ > 1e8f) forkAtM_ = arcLen; // first fork: path beyond is a guess
             nodeLat = pickEndLat; nodeLon = pickEndLon;
         }
 
@@ -171,12 +196,17 @@ int Route::build(const RoadSegment &startSeg, float startHeadingDeg, float ahead
         rs.startLatE7 = pickStartLat; rs.startLonE7 = pickStartLon;
         rs.endLatE7 = pickEndLat; rs.endLonE7 = pickEndLon;
         rs.speedLimitKmh = pick.speedLimitKmh;
+        rs.roadClass = pick.roadClass;
+        rs.flags = pick.flags;
         rs.headingDeg = pickHeading;
         rs.lenM = lenM;
         rs.startDistM = arcLen;
         arcLen += lenM;
         visited[visitedCount++] = pick.id;
         count_++;
+        incomingHeading = pickHeading;
+        incomingClass = pick.roadClass;
+        incomingFlags = pick.flags;
 
         if (arcLen >= aheadM) break;
     }
@@ -184,7 +214,7 @@ int Route::build(const RoadSegment &startSeg, float startHeadingDeg, float ahead
 }
 
 bool Route::project(float latDeg, float lonDeg, float lateralTolM, float *outDistM, float *outLat, float *outLon,
-                    float *outHeadingDeg) const {
+                    float *outHeadingDeg, float *outLateralM) const {
     if (count_ == 0) return false;
     float bestPerp = 1e9f, bestDist = 0, bestLat = 0, bestLon = 0, bestHeading = 0;
     bool found = false;
@@ -214,6 +244,7 @@ bool Route::project(float latDeg, float lonDeg, float lateralTolM, float *outDis
     if (outLat) *outLat = bestLat;
     if (outLon) *outLon = bestLon;
     if (outHeadingDeg) *outHeadingDeg = bestHeading;
+    if (outLateralM) *outLateralM = bestPerp;
     return true;
 }
 
@@ -255,4 +286,35 @@ bool Route::limitAt(float distM, float &outLimitKmh) const {
         }
     }
     return false;
+}
+
+bool Route::containsSegment(uint32_t id) const {
+    for (int i = 0; i < count_; i++)
+        if (segs_[i].id == id) return true;
+    return false;
+}
+
+float segPointDistM(const RoadSegment &seg, float latDeg, float lonDeg) {
+    float slat = seg.startLatE7 / 1e7f, slon = seg.startLonE7 / 1e7f;
+    Vec2 p = toLocalM(latDeg, lonDeg, slat, slon);
+    Vec2 e = toLocalM(seg.endLatE7 / 1e7f, seg.endLonE7 / 1e7f, slat, slon);
+    float L = e.x * e.x + e.y * e.y;
+    float t = L > 1e-4f ? (p.x * e.x + p.y * e.y) / L : 0.0f;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    float dx = p.x - e.x * t, dy = p.y - e.y * t;
+    return sqrtf(dx * dx + dy * dy);
+}
+
+bool Route::ownsPoint(float latDeg, float lonDeg, float maxLateralM, const uint32_t *nearIds, const float *nearDistM,
+                      int nNear, float marginM, float *outDistM, float *outHeadingDeg) const {
+    float dist, lateral, heading;
+    if (!project(latDeg, lonDeg, maxLateralM, &dist, 0, 0, &heading, &lateral)) return false;
+    for (int i = 0; i < nNear; i++) {
+        if (containsSegment(nearIds[i])) continue;
+        if (nearDistM[i] + marginM < lateral) return false; // clearly on another road
+    }
+    if (outDistM) *outDistM = dist;
+    if (outHeadingDeg) *outHeadingDeg = heading;
+    return true;
 }

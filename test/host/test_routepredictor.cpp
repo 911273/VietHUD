@@ -303,6 +303,93 @@ static void test_tile_boundary_stitch() {
     }
 }
 
+// ===================================================================
+// 2026-09-26 — route prediction quality (branch cost, forks, point ownership)
+static void setClass(uint32_t id, uint8_t cls) {
+    for (auto &s : g_world) if (s.id == id) s.roadClass = cls;
+}
+
+static void test_main_road_over_straight_side_street() {
+    printf("[12] junction: stays on the main road that bends, not the straight small side street\n");
+    g_world.clear();
+    addSeg(1, 0, 0, 200, 0, 60);                 // main road east (class 1)
+    addSeg(2, 200, 0, 373, 100, 60);             // main road bends 30 deg left
+    addSeg(3, 200, 0, 400, 0, 30);               // small alley straight on (class 3)
+    setClass(1, 1); setClass(2, 1); setClass(3, 3);
+    Route r;
+    r.build(worldById(1), 90.0f, 600.0f, worldProvider, nullptr);
+    CHECK(r.count() >= 2 && r.seg(1).id == 2, "follows the bending main road");
+}
+
+static void test_heading_updates_after_curve() {
+    printf("[13] after a curve, junction choice uses the road's CURRENT heading\n");
+    g_world.clear();
+    addSeg(1, 0, 0, 200, 0, 50);       // east
+    addSeg(2, 200, 0, 200, 200, 50);   // curve: now heading north
+    addSeg(3, 200, 200, 200, 400, 50); // continues north (straight on)
+    addSeg(4, 200, 200, 400, 200, 50); // turns east (same as the ORIGINAL heading)
+    Route r;
+    r.build(worldById(1), 90.0f, 800.0f, worldProvider, nullptr);
+    CHECK(r.count() >= 3 && r.seg(2).id == 3, "continues north after the bend (was: turned east)");
+}
+
+static void test_ramp_vs_mainline_and_fork() {
+    printf("[14] exit ramp vs mainline: mainline predicted, fork detected\n");
+    g_world.clear();
+    addSeg(1, 0, 0, 300, 0, 80);                          // expressway
+    addSeg(2, 300, 0, 600, 0, 80);                        // mainline straight on
+    addSeg(3, 300, 0, 590, -52, 40, DIR_FORWARD, SEGFLAG_LINK); // exit ramp ~10 deg right
+    setClass(1, 1); setClass(2, 1); setClass(3, 1);
+    Route r;
+    r.build(worldById(1), 90.0f, 800.0f, worldProvider, nullptr);
+    CHECK(r.count() >= 2 && r.seg(1).id == 2, "stays on the mainline");
+    CHECK_NEAR(r.forkAtM(), 300.0f, 2.0f, "fork recorded at the split (300 m)");
+    // A plain crossroads (90 deg turns) is NOT a fork.
+    g_world.clear();
+    addSeg(1, 0, 0, 300, 0, 50);
+    addSeg(2, 300, 0, 600, 0, 50);
+    addSeg(3, 300, 0, 300, 300, 50);
+    addSeg(4, 300, 0, 300, -300, 50);
+    Route c;
+    c.build(worldById(1), 90.0f, 800.0f, worldProvider, nullptr);
+    CHECK(c.forkAtM() > 1e8f, "crossroads is not a fork");
+}
+
+static void test_level_continuity() {
+    printf("[15] on a flyover: stays on the flyover, not onto the road below\n");
+    g_world.clear();
+    addSeg(1, 0, 0, 300, 0, 80, DIR_BIDIRECTIONAL, SEGFLAG_BRIDGE);   // flyover
+    addSeg(2, 300, 0, 600, 20, 80, DIR_BIDIRECTIONAL, SEGFLAG_BRIDGE); // flyover bends 4 deg
+    addSeg(3, 300, 0, 600, 0, 50);                                     // bad data: surface road touching the node
+    setClass(1, 1); setClass(2, 1); setClass(3, 1);
+    Route r;
+    r.build(worldById(1), 90.0f, 800.0f, worldProvider, nullptr);
+    CHECK(r.count() >= 2 && r.seg(1).id == 2, "keeps the bridge level");
+}
+
+static void test_point_ownership() {
+    printf("[16] which road does a camera/sign belong to?\n");
+    g_world.clear();
+    addSeg(1, 0, 0, 600, 0, 60);        // our road (east)
+    addSeg(2, 0, 14, 600, 14, 60);      // parallel service road / opposite carriageway, 14 m north
+    Route r;
+    r.build(worldById(1), 90.0f, 800.0f, worldProvider, nullptr);
+    auto own = [&](double e, double n) {
+        float lat, lon;
+        ptDeg(e, n, lat, lon);
+        uint32_t ids[2];
+        float d[2];
+        int k = 0;
+        for (auto &s : g_world) { ids[k] = s.id; d[k] = segPointDistM(s, lat, lon); k++; }
+        float dist;
+        return r.ownsPoint(lat, lon, 25.0f, ids, d, k, 3.0f, &dist, nullptr);
+    };
+    CHECK(own(300, 3), "camera 3 m from our road: ours");
+    CHECK(!own(300, 12), "camera 12 m away but 2 m from the parallel road: NOT ours");
+    CHECK(own(300, 7), "camera midway (7/7 m): kept (conservative)");
+    CHECK(!own(300, 40), "40 m off the route: not ours");
+}
+
 int main() {
     test_straight_road();
     test_tile_boundary_stitch();
@@ -315,6 +402,11 @@ int main() {
     test_gps_loss_recovery();
     test_untagged_segment_route_fill();
     test_oneway_wrongway();
+    test_main_road_over_straight_side_street();
+    test_heading_updates_after_curve();
+    test_ramp_vs_mainline_and_fork();
+    test_level_continuity();
+    test_point_ownership();
     printf("\n==== %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

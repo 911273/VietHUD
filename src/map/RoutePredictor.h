@@ -51,6 +51,8 @@ struct RouteSeg {
     int32_t startLatE7, startLonE7; // start node (travel direction)
     int32_t endLatE7, endLonE7;     // end node (travel direction)
     int16_t speedLimitKmh;          // -1 = unknown
+    uint8_t roadClass;              // RoadSegment::roadClass (1 major .. 3 small, 0 other)
+    uint8_t flags;                  // SEGFLAG_* (bridge / tunnel / link)
     float headingDeg;               // forward heading of THIS route direction (start->end as chained)
     float lenM;                     // segment length, meters
     float startDistM;               // arc length from route origin to this segment's start node
@@ -88,7 +90,25 @@ public:
     // that point (the local travel direction — what a sign's own orientation
     // tag should be compared against, not the car's raw heading, around curves).
     bool project(float latDeg, float lonDeg, float lateralTolM, float *outDistM, float *outLat, float *outLon,
-                 float *outHeadingDeg = 0) const;
+                 float *outHeadingDeg = 0, float *outLateralM = 0) const;
+
+    // Arc length (from the route origin) of the first FORK the route passes:
+    // a node where two or more branches both continue within kForkTurnDeg of
+    // the incoming heading (Y-split, exit ramp vs mainline). Beyond it the
+    // predicted path is a guess. Returns a huge value when there is none.
+    float forkAtM() const { return forkAtM_; }
+    static constexpr float kForkTurnDeg = 40.0f;
+
+    bool containsSegment(uint32_t id) const;
+
+    // Does this point (a sign / camera) belong to THIS route? True when it
+    // projects onto the route within maxLateralM AND no OTHER road segment is
+    // clearly closer (by more than marginM). nearIds/nearDistM: the road
+    // segments around the point with their distances to it (caller's tile
+    // data). Rejects a camera on the parallel service road, the opposite
+    // carriageway of a divided road, or the road below a flyover.
+    bool ownsPoint(float latDeg, float lonDeg, float maxLateralM, const uint32_t *nearIds, const float *nearDistM,
+                   int nNear, float marginM, float *outDistM, float *outHeadingDeg) const;
 
     // Walks the route forward from arc length `fromDistM` and reports the first
     // segment whose speed limit differs from `currentLimitKmh`, with its
@@ -115,4 +135,8 @@ private:
     RouteSeg segs_[kMaxSegments];
     int count_;
     float originLat_, originLon_; // route polyline start (start node of segs_[0])
+    float forkAtM_;               // see forkAtM()
 };
+
+// Distance (m) from a point to a road segment's centerline.
+float segPointDistM(const RoadSegment &seg, float latDeg, float lonDeg);

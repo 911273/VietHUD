@@ -395,6 +395,9 @@ bool speedLimitManagerGetNearbySegments(float lat, float lon, float radiusM, Roa
 // =====================================================================
 static const float kRouteBuildAheadM = 700.0f; // stop extending the route once it's this far ahead (covers the 600m max dynamic warn distance + margin)
 static const float kRouteLateralTolM = 35.0f;  // a camera/sign within this perpendicular distance of the route counts as "on the route"
+static const float kItemLateralTolM = 25.0f;   // stricter: a camera/sign must be this close to the route's centerline AND...
+static const float kItemOwnMarginM = 3.0f;     // ...no other road may be closer to it by more than this (see routeOwnsItem)
+static const float kItemNearRadiusM = 30.0f;   // roads considered as competing owners of an item
 
 static Route gRoute;                  // the one forward-route instance this module owns
 static int gRouteCount = 0;           // mirror of gRoute.count(), kept in sync by buildForwardRoute()/resetRouteState() so call sites read a plain int
@@ -445,6 +448,83 @@ static float routeTotalLenM() { return gRoute.totalLenM(); }
 static bool routeProject(float lat, float lon, float lateralTolM, float *outDistM, float *outLat, float *outLon,
                          float *outHeadingDeg = NULL) {
     return gRoute.project(lat, lon, lateralTolM, outDistM, outLat, outLon, outHeadingDeg);
+}
+
+// ---- Item ownership (2026-09-26, "nang cap chat luong do chinh xac canh bao
+// giao thong theo du doan lo trinh phia truoc"). A camera/sign counts as on
+// our route only if the route passes close to it AND it isn't clearly closer to
+// some OTHER road — the parallel service road, the opposite carriageway of a
+// divided road, the road under a flyover, a side street at a junction. The
+// competing roads around each item come from the tile cache and are cached per
+// item (items are static; the same few are re-checked every 500ms tick).
+static const int kItemNearMax = 6;
+struct ItemNearEntry {
+    uint32_t key;   // item identity (kind bit | index) mixed with its coordinates
+    uint8_t n;
+    uint32_t ids[kItemNearMax];
+    float dists[kItemNearMax];
+};
+static const int kItemNearCacheSize = 64;
+static ItemNearEntry gItemNear[kItemNearCacheSize];
+static bool gItemNearUsed[kItemNearCacheSize];
+
+static const ItemNearEntry &itemNearRoads(uint32_t key, float lat, float lon) {
+    int slot = (int)((key * 2654435761u) >> 26) & (kItemNearCacheSize - 1);
+    ItemNearEntry &e = gItemNear[slot];
+    if (gItemNearUsed[slot] && e.key == key) return e;
+    e.key = key;
+    e.n = 0;
+    gItemNearUsed[slot] = true;
+    float ts = gMetadata.tileSizeDeg;
+    if (ts <= 0) return e;
+    int32_t latCell = (int32_t)((lat + 90.0f) / ts);
+    int32_t lonCell = (int32_t)((lon + 180.0f) / ts);
+    // Cheap bbox reject before the exact distance: a segment's endpoints can't
+    // both be farther than (radius + half its length) away; segments are short
+    // (<~300m) so a generous box is enough.
+    const float boxDeg = (kItemNearRadiusM + 300.0f) / 110540.0f;
+    for (int dLat = -1; dLat <= 1; dLat++) {
+        for (int dLon = -1; dLon <= 1; dLon++) {
+            const CachedTile *tile = getOrLoadTile(packTile(latCell + dLat, lonCell + dLon));
+            if (!tile) continue;
+            for (int s = 0; s < tile->segCount; s++) {
+                const RoadSegment &c = tile->segments[s];
+                float aLat = c.startLatE7 / 1e7f, aLon = c.startLonE7 / 1e7f;
+                if (fabsf(aLat - lat) > boxDeg || fabsf(aLon - lon) > boxDeg * 1.1f) continue;
+                float d = segPointDistM(c, lat, lon);
+                if (d > kItemNearRadiusM) continue;
+                if (e.n < kItemNearMax) {
+                    e.ids[e.n] = c.id; e.dists[e.n] = d; e.n++;
+                } else { // keep the closest kItemNearMax
+                    int worst = 0;
+                    for (int k = 1; k < kItemNearMax; k++) if (e.dists[k] > e.dists[worst]) worst = k;
+                    if (d < e.dists[worst]) { e.ids[worst] = c.id; e.dists[worst] = d; }
+                }
+            }
+        }
+    }
+    return e;
+}
+
+// Arc distance (from the route origin) + road heading at an item that belongs
+// to our predicted route; false if it's off-route or owned by another road.
+static bool routeOwnsItem(uint32_t kindIndex, int32_t latE7, int32_t lonE7, float *outArcM, float *outHeadingDeg) {
+    float lat = latE7 / 1e7f, lon = lonE7 / 1e7f;
+    // Cheap first: most items within the horizon aren't near the route at all.
+    if (!gRoute.project(lat, lon, kItemLateralTolM, NULL, NULL, NULL)) return false;
+    uint32_t key = kindIndex ^ ((uint32_t)latE7 * 31u) ^ ((uint32_t)lonE7 * 17u);
+    const ItemNearEntry &e = itemNearRoads(key, lat, lon);
+    return gRoute.ownsPoint(lat, lon, kItemLateralTolM, e.ids, e.dists, e.n, kItemOwnMarginM, outArcM,
+                            outHeadingDeg);
+}
+
+// True if a route position lies past a FORK the car hasn't reached yet — the
+// predicted branch there is a guess (exit ramp vs mainline, Y-split), so a
+// sign/limit beyond it could belong to the branch we won't take. Once the car
+// passes the fork the route is rebuilt from the branch actually taken.
+static bool routeBeyondUnpassedFork(float arcM) {
+    float fork = gRoute.forkAtM();
+    return fork < 1e8f && gCarDistM < fork && arcM > fork;
 }
 
 static bool routeFindAheadLimitChange(float fromDistM, float currentLimitKmh, float maxM, float &outDistM,
@@ -940,6 +1020,10 @@ static bool findAheadLimitChange(const GnssSnapshot &gnss, float currentLimitKmh
     float maxM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
     if (gRouteCount > 0 && gCarOnRoute) {
         if (routeFindAheadLimitChange(gCarDistM, currentLimitKmh, maxM, outDistM, outLimitKmh)) {
+            // A change past an unpassed fork may be on the other branch (e.g.
+            // the 40 on an exit ramp while staying on the 80 mainline) — hold it
+            // back until the car commits to a branch.
+            if (routeBeyondUnpassedFork(gCarDistM + outDistM)) return false;
             return true;
         }
         // Route exists and we walked it fully — no change ahead within the
@@ -994,8 +1078,14 @@ static void matchCameraAheadRoute(const GnssSnapshot &gnss, const RoadInfoSnapsh
         Vec2 p = toLocalMeters(camLat, camLon, gnss.latDeg, gnss.lonDeg);
         if (sqrtf(p.x * p.x + p.y * p.y) > warnDistM + kRouteLateralTolM) continue;
 
-        float camArc, snapLat, snapLon;
-        if (!routeProject(camLat, camLon, kRouteLateralTolM, &camArc, &snapLat, &snapLon)) continue;
+        // Ownership, not just proximity: a camera on the parallel/opposite/
+        // lower road is rejected. NO direction filter for cameras — their
+        // stored directionDeg is effectively random in the data (measured
+        // 2026-09-26: 25% along travel, 23% opposite, 52% sideways on one-way
+        // roads). Not deferred past a fork either: a missed camera costs more
+        // than an early one.
+        float camArc;
+        if (!routeOwnsItem(0x80000000u | (uint32_t)i, cams[i].latE7, cams[i].lonE7, &camArc, NULL)) continue;
         float aheadDist = camArc - gCarDistM;     // remaining route distance to the camera
         if (aheadDist < 0) continue;             // behind the car
         if (aheadDist > warnDistM) continue;     // beyond the warn horizon
@@ -1169,10 +1259,11 @@ static void matchSignsAheadRoute(const GnssSnapshot &gnss, RoadInfoSnapshot &out
         Vec2 p = toLocalMeters(signLat, signLon, gnss.latDeg, gnss.lonDeg);
         if (sqrtf(p.x * p.x + p.y * p.y) > signWarnDistM + kRouteLateralTolM) continue;
 
-        float arc, snapLat, snapLon, routeHeading;
-        if (!routeProject(signLat, signLon, kRouteLateralTolM, &arc, &snapLat, &snapLon, &routeHeading)) continue;
+        float arc, routeHeading;
+        if (!routeOwnsItem((uint32_t)i, signs[i].latE7, signs[i].lonE7, &arc, &routeHeading)) continue;
         float aheadDist = arc - gCarDistM;   // remaining route distance to the sign
         if (aheadDist < 0 || aheadDist > signWarnDistM) continue; // behind, or beyond horizon
+        if (routeBeyondUnpassedFork(arc)) continue; // may be on the branch we won't take
 
         // Sign's own facing direction, judged against the ROAD heading at the
         // sign (routeHeading), not the car's raw heading — correct around curves.
