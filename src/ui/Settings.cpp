@@ -5,7 +5,6 @@
 #include "core/NvsStore.h"
 #include "core/SharedState.h" // gnssSnapshot()/roadInfoSnapshot() for the Sensors diagnostics panel
 #include "demo/DemoMode.h"    // scripted UI demo — Settings > Display switch
-#include "map/RasterMapManager.h"
 #include "map/SpeedLimitManager.h" // speedSourceStr() — Speed Map group in the Sensors tab
 #include "net/WebPortal.h"    // webPortalIsEnabled()/webPortalRequestEnable() — WiFi tab
 #include "net/DataUpdater.h"  // dataUpdateStart()/GetStatus() — WiFi tab "Update data" button
@@ -361,7 +360,7 @@ static void buildWifiScanOverlay(lv_obj_t *parent) {
     lv_label_set_long_mode(scanConnLbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(scanConnLbl, rw);
     lv_obj_set_style_text_color(scanConnLbl, lv_color_hex(0x8FA0B4), 0);
-    lv_obj_set_pos(scanConnLbl, rx, qy + 112);
+    lv_obj_set_pos(scanConnLbl, rx, qy + 134);
 
     bridgeBar = lv_bar_create(wifiScanOverlay);
     lv_obj_set_size(bridgeBar, rw, 10);
@@ -481,9 +480,14 @@ static void refreshScanListIfOpen() {
         char ap[40];
         webPortalApSsid(ap, sizeof(ap));
         bool secured = strlen(cfg.wifiPassword) >= 8;
-        char buf[200];
-        snprintf(buf, sizeof(buf), "Tên: %s\nMật khẩu: %s\nTrang: 192.168.4.1",
-                 ap, secured ? cfg.wifiPassword : "(không có)");
+        char buf[240];
+        int n = snprintf(buf, sizeof(buf), "Tên: %s\nMật khẩu: %s\nTrang: 192.168.4.1",
+                         ap, secured ? cfg.wifiPassword : "(không có)");
+        // Also on a WiFi network (home / phone hotspot): the portal is reachable
+        // at this address from any device on that same network.
+        char staIp[24];
+        if (webPortalStaIp(staIp, sizeof(staIp)) && n > 0 && n < (int)sizeof(buf))
+            snprintf(buf + n, sizeof(buf) - n, "\nMạng \"%s\": %s", cfg.staSsid, staIp);
         if (strcmp(lv_label_get_text(scanSavedLbl), buf) != 0) lv_label_set_text(scanSavedLbl, buf);
     }
 
@@ -502,8 +506,6 @@ static void refreshScanListIfOpen() {
             if (webPortalStaIp(ip, sizeof(ip))) {
                 if (dataUpdateAvailable())
                     snprintf(inet, sizeof(inet), "\nCó dữ liệu mới %s — mở trang để cập nhật", dataUpdateRemoteVersion());
-                else
-                    snprintf(inet, sizeof(inet), "\nVietHUD có Internet qua \"%s\"", cfg.staSsid);
             }
             if (clients > 0) {
                 snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Điện thoại đã kết nối (%d)\nTrang cài đặt tự mở trên điện thoại\n(hoặc vào 192.168.4.1)%s",
@@ -630,15 +632,6 @@ static void onChoiceBtnClicked(lv_event_t *e) {
             lv_obj_clear_flag(restartConfirmOverlay, LV_OBJ_FLAG_HIDDEN);
         }
     }
-    // Map source IS a choice row (addChoiceRow at the Map tab), so its apply
-    // logic must live HERE, not in onSliderChanged — it used to be only in the
-    // slider handler, which this choice row never dispatches to, so picking a
-    // map source silently did nothing (found in the 2026-09-24 UI audit).
-    if (b->target == &cfg.mapSource) {
-        RasterMapManager::instance().setMapSource((uint8_t)(int)cfg.mapSource);
-        saveConfigToNVS(cfg);
-        lv_label_set_text(settingsStatusLabel, "Da doi nguon ban do!");
-    }
 }
 
 static void addChoiceRow(lv_obj_t *parent, int &y, const char *name, float *target, const char *const *labels,
@@ -758,7 +751,6 @@ static void onDataUpdateBtnClicked(lv_event_t *) {
 // Settings > Sensors > "Speed Map" group — see refreshSensorsPanel(). Region/
 // version come from speedLimitManagerGetInfo() (static once loaded at boot);
 // the rest come from roadInfoSnapshot() (updates every ~500ms).
-static lv_obj_t *mapFileVal = nullptr, *mapTilesCountVal = nullptr, *mapZoomVal = nullptr, *mapStatusVal = nullptr;
 static lv_obj_t *speedMapStatusVal, *speedMapRegionVal, *speedMapVersionVal;
 static lv_obj_t *speedMapLimitVal, *speedMapSourceVal, *speedMapMatchVal, *speedMapRoadIdVal;
 
@@ -815,18 +807,6 @@ static void refreshSensorsPanel(lv_timer_t *) {
     // card is swapped and the device rebooted, so a single mapLoaded check
     // gates all the "static" fields; the rest (limit/source/match/road)
     // come from the live 500ms RoadInfoSnapshot regardless.
-    // Map tab diagnostic fields
-    if (mapFileVal) {
-        lv_label_set_text(mapFileVal, RasterMapManager::instance().getCurrentSourcePath());
-        char mBuf[32];
-        snprintf(mBuf, sizeof(mBuf), "%u tiles", (unsigned int)RasterMapManager::instance().getTileCount());
-        lv_label_set_text(mapTilesCountVal, mBuf);
-        snprintf(mBuf, sizeof(mBuf), "z%u .. z%u", (unsigned int)RasterMapManager::instance().getMinZoom(),
-                 (unsigned int)RasterMapManager::instance().getMaxZoom());
-        lv_label_set_text(mapZoomVal, mBuf);
-        lv_label_set_text(mapStatusVal, RasterMapManager::instance().isLoaded() ? "Active (OK)" : "File missing");
-    }
-
     SpeedMapMetadata mapInfo;
     bool mapLoaded = speedLimitManagerGetInfo(mapInfo);
     if (mapLoaded) {
@@ -1250,31 +1230,13 @@ void buildSettingsScreen() {
     demoSceneVal = addReadonlyRow(categoryPanels[0], y, "Demo scene");
 
     // -----------------------------------------------------------------
-    // Map tab (categoryPanels[1]) - Map Source (Carto / OSM) & Layers
+    // Map tab (categoryPanels[1]) — vector map display options
     // -----------------------------------------------------------------
     y = 4;
-    // Carto is the only source with street-level detail (z14/z15); OSM &
-    // Voyager top out at coarse z13 everywhere incl. Hanoi (measured
-    // 2026-09-24), so Carto is the default and marked "HD" here to steer the
-    // user away from the low-detail ones.
-    static const char *kMapSourceLabels[3] = {"Carto HD", "OSM (co ban)", "OSM Dark"};
-    addChoiceRow(categoryPanels[1], y, "Map Source", &cfg.mapSource, kMapSourceLabels, 3);
-    addSwitchRow(categoryPanels[1], y, "Ban do JPEG (nen anh)", &cfg.showRasterMap);
-    addSwitchRow(categoryPanels[1], y, "Vector Roads overlay", &cfg.showVectorRoads);
+    // Vector map only (raster JPEG background removed 2026-09-26).
     addSwitchRow(categoryPanels[1], y, "Huong xe len tren (xoay)", &cfg.mapHeadingUp);
     addSwitchRow(categoryPanels[1], y, "Vehicle Trail (track)", &cfg.showVehicleTrail);
 
-    y += 8;
-    lv_obj_t *mapHeader = lv_label_create(categoryPanels[1]);
-    lv_label_set_text(mapHeader, "SD Card Map File");
-    lv_obj_set_style_text_color(mapHeader, lv_color_hex(0x7C8A9A), 0);
-    lv_obj_set_pos(mapHeader, 4, y);
-    y += 20;
-
-    mapFileVal = addReadonlyRow(categoryPanels[1], y, "Active file");
-    mapTilesCountVal = addReadonlyRow(categoryPanels[1], y, "Tile count");
-    mapZoomVal = addReadonlyRow(categoryPanels[1], y, "Zoom range");
-    mapStatusVal = addReadonlyRow(categoryPanels[1], y, "Status");
 
     // Sensors tab (categoryPanels[2]) — real-hardware check/configure
     // (spec 16.6/16.7). GNSS (u-blox M10N, UART2) went real 2026-09-15;

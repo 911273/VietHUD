@@ -21,20 +21,14 @@ echo   [1] BAN DO VECTOR TOI GIAN (Khuyen dung - Chi ~16.6MB, Chep the sieu nhan
 echo       + Day du Canh bao giao thong, Camera phat nguoi, Bien bao toan quoc
 echo       + Day du Tuyen duong Vector (tiles.bin) va Ten duong pho (names.bin)
 echo       + Day du Thu vien am thanh giong noi (sounds/)
-echo       - Khong kem file anh raster nang 448MB
 echo.
-echo   [2] BAN DO DAY DU (Full - ~460MB)
-echo       + Bao gom toan bo muc [1] va them file anh nen Raster (maptiles.bin)
-echo.
-echo   [3] CHI DU LIEU CANH BAO GIAO THONG (Alerts Only - ~3MB)
+echo   [2] CHI DU LIEU CANH BAO GIAO THONG (Alerts Only - ~3MB)
 echo       + Chi bao gom Camera, Bien bao va Am thanh
 echo.
 
-set /p choice="Nhap lua chon cua ban [1/2/3] (Nhan Enter mac dinh la 1): "
+set /p choice="Nhap lua chon cua ban [1/2] (Nhan Enter mac dinh la 1): "
 
 if "%choice%"=="2" (
-    set MODE_ARG=--full
-) else if "%choice%"=="3" (
     set MODE_ARG=--mode alerts
 ) else (
     set MODE_ARG=--vector-only

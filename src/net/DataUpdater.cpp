@@ -13,9 +13,8 @@
 #include <freertos/task.h>
 #include <string.h>
 
-// The core (vector) data set the updater manages. maptiles*.bin is deliberately
-// NOT here (vector-only). A file listed in the remote manifest but not here is
-// still downloaded — this array only bounds the local-manifest parse.
+// The (vector-only) data set the updater manages. A file listed in the remote
+// manifest but not here is still downloaded — this bounds the manifest parse.
 #define DU_MAX_FILES 24
 #define DU_SPEEDMAP_DIR "/speedmap/"
 #define DU_MANIFEST_NAME "manifest.txt"
