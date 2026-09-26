@@ -51,6 +51,8 @@
 #include "log/TripLogger.h"
 #include "net/WebPortal.h"
 #include "net/DataUpdater.h" // dataUpdateStart()/GetStatus() — serial 'u' bench trigger
+#include "update/DataInstaller.h" // boot-time atomic data install + rollback (Phone Update Bridge)
+#include <esp_ota_ops.h> // esp_ota_mark_app_valid_cancel_rollback() — firmware OTA rollback
 #include "touch/TouchTask.h"
 #include "ui/Dashboard.h"
 #include "ui/Settings.h"
@@ -67,8 +69,8 @@ LV_IMAGE_DECLARE(logo_vre);
 // sketch can override it — this is that override. Raised to 16384
 // 2026-09-22 after a REAL, reproducible crash on hardware: "Guru Meditation
 // Error: Core 1 panic'ed (Unhandled debug exception) — Stack canary
-// watchpoint triggered (loopTask)" while map/RasterMapManager.cpp's
-// renderBackground() retried a failed SD read every 2s directly from
+// watchpoint triggered (loopTask)" while the (since removed, 2026-09-26)
+// raster-map background retried a failed SD read every 2s directly from
 // updateMapCanvas() (ui/Dashboard.cpp), itself called every ~150ms tick from
 // this file's own loop() — i.e. loopTask, the Arduino default/UI task this
 // whole file's setup()/loop() runs as (see this file's own header comment).
@@ -78,9 +80,8 @@ LV_IMAGE_DECLARE(logo_vre);
 // then became a real one. Doubling to 16384 is the standard, minimal-risk
 // fix for genuine stack pressure (loopTask is UI-only work, not a
 // tightly-budgeted small task like the sensor tasks elsewhere in this
-// project) — it does not touch or explain away whatever in
-// RasterMapManager.cpp/SD_MMC's own call depth is actually consuming that
-// much stack, which is a separate thing worth understanding on its own.
+// project). Kept at 16384 after the raster code was removed: the vector map
+// draw + SD tile reads still run from this task.
 size_t getArduinoLoopTaskStackSize(void) { return 16384; }
 
 static lv_display_t *lvDisplay;
@@ -89,7 +90,29 @@ static lv_indev_t *lvTouchIndev;
 static uint32_t lastStatsMs = 0;
 static uint32_t lastMemStatsMs = 0;
 
+// Bench-only synthetic touch (serial 'T'/'H'/'G' in loop()): lets a PC drive the
+// UI without a finger — a press from (x0,y0) to (x1,y1) held until sInjEndMs.
+static volatile uint32_t sInjStartMs = 0, sInjEndMs = 0;
+static volatile int16_t sInjX0, sInjY0, sInjX1, sInjY1;
+
 static void touch_read_cb(lv_indev_t *, lv_indev_data_t *data) {
+    uint32_t nowMs = millis();
+    if (sInjEndMs && (int32_t)(nowMs - sInjEndMs) < 0) {
+        uint32_t span = sInjEndMs - sInjStartMs, t = nowMs - sInjStartMs;
+        data->point.x = sInjX0 + (int32_t)(sInjX1 - sInjX0) * (int32_t)t / (int32_t)(span ? span : 1);
+        data->point.y = sInjY0 + (int32_t)(sInjY1 - sInjY0) * (int32_t)t / (int32_t)(span ? span : 1);
+        data->state = LV_INDEV_STATE_PRESSED;
+        wakeScreen();
+        return;
+    }
+    if (sInjEndMs) { // injected gesture just ended: one release at its end point
+        sInjEndMs = 0;
+        data->point.x = sInjX1;
+        data->point.y = sInjY1;
+        data->state = LV_INDEV_STATE_RELEASED;
+        Serial.println("[touch] injected UP");
+        return;
+    }
     TouchPoint p = touchSnapshot();
     static bool wasTouched = false; // only log on DOWN/UP transitions, not every poll
     if (p.pressed) {
@@ -175,133 +198,186 @@ static void showBootSplash() {
 }
 
 // ---------------------------------------------------------------------
-// "Update mode": entered at boot when the user pressed "Update data" (web or
-// on-screen), which set an NVS flag and rebooted. We land here with ONLY the
-// display + LVGL + SD up — none of the map/audio/GNSS/AP tasks have started —
-// so a big block of internal RAM is free for the TLS handshake that the normal
-// running app can't spare (the "cannot fetch manifest" failure: TLS needs
-// ~16 KB contiguous, the live app leaves ~10 KB). We bring up WiFi station,
-// run the download to completion on its own task while pumping a small progress
-// screen, then reboot back into normal mode. This function never returns.
+// Shared pump for the blocking setup-time screens below (update mode, install
+// result): drive LVGL + feed the watchdog while nothing else is running yet.
+static uint32_t sPumpLastMs = 0;
+static void setupPump() {
+    uint32_t n = millis();
+    if (sPumpLastMs == 0) sPumpLastMs = n;
+    lv_tick_inc(n - sPumpLastMs);
+    sPumpLastMs = n;
+    lv_timer_handler();
+    esp_task_wdt_reset();
+    delay(10);
+}
+
+// A simple full-screen status page used by update mode and the install-result
+// notice: big icon, title, message, optional progress bar, footer hint.
+struct StatusScreen {
+    lv_obj_t *scr, *icon, *title, *msg, *bar, *sub, *hint;
+};
+static StatusScreen makeStatusScreen(const char *titleTxt, uint32_t accent) {
+    StatusScreen s;
+    s.scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s.scr, lv_color_hex(0x0B0F14), 0);
+    lv_obj_clear_flag(s.scr, LV_OBJ_FLAG_SCROLLABLE);
+    int w = gfx->width();
+    s.icon = lv_label_create(s.scr);
+    lv_obj_set_style_text_font(s.icon, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(s.icon, lv_color_hex(accent), 0);
+    lv_label_set_text(s.icon, LV_SYMBOL_DOWNLOAD);
+    lv_obj_align(s.icon, LV_ALIGN_TOP_MID, 0, 26);
+    s.title = lv_label_create(s.scr);
+    lv_obj_set_style_text_color(s.title, lv_color_hex(accent), 0);
+    lv_label_set_text(s.title, titleTxt);
+    lv_obj_align(s.title, LV_ALIGN_TOP_MID, 0, 70);
+    s.msg = lv_label_create(s.scr);
+    lv_obj_set_width(s.msg, w - 60);
+    lv_label_set_long_mode(s.msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(s.msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s.msg, lv_color_hex(0xE6EDF3), 0);
+    lv_label_set_text(s.msg, "");
+    lv_obj_align(s.msg, LV_ALIGN_TOP_MID, 0, 104);
+    s.bar = lv_bar_create(s.scr);
+    lv_obj_set_size(s.bar, w - 120, 12);
+    lv_obj_align(s.bar, LV_ALIGN_TOP_MID, 0, 196);
+    lv_obj_set_style_bg_color(s.bar, lv_color_hex(0x1E2A38), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s.bar, lv_color_hex(accent), LV_PART_INDICATOR);
+    lv_bar_set_range(s.bar, 0, 100);
+    lv_obj_add_flag(s.bar, LV_OBJ_FLAG_HIDDEN);
+    s.sub = lv_label_create(s.scr);
+    lv_obj_set_style_text_color(s.sub, lv_color_hex(0x8A98A8), 0);
+    lv_label_set_text(s.sub, "");
+    lv_obj_align(s.sub, LV_ALIGN_TOP_MID, 0, 216);
+    s.hint = lv_label_create(s.scr);
+    lv_obj_set_style_text_color(s.hint, lv_color_hex(0x6B7888), 0);
+    lv_label_set_text(s.hint, "");
+    lv_obj_align(s.hint, LV_ALIGN_BOTTOM_MID, 0, -18);
+    lv_screen_load(s.scr);
+    return s;
+}
+
+// After a boot that swapped in new data (or rolled back a bad install), tell
+// the driver what happened for ~2.5 s before the normal splash.
+static void showInstallResult(bool rolledBack) {
+    char detail[64];
+    installerLastResult(detail, sizeof(detail), false);
+    Serial.printf("[install] result screen: %s (%s)\n", rolledBack ? "ROLLED BACK" : "UPDATED", detail);
+    StatusScreen s = makeStatusScreen(rolledBack ? "KHÔI PHỤC DỮ LIỆU CŨ" : "ĐÃ CẬP NHẬT DỮ LIỆU",
+                                      rolledBack ? 0xE8B931 : 0x34C46A);
+    lv_label_set_text(s.icon, rolledBack ? LV_SYMBOL_WARNING : LV_SYMBOL_OK);
+    char b[160];
+    if (rolledBack)
+        snprintf(b, sizeof(b), "Bản cập nhật không dùng được (%s).\nVietHUD đã tự quay lại dữ liệu trước đó.", detail);
+    else
+        snprintf(b, sizeof(b), "Bản đồ và cảnh báo đã được cài đặt.\nPhiên bản dữ liệu: %s", detail);
+    lv_label_set_text(s.msg, b);
+    for (int i = 0; i < 250; i++) setupPump();
+    lv_obj_delete(s.scr);
+}
+
+// ---------------------------------------------------------------------
+// "Update mode" (Mode A — the device downloads by itself): entered at boot when
+// the user asked for a direct online update (web or on-screen), which set an
+// NVS flag and rebooted. We land here with ONLY display + LVGL + SD up — none
+// of the map/audio/GNSS/AP tasks have started — so a big block of internal RAM
+// is free for the TLS handshake the normal running app can't spare (TLS needs
+// ~16 KB contiguous). Joins the configured / saved WiFi networks in turn, runs
+// the download (which stages + verifies through DataInstaller), then reboots;
+// the boot-time installer swaps the data in. This function never returns.
 static void runDataUpdateMode() {
     Serial.println("[update-mode] entered — display+SD only, connecting WiFi for OTA");
-
-    // Minimal progress screen (LVGL is already initialised before this is called).
-    lv_obj_t *scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A1526), 0);
-    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "CAP NHAT DU LIEU");
-    lv_obj_set_style_text_color(title, lv_color_hex(0x4FC3F7), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 34);
-    lv_obj_t *msg = lv_label_create(scr);
-    lv_obj_set_width(msg, gfx->width() - 48);
-    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(msg, lv_color_hex(0xE0E6ED), 0);
-    lv_label_set_text(msg, "Dang ket noi WiFi...");
-    lv_obj_align(msg, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_t *hint = lv_label_create(scr);
-    lv_obj_set_style_text_color(hint, lv_color_hex(0x7A8896), 0);
-    lv_label_set_text(hint, "Khong tat nguon trong khi cap nhat");
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -22);
-    lv_screen_load(scr);
-
-    uint32_t lt = millis();
-    auto pump = [&]() {
-        uint32_t n = millis();
-        lv_tick_inc(n - lt); lt = n;
-        lv_timer_handler();
-        esp_task_wdt_reset();
-        delay(10);
-    };
-    for (int i = 0; i < 12; i++) pump();
-
-    if (cfg.staSsid[0] == '\0') {
-        Serial.println("[update-mode] no STA SSID configured — aborting");
-        lv_label_set_text(msg, "Chua cai mang WiFi.\nVao Settings > WiFi de dat.");
-        for (int i = 0; i < 350; i++) pump();
+    StatusScreen s = makeStatusScreen("CẬP NHẬT DỮ LIỆU", 0x3DA5FF);
+    lv_label_set_text(s.hint, "Không tắt nguồn trong khi cập nhật");
+    lv_label_set_text(s.msg, "Đang kết nối Wi-Fi...");
+    for (int i = 0; i < 12; i++) setupPump();
+    auto finish = [&](const char *text, bool ok, int ticks) {
+        lv_label_set_text(s.icon, ok ? LV_SYMBOL_OK : LV_SYMBOL_WARNING);
+        lv_obj_set_style_text_color(s.icon, lv_color_hex(ok ? 0x34C46A : 0xE8B931), 0);
+        lv_label_set_text(s.msg, text);
+        lv_label_set_text(s.hint, "Tự khởi động lại...");
+        for (int i = 0; i < ticks; i++) setupPump();
         ESP.restart();
-    }
+    };
 
-    Serial.printf("[update-mode] connecting to \"%s\"\n", cfg.staSsid);
+    // Candidate networks: the active STA creds first, then every saved one.
+    const char *ssids[AppConfig::kMaxSavedNetworks + 1];
+    const char *passes[AppConfig::kMaxSavedNetworks + 1];
+    int nc = 0;
+    if (cfg.staSsid[0]) {
+        ssids[nc] = cfg.staSsid;
+        passes[nc++] = cfg.staPassword;
+    }
+    for (int i = 0; i < cfg.savedNetworkCount; i++) {
+        bool dup = false;
+        for (int k = 0; k < nc; k++) dup |= strcmp(ssids[k], cfg.savedNetworks[i].ssid) == 0;
+        if (!dup && cfg.savedNetworks[i].ssid[0]) {
+            ssids[nc] = cfg.savedNetworks[i].ssid;
+            passes[nc++] = cfg.savedNetworks[i].password;
+        }
+    }
+    if (nc == 0) finish("Chưa có Wi-Fi Internet cho VietHUD.\nHãy cập nhật qua điện thoại (mục Dữ liệu).", false, 400);
+
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false); // keep the radio hot while we wait for the AP to appear
-    WiFi.begin(cfg.staSsid, cfg.staPassword);
-    // iOS Personal Hotspot in particular parks its radio when no client is
-    // attached, so the first association attempt can miss even when the phone is
-    // "on". Wait up to 45s and re-issue begin() a couple of times to catch the
-    // AP the moment it wakes; log the raw status code each second to diagnose.
-    const uint32_t kConnectMs = 45000;
-    uint32_t t0 = millis();
-    uint32_t lastRebegin = t0;
-    int lastStatus = -99;
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < kConnectMs) {
-        int st = WiFi.status();
-        if (st != lastStatus) {
-            Serial.printf("[update-mode] wifi status=%d (%lus)\n", st,
-                          (unsigned long)((millis() - t0) / 1000));
-            lastStatus = st;
+    bool up = false;
+    for (int c = 0; c < nc && !up; c++) {
+        Serial.printf("[update-mode] connecting to \"%s\"\n", ssids[c]);
+        WiFi.disconnect();
+        WiFi.begin(ssids[c], passes[c]);
+        // iOS Personal Hotspot parks its radio when no client is attached, so the
+        // first association attempt can miss even when the phone is "on":
+        // re-issue begin() every 12 s within a ~30 s window per network.
+        uint32_t t0 = millis(), lastRebegin = t0;
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) {
+            if (millis() - lastRebegin > 12000) {
+                WiFi.disconnect();
+                WiFi.begin(ssids[c], passes[c]);
+                lastRebegin = millis();
+            }
+            char b[96];
+            snprintf(b, sizeof(b), "Đang kết nối Wi-Fi \"%s\"... %lus", ssids[c],
+                     (unsigned long)((millis() - t0) / 1000));
+            lv_label_set_text(s.msg, b);
+            setupPump();
         }
-        if (millis() - lastRebegin > 12000) { // nudge: re-begin if still not up
-            Serial.println("[update-mode] re-issuing WiFi.begin()");
-            WiFi.disconnect();
-            WiFi.begin(cfg.staSsid, cfg.staPassword);
-            lastRebegin = millis();
-        }
-        char b[80];
-        snprintf(b, sizeof(b), "Dang ket noi WiFi...\n%s (%lus)", cfg.staSsid,
-                 (unsigned long)((millis() - t0) / 1000));
-        lv_label_set_text(msg, b);
-        pump();
+        up = WiFi.status() == WL_CONNECTED;
     }
-    if (WiFi.status() != WL_CONNECTED) {
+    if (!up) {
         Serial.printf("[update-mode] WiFi connect FAILED (last status=%d)\n", WiFi.status());
-        lv_label_set_text(msg,
-            "Khong ket noi duoc WiFi.\nBat hotspot 2.4GHz (mo man hinh\nPersonal Hotspot) roi thu lai.");
-        for (int i = 0; i < 500; i++) pump();
-        ESP.restart();
+        finish("Không kết nối được Wi-Fi.\nBật hotspot 2.4 GHz rồi thử lại,\nhoặc cập nhật qua điện thoại.", false, 500);
     }
-
-    // NTP — GitHub's TLS is happy without cert-time checks (setInsecure), but a
-    // sane clock never hurts and matches the running app's behaviour.
     configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
-    Serial.printf("[update-mode] STA up: %s  free internal=%u biggest=%u\n",
-                  WiFi.localIP().toString().c_str(),
+    Serial.printf("[update-mode] STA up: %s  free internal=%u biggest=%u\n", WiFi.localIP().toString().c_str(),
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    lv_label_set_text(msg, "Da ket noi. Dang tai du lieu...");
-    for (int i = 0; i < 10; i++) pump();
+    lv_label_set_text(s.msg, "Đã kết nối. Đang kiểm tra bản mới...");
+    for (int i = 0; i < 10; i++) setupPump();
 
     if (!dataUpdateStart()) {
         DataUpdateStatus st = dataUpdateGetStatus();
-        Serial.printf("[update-mode] dataUpdateStart failed: %s\n", st.message);
-        char b[96];
-        snprintf(b, sizeof(b), "Loi: %s", st.message);
-        lv_label_set_text(msg, b);
-        for (int i = 0; i < 450; i++) pump();
-        ESP.restart();
+        char b[112];
+        snprintf(b, sizeof(b), "Lỗi: %s", st.message);
+        finish(b, false, 450);
     }
-
-    // Poll the updater task and mirror progress to the screen. On success the
-    // task reboots the device itself (to reload the new data cleanly); if it
-    // finishes without a reboot (no changes) or fails, we reboot from here.
+    lv_obj_clear_flag(s.bar, LV_OBJ_FLAG_HIDDEN);
     for (;;) {
         DataUpdateStatus st = dataUpdateGetStatus();
-        char b[112];
-        if (st.state == DU_RUNNING && st.filesTotal > 0) {
-            snprintf(b, sizeof(b), "%s\nFile %d/%d  (%d%%)",
-                     st.message, st.filesDone, st.filesTotal, st.percent);
-        } else {
-            snprintf(b, sizeof(b), "%s", st.message);
+        lv_label_set_text(s.msg, st.message);
+        if (st.filesTotal > 0) {
+            int cur = st.filesDone < st.filesTotal ? st.percent : 0;
+            int overall = (st.filesDone * 100 + cur) / st.filesTotal;
+            lv_bar_set_value(s.bar, overall, LV_ANIM_OFF);
+            char b[48];
+            snprintf(b, sizeof(b), "Tệp %d/%d  ·  %d%%",
+                     st.filesDone < st.filesTotal ? st.filesDone + 1 : st.filesTotal, st.filesTotal, overall);
+            lv_label_set_text(s.sub, b);
         }
-        lv_label_set_text(msg, b);
-        pump();
+        setupPump();
         if (st.state == DU_SUCCESS || st.state == DU_FAILED) {
             Serial.printf("[update-mode] terminal state=%d: %s\n", st.state, st.message);
-            for (int i = 0; i < 300; i++) pump();  // ~3s to read the result
-            ESP.restart();
+            finish(st.message, st.state == DU_SUCCESS, 300); // success path: the task reboots first
         }
     }
 }
@@ -371,7 +447,13 @@ void setup() {
     lv_timer_set_period(lv_indev_get_read_timer(lvTouchIndev), 20);
     lv_indev_set_long_press_time(lvTouchIndev, HOLD_PRESS_MS);      // hold 1s anywhere on the dashboard = Settings
 
-    sdMgrMount();
+    // Data install journal (Phone Update Bridge / online update): swap staged,
+    // verified files in BEFORE the map data is loaded into PSRAM, then let the
+    // installer roll back if the new set doesn't mount. See update/DataInstaller.h.
+    bool dataApplied = installerBootApply();
+    bool mountOk = sdMgrMount();
+    installerAfterMount(mountOk); // rolls back + reboots if the NEW data can't mount
+    if (dataApplied || installerRolledBackThisBoot()) showInstallResult(!dataApplied);
 
     // If the last shutdown was a "press Update data → reboot", handle the whole
     // download here, before any RAM-hungry task starts, then reboot back to
@@ -392,6 +474,9 @@ void setup() {
     sharedStateInit();
     gnssTaskStart();  // Core 0 — real GNSS M10N on UART2
     webPortalInit(); // Core 0 — WiFi AP + local web server, starts with WiFi OFF — see net/WebPortal.h
+    // Just rebooted to install data pushed from a phone: bring the hotspot back
+    // so the phone reconnects and its portal page can show the result.
+    if (installerTakeWifiOnRequest()) webPortalRequestEnable(true);
     speedLimitManagerStart(); // Core 0 — microSD speed-limit/camera/sign map matching, see map/SpeedLimitManager.h
     tripLoggerStart(); // Core 0 — microSD trip/event CSV logging, see log/TripLogger.h
     demoModeStart(); // Core 0 — scripted UI demo, idles until switched on in Settings > Display (demo/DemoMode.h)
@@ -409,8 +494,23 @@ void setup() {
     Serial.println("[viethud] running — hold the screen 1s to open Settings");
 }
 
+// Firmware OTA rollback (bootloader CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=1):
+// tell the Arduino core NOT to auto-confirm a freshly OTA'd image at startup.
+// loop() confirms it after kHealthyAfterMs of normal running; a crash/reset
+// before that boots the previous firmware again. (C linkage: overrides the weak
+// default in esp32-hal-misc.c.)
+extern "C" bool verifyRollbackLater() { return true; }
+static const uint32_t kHealthyAfterMs = 30000;
+
 void loop() {
     esp_task_wdt_reset();
+
+    static bool sHealthyDone = false;
+    if (!sHealthyDone && millis() > kHealthyAfterMs) {
+        sHealthyDone = true;
+        esp_ota_mark_app_valid_cancel_rollback(); // no-op unless this image is pending verification
+        installerConfirmHealthy();                // new data survived 30 s -> drop its backups
+    }
 
     static uint32_t lastTick = millis();
     static uint32_t lastHb = 0;
@@ -446,6 +546,30 @@ void loop() {
             webPortalRequestEnable(true); // bench: scan nearby WiFi (needs radio on) and log results
             webPortalStartScan();
             Serial.println("[debug] WiFi scan requested via serial");
+        } else if (c == 'T' || c == 'H' || c == 'G') {
+            // Bench: synthetic touch. "T x y" tap, "H x y ms" hold, "G x1 y1 x2 y2 ms" drag.
+            String line = Serial.readStringUntil('\n');
+            int v[5] = {0, 0, 0, 0, 0};
+            int n = sscanf(line.c_str(), "%d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4]);
+            int x0 = v[0], y0 = v[1], x1 = v[0], y1 = v[1], ms = 150;
+            if (c == 'H' && n >= 3) ms = v[2];
+            if (c == 'G' && n >= 5) { x1 = v[2]; y1 = v[3]; ms = v[4]; }
+            sInjX0 = x0; sInjY0 = y0; sInjX1 = x1; sInjY1 = y1;
+            sInjStartMs = millis();
+            sInjEndMs = sInjStartMs + (ms > 0 ? ms : 1);
+            Serial.printf("[touch] injected %c (%d,%d)->(%d,%d) %dms\n", c, x0, y0, x1, y1, ms);
+        } else if (c == 'n') {
+            // Bench: add a saved STA network without the touchscreen/portal —
+            // "n<ssid>\t<password>\n". Used to put the device on a PC hotspot
+            // so a PC can drive the Phone Update Bridge API end-to-end.
+            String line = Serial.readStringUntil('\n');
+            int tab = line.indexOf('\t');
+            if (tab > 0) {
+                String pass = line.substring(tab + 1);
+                pass.trim();
+                webPortalAddNetwork(line.substring(0, tab).c_str(), pass.c_str());
+                Serial.printf("[debug] saved network via serial: \"%s\"\n", line.substring(0, tab).c_str());
+            }
         } else if (c == 'u') {
             // Bench trigger for the OTA data update. Uses the SAME reliable path
             // as the web + on-screen buttons: set the NVS flag and reboot into

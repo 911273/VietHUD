@@ -9,9 +9,7 @@
 // card, verified, then atomically renamed over the live file. See the approved
 // plan and net/DataUpdater.cpp for the full flow.
 //
-// Data is VECTOR-ONLY now: the ~8 MB core (tiles/index/metadata/names/
-// seg_names/signs/cameras) is what gets updated; the 448 MB raster maptiles.bin
-// is no longer shipped (see AppConfig::showRasterMap).
+// Data is vector-only: tiles/index/metadata/names/seg_names/signs/cameras.
 
 enum DataUpdateState : uint8_t {
     DU_IDLE = 0,   // never run this session, or finished a while ago
@@ -22,7 +20,7 @@ enum DataUpdateState : uint8_t {
 
 struct DataUpdateStatus {
     DataUpdateState state;
-    char message[64];  // human-readable current step or error reason
+    char message[96];  // human-readable current step or error reason (UTF-8 Vietnamese)
     int filesTotal;    // files that need updating this run
     int filesDone;     // files completed so far
     int percent;       // 0..100 progress of the CURRENT file
@@ -44,3 +42,15 @@ bool dataUpdatePending();
 
 // Snapshot of the current progress/result for the web + on-screen UI.
 DataUpdateStatus dataUpdateGetStatus();
+
+// OTA auto-check (2026-09-26): fetch ONLY the remote manifest.txt and compare its
+// version line to the copy on the SD card. Cheap, downloads nothing else, never
+// reboots. dataUpdateCheckStart() runs it in the background (no-op unless WiFi
+// station is connected and a URL is set); the getters feed the on-screen + web
+// "update available" indicator. Applying an update is still the manual
+// dataUpdateSchedule() path.
+bool dataUpdateCheckStart();
+bool dataUpdateAvailable();
+bool dataUpdateCheckInProgress();
+const char *dataUpdateRemoteVersion();
+const char *dataUpdateLocalVersion();

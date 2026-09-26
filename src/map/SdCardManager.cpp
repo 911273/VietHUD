@@ -4,6 +4,7 @@
 #include <SD_MMC.h>
 #include <esp_heap_caps.h>
 #include <esp_task_wdt.h> // esp_task_wdt_reset() — see ensureSdMmcBegun()'s own comment
+#include <mbedtls/sha256.h> // sdMgrSha256File() — data-install readback verify
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <stdio.h> // sscanf() — trip-log filename parsing in sdMgrListTripLogs()
@@ -93,9 +94,16 @@ static int trafficSignCount = 0;
 // segNameWidth records how wide each seg_names.bin entry is (2 for legacy v1
 // cards, 4 for v2), so an old card still reads correctly. See the names.bin
 // loader for the exact v1/v2 header layouts.
+//
+// NOT loaded into PSRAM any more (2026-09-26): the nationwide names.bin is a
+// ~1.7 MB pool + ~0.25 MB offsets, which filled PSRAM so completely that
+// allocations spilled into internal RAM and the WiFi driver could no longer
+// start (esp_wifi_init ESP_ERR_NO_MEM, then a crash in hostap attach). The only
+// consumer is the current-road label, which changes a few times a minute and
+// is cached per segment, so each name is read straight from the card instead.
 static uint32_t roadNameCount = 0;
-static uint32_t *roadNameOffsets = NULL;
-static char *roadNamePool = NULL;
+static uint32_t roadNameOffsetsBase = 0; // file offset of the u32 offsets table
+static uint32_t roadNamePoolBase = 0;    // file offset of the UTF-8 string pool
 static size_t roadNamePoolSize = 0;
 static uint8_t segNameWidth = 2; // bytes per seg_names.bin entry: v1=2, v2=4
 
@@ -348,12 +356,9 @@ bool sdMgrMount() {
     }
     Serial.printf("[sdmgr] signs.bin: %d traffic sign(s) loaded\n", trafficSignCount);
 
-    // names.bin - loaded into PSRAM for road name display
-    if (roadNameOffsets) { heap_caps_free(roadNameOffsets); roadNameOffsets = NULL; }
-    if (roadNamePool) { heap_caps_free(roadNamePool); roadNamePool = NULL; }
+    // names.bin — header only; names are read on demand (sdMgrGetRoadName).
     roadNameCount = 0;
     roadNamePoolSize = 0;
-
     segNameWidth = 2;
     File nameFile = SD_MMC.open("/speedmap/names.bin");
     if (nameFile) {
@@ -362,7 +367,7 @@ bool sdMgrMount() {
         uint32_t count = 0, totalBytes = 0;
         if (nameFile.read((uint8_t *)magic, 4) == 4 && memcmp(magic, "VNNM", 4) == 0) {
             nameFile.read((uint8_t *)&version, 2);
-            // Header layouts, both 16 bytes total after magic+version:
+            // Header layouts, both 16 bytes total including magic+version:
             //   v1: count(u16) totalBytes(u32) reserved(u32)   — seg_names entries are u16
             //   v2: count(u32) totalBytes(u32) reserved(u16)   — seg_names entries are u32
             // v2 lifts the 65 535-name ceiling for the full-VN dataset. Old v1
@@ -382,36 +387,20 @@ bool sdMgrMount() {
                 count = count16;
                 segNameWidth = 2;
             }
-
-            // Sanity ceilings (raised for v2): a corrupt header must not trigger a
-            // wild allocation. Real full-VN data stays far below these; if it ever
-            // legitimately exceeds PSRAM the heap_caps_malloc NULL-check below
-            // fails gracefully (names simply don't load) rather than crashing.
-            if (count > 0 && totalBytes > 0 && count < 5000000u && totalBytes < 16000000u) {
-                roadNameOffsets = (uint32_t *)heap_caps_malloc(count * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
-                roadNamePool = (char *)heap_caps_malloc(totalBytes, MALLOC_CAP_SPIRAM);
-                if (roadNameOffsets && roadNamePool) {
-                    nameFile.read((uint8_t *)roadNameOffsets, count * sizeof(uint32_t));
-                    nameFile.read((uint8_t *)roadNamePool, totalBytes);
-                    // Defensive: force a terminator on the very last byte so any
-                    // string returned by sdMgrGetRoadName() (which only checks that
-                    // its START offset is < poolSize) is guaranteed to be
-                    // NUL-terminated within the buffer. Without this, a truncated
-                    // or corrupt names.bin (e.g. an interrupted OTA) whose last
-                    // string lacks a terminator would let strncpy/label rendering
-                    // read past the pool end — an OOB read on the constantly-used
-                    // road-name display path. Costs one string entry at worst.
-                    roadNamePool[totalBytes - 1] = '\0';
-                    roadNameCount = count;
-                    roadNamePoolSize = totalBytes;
-                    Serial.printf("[sdmgr] names.bin v%u: %u street names loaded (%u bytes string pool, seg id width %uB)\n",
-                                  (unsigned)version, (unsigned)roadNameCount, (unsigned int)roadNamePoolSize,
-                                  (unsigned)segNameWidth);
-                } else {
-                    if (roadNameOffsets) { heap_caps_free(roadNameOffsets); roadNameOffsets = NULL; }
-                    if (roadNamePool) { heap_caps_free(roadNamePool); roadNamePool = NULL; }
-                    Serial.println("[sdmgr] PSRAM allocation for road names failed");
-                }
+            // Sanity: the file must actually contain the table + pool it declares
+            // (a truncated/corrupt names.bin simply disables street names).
+            uint32_t offBase = 16, poolBase = 16 + count * 4;
+            if (count > 0 && totalBytes > 0 && count < 5000000u && totalBytes < 16000000u &&
+                nameFile.size() >= (size_t)poolBase + totalBytes) {
+                roadNameCount = count;
+                roadNameOffsetsBase = offBase;
+                roadNamePoolBase = poolBase;
+                roadNamePoolSize = totalBytes;
+                Serial.printf("[sdmgr] names.bin v%u: %u street names (read on demand, %u KB on card, seg id width %uB)\n",
+                              (unsigned)version, (unsigned)roadNameCount, (unsigned)(roadNamePoolSize / 1024),
+                              (unsigned)segNameWidth);
+            } else {
+                Serial.println("[sdmgr] names.bin header/size mismatch — street names disabled");
             }
         }
         nameFile.close();
@@ -633,7 +622,7 @@ int sdMgrDeleteAllTripLogs() {
 
 int sdMgrReadFileChunk(const char *path, size_t offset, uint8_t *buf, size_t bufSize) {
     SdLock lock;
-    if (!ensureSdMmcBegun()) return -1;
+    if (!ensureSdMmcBegun() || !SD_MMC.exists(path)) return -1; // quiet "not found" for optional files
     File f = SD_MMC.open(path, FILE_READ);
     if (!f) return -1;
     if (offset >= f.size()) {
@@ -765,15 +754,25 @@ bool sdMgrFindTileEntry(uint32_t tileId, TileIndexEntry *outEntry) {
     return found;
 }
 
+// Returns a pointer to a static buffer, valid until the next call (the only
+// caller, sdMgrGetSegmentRoadName, copies it immediately). Two small SD reads:
+// the u32 offset, then up to 95 bytes of the NUL-terminated UTF-8 string.
 const char *sdMgrGetRoadName(uint32_t nameId) {
-    if (nameId == 0 || nameId > roadNameCount || !roadNameOffsets || !roadNamePool) {
-        return "";
+    static char buf[96];
+    buf[0] = '\0';
+    if (nameId == 0 || nameId > roadNameCount) return buf;
+    uint32_t offset = 0;
+    if (!sdMgrReadBytes("/speedmap/names.bin", roadNameOffsetsBase + (nameId - 1) * 4, (uint8_t *)&offset, 4) ||
+        offset >= roadNamePoolSize)
+        return buf;
+    size_t n = roadNamePoolSize - offset;
+    if (n > sizeof(buf) - 1) n = sizeof(buf) - 1;
+    if (!sdMgrReadBytes("/speedmap/names.bin", roadNamePoolBase + offset, (uint8_t *)buf, n)) {
+        buf[0] = '\0';
+        return buf;
     }
-    uint32_t offset = roadNameOffsets[nameId - 1];
-    if (offset < roadNamePoolSize) {
-        return roadNamePool + offset;
-    }
-    return "";
+    buf[n] = '\0'; // strings are NUL-terminated in the pool; this bounds a corrupt one
+    return buf;
 }
 
 // Copy up to dstCap-1 bytes of a UTF-8 string, but never split a multi-byte
@@ -820,4 +819,154 @@ const char *sdMgrGetSegmentRoadName(uint32_t segId) {
     sLastSegId = segId;
     sLastRoadName[0] = '\0';
     return "";
+}
+
+// ---------------------------------------------------------------------------
+// Data-install primitives (Phone Update Bridge / online update, 2026-09-26).
+// See src/update/DataInstaller.cpp for the staging + journal protocol these
+// serve. All are mutex-guarded like the rest of this module.
+// ---------------------------------------------------------------------------
+
+// ONE streaming writer at a time, kept OPEN between chunks. The old
+// open-append-close-per-chunk pattern (sdMgrAppendBytes) re-walks the FAT
+// cluster chain on every open, so a multi-MB file got slower with every chunk;
+// holding the handle makes each write O(chunk). The SD mutex is still taken
+// only per write, so the map matcher keeps reading tiles between chunks.
+static File sWriter;
+
+bool sdMgrWriterOpen(const char *path, bool append) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    if (sWriter) sWriter.close();
+    sWriter = SD_MMC.open(path, append ? FILE_APPEND : FILE_WRITE);
+    return (bool)sWriter;
+}
+
+bool sdMgrWriterWrite(const uint8_t *buf, size_t len) {
+    SdLock lock;
+    if (!sWriter) return false;
+    return sWriter.write(buf, len) == len;
+}
+
+void sdMgrWriterClose() {
+    SdLock lock;
+    if (sWriter) {
+        sWriter.flush();
+        sWriter.close();
+    }
+}
+
+int64_t sdMgrFileSize(const char *path) {
+    SdLock lock;
+    if (!ensureSdMmcBegun() || !SD_MMC.exists(path)) return -1; // exists() first: open() of a missing file logs an error
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) return -1;
+    int64_t s = (int64_t)f.size();
+    f.close();
+    return s;
+}
+
+bool sdMgrExists(const char *path) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    return SD_MMC.exists(path);
+}
+
+bool sdMgrMkdir(const char *path) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    return SD_MMC.exists(path) || SD_MMC.mkdir(path);
+}
+
+// Plain rename that does NOT delete an existing target first (FAT rename fails
+// if the target exists — the installer journal handles the backup step itself,
+// so a crash can never leave BOTH files missing).
+bool sdMgrMove(const char *from, const char *to) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    return SD_MMC.rename(from, to);
+}
+
+uint64_t sdMgrFreeBytes() {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return 0;
+    uint64_t total = SD_MMC.totalBytes(), used = SD_MMC.usedBytes();
+    return total > used ? total - used : 0;
+}
+
+// Replace a small file's whole content (manifest, journal, session record).
+bool sdMgrWriteSmallFile(const char *path, const void *data, size_t len) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return false;
+    File f = SD_MMC.open(path, FILE_WRITE);
+    if (!f) return false;
+    size_t w = f.write((const uint8_t *)data, len);
+    f.flush();
+    f.close();
+    return w == len;
+}
+
+// Stream a whole file through SHA-256 with one open handle (readback verify of
+// what is ACTUALLY on the card). Mutex taken per 4 KB chunk; tick() (may be
+// NULL) is called between chunks — callers pass a watchdog feed.
+bool sdMgrSha256File(const char *path, uint8_t out[32], void (*tick)()) {
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    if (!buf) return false;
+    File f;
+    {
+        SdLock lock;
+        if (ensureSdMmcBegun()) f = SD_MMC.open(path, FILE_READ);
+    }
+    if (!f) {
+        heap_caps_free(buf);
+        return false;
+    }
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    bool ok = true;
+    for (;;) {
+        int r;
+        {
+            SdLock lock;
+            r = f.read(buf, 4096);
+        }
+        if (r < 0) { ok = false; break; }
+        if (r == 0) break;
+        mbedtls_sha256_update(&ctx, buf, r);
+        if (tick) tick();
+    }
+    {
+        SdLock lock;
+        f.close();
+    }
+    mbedtls_sha256_finish(&ctx, out);
+    mbedtls_sha256_free(&ctx);
+    heap_caps_free(buf);
+    return ok;
+}
+
+// Delete every regular file directly inside dir (non-recursive). Used to wipe
+// the data-install staging area. Returns files removed, -1 if no card.
+int sdMgrClearDir(const char *dir) {
+    SdLock lock;
+    if (!ensureSdMmcBegun()) return -1;
+    File d = SD_MMC.open(dir);
+    if (!d || !d.isDirectory()) return 0;
+    // Collect first, delete after: deleting while iterating is unreliable on SD_MMC.
+    static char names[48][48];
+    int n = 0;
+    for (File f = d.openNextFile(); f && n < 48; f = d.openNextFile()) {
+        if (!f.isDirectory()) {
+            const char *nm = f.name();
+            const char *base = strrchr(nm, '/');
+            snprintf(names[n++], sizeof(names[0]), "%s/%s", dir, base ? base + 1 : nm);
+        }
+        f.close();
+    }
+    d.close();
+    int removed = 0;
+    for (int i = 0; i < n; i++)
+        if (SD_MMC.remove(names[i])) removed++;
+    return removed;
 }

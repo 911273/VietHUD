@@ -457,13 +457,13 @@ def export_viethud_package(clean_points, ref_map_dir, target_dirs, mode='vector'
 
     if mode == 'vector':
         map_files = ["metadata.bin", "index.bin", "tiles.bin", "names.bin", "seg_names.bin"]
-        mode_desc = "BAN DO VECTOR + TEN DUONG (Toi gian ~16.6MB, khong kem anh raster)"
+        mode_desc = "BAN DO VECTOR + TEN DUONG (~16.6MB)"
     elif mode == 'alerts':
         map_files = []
         mode_desc = "CHI DU LIEU CANH BAO GIAO THONG (Alerts only ~3MB)"
-    else:
-        map_files = ["metadata.bin", "index.bin", "tiles.bin", "names.bin", "seg_names.bin", "maptiles.bin"]
-        mode_desc = "BAN DO DAY DU (Full ~460MB, bao gom ca anh raster maptiles.bin)"
+    else:  # 'full' kept as an alias of 'vector' (raster maptiles.bin removed 2026-09-26)
+        map_files = ["metadata.bin", "index.bin", "tiles.bin", "names.bin", "seg_names.bin"]
+        mode_desc = "BAN DO VECTOR + TEN DUONG (~16.6MB)"
 
     print(f"  * Che do dong goi: {mode_desc}")
 
@@ -501,8 +501,8 @@ def export_viethud_package(clean_points, ref_map_dir, target_dirs, mode='vector'
                         p['type'], p['speed'], p['heading'], 1 if p['is_camera'] else 0, p['source']
                     ])
 
-            # Nếu ở chế độ vector, dọn file ảnh maptiles.bin thừa nếu có trong thư mục VietHUD_SDCard_Ready
-            if mode in ('vector', 'alerts') and 'VietHUD_SDCard_Ready' in dest_dir:
+            # Firmware no longer uses the raster maptiles.bin — remove any leftover copy
+            if 'VietHUD_SDCard_Ready' in dest_dir:
                 old_raster = os.path.join(dest_dir, 'maptiles.bin')
                 if os.path.exists(old_raster):
                     try: os.remove(old_raster)
@@ -801,11 +801,11 @@ def main():
     parser.add_argument('--sd-drive', '-s', default=None, help="Ky tu o dia the nho (vi du: E hoac E:\\)")
     parser.add_argument('--ref-map', '-r', default=None, help="Thu muc chua ban do goc va am thanh")
     parser.add_argument('--mode', '-m', choices=['vector', 'full', 'alerts'], default=None,
-                        help="Che do dong goi: vector (mac dinh ~16MB), full (~460MB), alerts (~3MB)")
+                        help="Che do dong goi: vector (mac dinh ~16MB), alerts (~3MB); full = vector")
     parser.add_argument('--no-raster', '--vector-only', action='store_true', dest='no_raster',
-                        help="Chi xuat ban do vector va canh bao, khong kem anh raster (maptiles.bin)")
+                        help="Xuat ban do vector va canh bao (mac dinh)")
     parser.add_argument('--full', action='store_true',
-                        help="Xuat day du bao gom ca anh raster (maptiles.bin)")
+                        help="Giong --vector-only (anh raster da bi bo)")
     parser.add_argument('--github', '-g', action='store_true',
                         help="Tu dong day du lieu len GitHub sau khi dong goi")
     parser.add_argument('--github-only', action='store_true',
@@ -850,10 +850,6 @@ def main():
         print()
         print("   [1] DONG GOI BAN DO VECTOR (~16.6MB, Khuyen dung - Chep the nho)")
         print("       + Canh bao camera, bien bao, tuyen duong vector & am thanh")
-        print("       - Khong kem file anh raster nang 448MB")
-        print()
-        print("   [2] DONG GOI BAN DO DAY DU (FULL - ~460MB)")
-        print("       + Bao gom toan bo muc [1] va them anh raster maptiles.bin")
         print()
         print("   [3] ALL-IN-ONE: CONVERT DU LIEU + TU DONG DAY LEN GITHUB OTA (Khuyen dung)")
         print("       + Tu dong doc CSV/OSM, dong goi vector va push thang len GitHub")
@@ -866,15 +862,12 @@ def main():
         print("   [0] Thoat")
         print("=" * 80)
 
-        choice = input("Nhap lua chon cua ban [1/2/3/4/5/0] (Nhan Enter mac dinh la 3): ").strip()
+        choice = input("Nhap lua chon cua ban [1/3/4/5/0] (Nhan Enter mac dinh la 3): ").strip()
         if choice == '0':
             print("Tam biet!")
             return
         elif choice == '1':
             mode = 'vector'
-            auto_push_git = False
-        elif choice == '2':
-            mode = 'full'
             auto_push_git = False
         elif choice == '4':
             publish_to_github(ready_pkg, repo_url=args.repo, branch=args.branch, dry_run=args.dry_run)
@@ -898,7 +891,7 @@ def main():
 
     print("\n" + "="*80)
     print("      VIETHUD MASTER DATA BUILDER & SD-CARD SYNC TOOL (2026)")
-    print(f"      Che do: {'BAN DO VECTOR + TEN DUONG (Khong anh raster)' if mode == 'vector' else ('BAN DO DAY DU (FULL)' if mode == 'full' else 'CHI CANH BAO GIAO THONG')}")
+    print(f"      Che do: {'CHI CANH BAO GIAO THONG' if mode == 'alerts' else 'BAN DO VECTOR + TEN DUONG'}")
     print("="*80)
 
     # Xác định thư mục bản đồ gốc

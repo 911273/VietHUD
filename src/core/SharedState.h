@@ -26,6 +26,13 @@ struct GnssSnapshot {
     int utcHour = 0, utcMinute = 0;
     float lonDeg = 0;
     float latDeg = 0;
+    // GNSS altitude above mean sea level (GGA). Absolute accuracy is poor
+    // (+-10 m or worse), but its CHANGE over tens of seconds reliably shows a
+    // car climbing onto / descending off an elevated road (map matcher).
+    float altitudeM = 0;
+    bool altitudeValid = false;
+    float hdop = 0;       // horizontal dilution of precision (0 = unknown); jumps under viaducts
+    uint32_t fixSeq = 0;  // increments on every NEW position fix (the matcher's HMM steps once per fix)
     // Sunrise/sunset estimate from GNSS date+time+position (spec section
     // 15.2: "no light sensor" — this IS that calculation). Only meaningful
     // when timeValid; defaults true (sun) so a not-yet-fixed clock icon

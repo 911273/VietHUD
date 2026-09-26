@@ -7,24 +7,14 @@
 // one small built-in WebServer instance on its own FreeRTOS task (Core 0,
 // same pattern as gnss/touch — see gnss/GNSS.h):
 //
-//   1. Live telemetry ("/") — a browser page polling /api/status (plain
-//      JSON, hand-rolled with snprintf, no ArduinoJson dependency) every
-//      500ms for the same GNSS/speed-map/heap numbers the serial [gnss]/
-//      [sdmgr]/[mem] debug lines already carry. Lets someone watch the link
-//      health (fix/sats/speed, speed-map status) from a phone during a real
-//      drive without a USB cable tethered to a laptop the whole time, which
-//      every debugging session up to now has required.
-//   2. Remote config ("/config") — an HTML form over the same AppConfig
-//      fields Settings.cpp's sliders bind, for typing exact values instead
-//      of dragging a small touchscreen slider. Submitting it clamps +
-//      sanitizes + saves to NVS immediately (a web form submit is already a
-//      deliberate action, unlike a touchscreen slider that can be brushed
-//      by accident — see Settings.cpp's confirm-modal comment for why THAT
-//      one needs a confirm step and this one doesn't).
-//   3. OTA update ("/update") — standard ESP32-Arduino HTTP-upload OTA
-//      (Update.h, built into the core, no extra library) so a new .bin can
-//      be pushed over WiFi instead of re-opening the case for a USB flash
-//      every build/flash/verify cycle.
+//   1. The portal page ("/", net/PortalPage.h) — one self-contained mobile
+//      page: data update (Phone Update Bridge, /api/v1/update/*), live
+//      status (/api/status), settings (/api/v1/config), optional device
+//      WiFi (/api/wifi/*), trip logs (/api/v1/triplogs, /triplog/get) and
+//      tools (/api/action).
+//   2. Firmware OTA (POST /update) — ESP32-Arduino Update.h, multipart
+//      upload from the portal's System section; requires the X-VietHUD
+//      header; the bootloader rolls back a build that doesn't survive 30 s.
 //
 // Deliberately built on the synchronous WiFi.h/WebServer.h/Update.h trio
 // that ships with arduino-esp32 (no AsyncTCP/ESPAsyncWebServer dependency):
@@ -61,6 +51,9 @@ void webPortalRequestEnable(bool on);
 // Current ACTUAL state (what the web task has applied, not merely
 // requested) — for the Dashboard/Settings to display without guessing.
 bool webPortalIsEnabled();
+// What the UI last asked for (applied by the web task shortly after) — for a
+// switch that must not flicker back while the radio is still starting.
+bool webPortalRequestedOn();
 
 // Formats a short status string ("OFF" or "ON, IP=192.168.4.1") into buf —
 // used by Settings.cpp's WiFi tab. A formatted buffer, not a getter
@@ -76,6 +69,14 @@ void webPortalStatusText(char *buf, size_t cap);
 // 5 GHz-hotspot case). Added 2026-09-25.
 void webPortalStaInfo(char *buf, size_t cap);
 
+// The device's AP SSID (custom or auto "VietHUD-XXXX"), computed even when the AP
+// is off — for the on-screen QR "join my hotspot" setup code (Settings.cpp).
+void webPortalApSsid(char *buf, size_t cap);
+
+// The device's station (STA) IP once joined to a WiFi — for the on-screen "IP
+// after connect" display. false + empty buf when not connected.
+bool webPortalStaIp(char *buf, size_t cap);
+
 // --- WiFi scan + STA reconnect (2026-09-25), for the on-screen "WiFi setup"
 // overlay. All WiFi.* calls stay on the web task, so the UI (Core 1) only sets
 // requests / reads cached results — never touches the radio directly. ---
@@ -87,9 +88,21 @@ int  webPortalScanResult(int i, char *ssid, size_t cap, int *rssi, bool *locked)
 // station with them (turns WiFi on if it was off). Runs on the web task.
 void webPortalReconnectSta();
 
+// WiFi Manager (2026-09-26): manage the list of remembered station networks.
+// All mutate AppConfig + persist to NVS and kick a reconnect; safe to call from
+// the on-screen UI (Core 1) or the web handlers (web task) — plain cfg writes,
+// same pattern as the /api/v1/config POST.
+int  webPortalSavedCount();                                  // # of saved networks
+bool webPortalSavedNetwork(int i, char *ssid, size_t cap);   // SSID of saved network i
+bool webPortalAddNetwork(const char *ssid, const char *password);  // add/update by SSID
+bool webPortalDeleteNetwork(int idx);                        // remove saved network idx
+
 // NTP-synced local time (feature F, 2026-09-25). Returns true and fills
 // hour/minute (local, VN UTC+7) once the device has joined a station network
 // (AppConfig staSsid) and NTP has delivered a plausible time — lets the
 // Dashboard clock show the right time without waiting for a GPS fix. Returns
 // false when not yet synced, so the caller keeps using GPS time as before.
 bool webPortalLocalTime(int *hour, int *minute);
+
+// Phones/laptops currently joined to the device hotspot (0 when WiFi is off).
+int webPortalClientCount();

@@ -1,0 +1,17 @@
+[Unit]
+Description=VietHUD - pack OSM + custom alerts and publish to GitHub if changed
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=admin
+Group=admin
+WorkingDirectory=/opt/viethud-pipeline
+ExecStart=/opt/viethud-pipeline/venv/bin/python /opt/viethud-pipeline/run_pipeline.py
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3600
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true

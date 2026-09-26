@@ -1,0 +1,12 @@
+[Unit]
+Description=VietHUD - daily data pack + conditional publish (10:00 local)
+
+[Timer]
+# Every day at 10:00 local. Picks up new custom_alerts daily and the new PBF
+# after the monthly fetch; publishes only if the packed data actually changed.
+OnCalendar=*-*-* 10:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

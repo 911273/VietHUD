@@ -838,7 +838,7 @@
 #define LV_USE_RLE 0
 
 /*QR code library*/
-#define LV_USE_QRCODE 0
+#define LV_USE_QRCODE 1  /* WiFi setup: show a QR to join the device AP (Settings.cpp) */
 
 /*Barcode code library*/
 #define LV_USE_BARCODE 0

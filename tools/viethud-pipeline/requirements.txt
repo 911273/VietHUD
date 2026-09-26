@@ -1,0 +1,8 @@
+# VietHUD data pipeline — Python deps (install into a venv on the Pi).
+# Only two runtime deps: OSM PBF parsing + HTTP.
+osmium>=3.6,<5        # pyosmium — streaming .osm.pbf reader (Node-location index)
+requests>=2.28        # Geofabrik download, GitHub raw check, Telegram Bot API
+# Standard library covers the rest: struct, hashlib, zlib, csv, json, subprocess (git).
+# NOTE: shapely/gitpython are NOT required — segment street names come straight
+# from each OSM way, and git is driven via the system `git` CLI.
+cryptography>=3.4    # ECDSA P-256 signing of manifest.txt (manifest.txt.sig)

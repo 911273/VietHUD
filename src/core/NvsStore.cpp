@@ -1,6 +1,8 @@
 #include "NvsStore.h"
 #include <Preferences.h>
 #include <string.h> // strncpy() — see loadConfigFromNVS()'s wifiSsid/wifiPassword copy
+#include <stdio.h>  // snprintf() — per-slot NVS keys for the saved-network list
+#include <esp_system.h> // esp_random() — per-device hotspot password (schema 3)
 
 static Preferences prefs;
 
@@ -39,16 +41,38 @@ void loadConfigFromNVS(AppConfig &cfg) {
     String stap = prefs.getString("staPass", cfg.staPassword);
     strncpy(cfg.staPassword, stap.c_str(), sizeof(cfg.staPassword) - 1);
     cfg.staPassword[sizeof(cfg.staPassword) - 1] = '\0';
+
+    // WiFi Manager saved networks (2026-09-26).
+    cfg.savedNetworkCount = prefs.getInt("netCount", 0);
+    for (int i = 0; i < AppConfig::kMaxSavedNetworks; i++) {
+        char ks[12], kp[12];
+        snprintf(ks, sizeof(ks), "netS%d", i);
+        snprintf(kp, sizeof(kp), "netP%d", i);
+        String s = prefs.getString(ks, "");
+        String p = prefs.getString(kp, "");
+        strncpy(cfg.savedNetworks[i].ssid, s.c_str(), sizeof(cfg.savedNetworks[i].ssid) - 1);
+        cfg.savedNetworks[i].ssid[sizeof(cfg.savedNetworks[i].ssid) - 1] = '\0';
+        strncpy(cfg.savedNetworks[i].password, p.c_str(), sizeof(cfg.savedNetworks[i].password) - 1);
+        cfg.savedNetworks[i].password[sizeof(cfg.savedNetworks[i].password) - 1] = '\0';
+    }
+    // Migrate a pre-WiFi-Manager single STA credential into slot 0 once, so an
+    // existing device's saved network isn't lost by the upgrade.
+    if (cfg.savedNetworkCount <= 0 && cfg.staSsid[0]) {
+        strncpy(cfg.savedNetworks[0].ssid, cfg.staSsid, sizeof(cfg.savedNetworks[0].ssid) - 1);
+        cfg.savedNetworks[0].ssid[sizeof(cfg.savedNetworks[0].ssid) - 1] = '\0';
+        strncpy(cfg.savedNetworks[0].password, cfg.staPassword, sizeof(cfg.savedNetworks[0].password) - 1);
+        cfg.savedNetworks[0].password[sizeof(cfg.savedNetworks[0].password) - 1] = '\0';
+        cfg.savedNetworkCount = 1;
+    }
+
     cfg.wifiAutoOffMin = prefs.getFloat("wifiAutoOff", cfg.wifiAutoOffMin);
     String durl = prefs.getString("dataUrl", cfg.dataUpdateUrl);
     strncpy(cfg.dataUpdateUrl, durl.c_str(), sizeof(cfg.dataUpdateUrl) - 1);
     cfg.dataUpdateUrl[sizeof(cfg.dataUpdateUrl) - 1] = '\0';
     cfg.screenRotation = prefs.getFloat("screenRot", cfg.screenRotation);
     cfg.themeMode = prefs.getFloat("themeMode", cfg.themeMode);
-    cfg.mapSource = prefs.getFloat("mapSource", cfg.mapSource);
-    cfg.showVectorRoads = prefs.getBool("showVecRoads", cfg.showVectorRoads);
+    cfg.brightnessMode = prefs.getFloat("briMode", cfg.brightnessMode);
     cfg.showVehicleTrail = prefs.getBool("showTrail", cfg.showVehicleTrail);
-    cfg.showRasterMap = prefs.getBool("showRaster", cfg.showRasterMap);
     cfg.mapHeadingUp = prefs.getBool("mapHeadUp", cfg.mapHeadingUp);
     cfg.defaultLimitKmh = prefs.getFloat("defLimitKmh", cfg.defaultLimitKmh);
 
@@ -58,13 +82,32 @@ void loadConfigFromNVS(AppConfig &cfg) {
     // when a road's limit is unknown (VN urban baseline). Reset it to the code
     // default exactly ONCE (guarded by a schema-version key) so a later manual
     // change the user makes is still respected and never re-clobbered.
-    const uint32_t kCfgSchemaVer = 2;
+    const uint32_t kCfgSchemaVer = 4;
     uint32_t cfgVer = prefs.getUInt("cfgVer", 0);
-    if (cfgVer < kCfgSchemaVer) {
+    if (cfgVer < 2) {
         cfg.defaultLimitKmh = 50.0f;
         prefs.putFloat("defLimitKmh", 50.0f);
-        prefs.putUInt("cfgVer", kCfgSchemaVer);
     }
+    // Schema 3 (2026-09-26, Phone Update Bridge security): every unit shipped
+    // with the SAME hotspot password "12345678", so anyone in range could join
+    // and use the portal. Replace that factory default ONCE with a per-device
+    // random one (shown on-screen + inside the join QR, so the user never has to
+    // type it). A password the user chose themselves is left untouched.
+    if (cfgVer < 3 && strcmp(cfg.wifiPassword, "12345678") == 0) {
+        static const char kAlphabet[] = "abcdefghjkmnpqrstuvwxyz23456789"; // no 0/O/1/l/i look-alikes
+        char pw[11];
+        for (int i = 0; i < 10; i++) pw[i] = kAlphabet[esp_random() % (sizeof(kAlphabet) - 1)];
+        pw[10] = '\0';
+        strncpy(cfg.wifiPassword, pw, sizeof(cfg.wifiPassword) - 1);
+        prefs.putString("wifiPass", cfg.wifiPassword);
+    }
+    // Schema 4 (2026-09-26): WiFi auto-off can no longer be disabled; a unit
+    // saved with 0 (= never) goes back to the 10 min default.
+    if (cfgVer < 4 && cfg.wifiAutoOffMin < 1.0f) {
+        cfg.wifiAutoOffMin = 10.0f;
+        prefs.putFloat("wifiAutoOff", cfg.wifiAutoOffMin);
+    }
+    if (cfgVer < kCfgSchemaVer) prefs.putUInt("cfgVer", kCfgSchemaVer);
     prefs.end();
     sanitizeConfig(cfg); // NaN/Inf guard against a corrupted flash page — must run BEFORE clamping, see its comment
     clampConfig(cfg);
@@ -87,14 +130,20 @@ void saveConfigToNVS(const AppConfig &cfg) {
     prefs.putString("wifiPass", cfg.wifiPassword);
     prefs.putString("staSsid", cfg.staSsid);
     prefs.putString("staPass", cfg.staPassword);
+    prefs.putInt("netCount", cfg.savedNetworkCount);
+    for (int i = 0; i < AppConfig::kMaxSavedNetworks; i++) {
+        char ks[12], kp[12];
+        snprintf(ks, sizeof(ks), "netS%d", i);
+        snprintf(kp, sizeof(kp), "netP%d", i);
+        prefs.putString(ks, cfg.savedNetworks[i].ssid);
+        prefs.putString(kp, cfg.savedNetworks[i].password);
+    }
     prefs.putFloat("wifiAutoOff", cfg.wifiAutoOffMin);
     prefs.putString("dataUrl", cfg.dataUpdateUrl);
     prefs.putFloat("screenRot", cfg.screenRotation);
     prefs.putFloat("themeMode", cfg.themeMode);
-    prefs.putFloat("mapSource", cfg.mapSource);
-    prefs.putBool("showVecRoads", cfg.showVectorRoads);
+    prefs.putFloat("briMode", cfg.brightnessMode);
     prefs.putBool("showTrail", cfg.showVehicleTrail);
-    prefs.putBool("showRaster", cfg.showRasterMap);
     prefs.putBool("mapHeadUp", cfg.mapHeadingUp);
     prefs.putFloat("defLimitKmh", cfg.defaultLimitKmh);
     prefs.end();

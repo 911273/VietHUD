@@ -1,0 +1,19 @@
+[Unit]
+Description=VietHUD - fetch monthly OpenStreetMap Vietnam PBF (Geofabrik, ODbL)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=admin
+Group=admin
+WorkingDirectory=/opt/viethud-pipeline
+ExecStart=/opt/viethud-pipeline/venv/bin/python /opt/viethud-pipeline/fetch_osm.py
+# Be gentle on the box (large download + it's a shared home server).
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3600
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
