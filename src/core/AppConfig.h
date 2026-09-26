@@ -150,6 +150,12 @@ struct AppConfig {
     // runs regardless, since the sun icon and the local-time-from-longitude
     // estimate both still need it). Applies live, no restart needed.
     float themeMode = 0;
+    // Backlight mode (2026-09-26): 0 = Auto — at night (GNSS sunrise/sunset
+    // calc, same gnss.daytime as the Auto theme) the backlight is capped at
+    // kNightBrightnessPct; by day it uses `brightness`. 1 = Manual — always
+    // `brightness`. Float-as-enum like themeMode (choice row in Settings).
+    float brightnessMode = 0;
+    static constexpr float kNightBrightnessPct = 50.0f;
     // Map display (vector only — the raster JPEG background was removed
     // 2026-09-26; vector roads are always drawn).
     bool showVehicleTrail = true;
@@ -188,6 +194,7 @@ inline void clampConfig(AppConfig &c) {
     c.cameraWarnDistM = constrain(c.cameraWarnDistM, 50.0f, 100.0f);
     c.screenRotation = constrain(c.screenRotation, 0.0f, 3.0f);
     c.themeMode = constrain(c.themeMode, 0.0f, 2.0f);
+    c.brightnessMode = constrain(c.brightnessMode, 0.0f, 1.0f);
     if (c.savedNetworkCount < 0) c.savedNetworkCount = 0;
     if (c.savedNetworkCount > AppConfig::kMaxSavedNetworks) c.savedNetworkCount = AppConfig::kMaxSavedNetworks;
 }
@@ -216,4 +223,5 @@ inline void sanitizeConfig(AppConfig &c) {
     if (!isfinite(c.cameraWarnDistM)) c.cameraWarnDistM = d.cameraWarnDistM;
     if (!isfinite(c.screenRotation)) c.screenRotation = d.screenRotation;
     if (!isfinite(c.themeMode)) c.themeMode = d.themeMode;
+    if (!isfinite(c.brightnessMode)) c.brightnessMode = d.brightnessMode;
 }
