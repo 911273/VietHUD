@@ -40,3 +40,8 @@ tools/viethud-pipeline/data/
 tools/viethud-pipeline/logs/
 tools/viethud-pipeline/.env
 *.pem
+ 
+# Local environment and data
+.venv/
+VietHUD_SDCard_Ready/
+tools/map_builder/mwm_data/
