@@ -3,7 +3,7 @@
 #include <math.h> // isfinite() — see sanitizeConfig() below
 
 // User-tunable settings, persisted to NVS (core/NvsStore.cpp) and edited
-// from ui/Settings.cpp and net/WebPortal.cpp's /config page. Trimmed
+// from ui/Settings.cpp and net/WebPortal.cpp's /api/v1/config. Trimmed
 // 2026-09-21 to VietHUD's actual scope (GPS-only offline speed-limit/
 // camera/sign warnings) when radar was removed entirely — every field that
 // only ever fed the HLK-LD2451/target tracking/TTC risk engine (max range,
@@ -29,7 +29,7 @@ struct AppConfig {
     // Speaker volume 0-100% (audio/AudioPlayer.cpp audioSetVolume). Defaults to
     // 100 = loudest the NS4168 + full-scale digital path allow (raised from the
     // old hard-coded 80% default 2026-09-24). Applied in applyConfig(),
-    // adjustable in Settings > Display and web /config.
+    // adjustable in Settings > Display and web portal (Cài đặt).
     float audioVolume = 100;
 
     // Real GNSS calibration (gnss/GNSS.cpp reads these directly every tick —
@@ -52,7 +52,7 @@ struct AppConfig {
     // matching's heading-gate speed check) see the corrected value — there is
     // no separate "true" vs "displayed" speed anywhere else in this project.
     float gnssSpeedCalibrationPct = 0.0f;
-    float overspeedOffsetKmh = 1.0f; // overspeed warning fires when egoSpeed > limit + this (km/h). Clamp 0..10; user-tunable in Settings > Sensors and web /config.
+    float overspeedOffsetKmh = 1.0f; // overspeed warning fires when egoSpeed > limit + this (km/h). Clamp 0..10; user-tunable in Settings > Sensors and web portal (Cài đặt).
 
     // Ahead-warning lookahead/trigger distances (user-requested 2026-09-22)
     // — both used to be fixed constants in map/SpeedLimitManager.cpp
@@ -98,7 +98,7 @@ struct AppConfig {
     // staSsid is non-empty the device ALSO joins this network (AP+STA mode) to
     // get internet — used for NTP time sync (accurate clock without waiting for
     // a GPS fix), and a base for future online updates. Empty staSsid = AP-only,
-    // as before. Editable in web /config. Never auto-enables anything on its own.
+    // as before. Editable in web portal (Cài đặt). Never auto-enables anything on its own.
     char staSsid[32] = "";
     char staPassword[64] = "";
 
@@ -120,14 +120,14 @@ struct AppConfig {
     // Base URL the online data updater fetches from (net/DataUpdater.cpp, added
     // 2026-09-25). Points at the Raspberry Pi's public endpoint that serves the
     // map/warning data + manifest.txt (Pi bridges Google Drive via rclone).
-    // e.g. GitHub raw CDN. Must end with "/". Editable in web /config and
+    // e.g. GitHub raw CDN. Must end with "/". Editable in web portal (Cài đặt) and
     // Settings > WiFi. Default = the project's public GitHub release path so OTA
     // works out of the box (GitHub raw 301/302s to Fastly — DataUpdater follows
     // redirects). Empty = updater disabled.
     char dataUpdateUrl[128] = "https://raw.githubusercontent.com/911273/VietHUD/main/speedmap/";
     // Auto-off the WiFi AP after this many minutes with NO client connected
     // (0 = never). Saves power/heat/exposure on a windscreen device left with
-    // WiFi on. web /config + Settings; see WebPortal.cpp webTaskFn().
+    // WiFi on. web portal (Cài đặt) + Settings; see WebPortal.cpp webTaskFn().
     float wifiAutoOffMin = 10;
 
     // Display settings (user-requested 2026-09-15). Both are floats used as

@@ -53,10 +53,10 @@ No radar, no cellular/SIM card, no cloud dependency needed while driving — eve
 1. Trên VietHUD: **Settings → WiFi**. Màn hình hiện 2 mã QR.
 2. Quét **QR 1** bằng Camera để vào Wi-Fi `VietHUD-XXXX` (mật khẩu riêng của từng máy, đã nằm trong QR).
 3. Quét **QR 2** để mở `http://192.168.4.1` bằng **Safari/Chrome** (không dùng cửa sổ "Captive Wi-Fi" tự bật — cửa sổ đó không có 4G).
-4. Tab **Dữ liệu** → **Kiểm tra cập nhật** → **Cập nhật ngay**. Điện thoại tải dữ liệu từ GitHub bằng 4G/5G, kiểm tra SHA-256, truyền sang VietHUD; VietHUD kiểm tra chữ ký + SHA-256 rồi khởi động lại để cài.
+4. Trang tự kiểm tra bản mới; bấm **Cập nhật**. Điện thoại tải dữ liệu từ GitHub bằng 4G/5G, kiểm tra SHA-256, truyền sang VietHUD; VietHUD kiểm tra chữ ký + SHA-256 rồi khởi động lại để cài.
 
-Không có Internet trên điện thoại: mục **"Dùng tệp đã tải sẵn"** (chọn `manifest.txt`, `manifest.txt.sig` và các `.bin`).
-VietHUD có Wi-Fi Internet riêng (tab **Wi-Fi**, tùy chọn): nút **"Để VietHUD tự tải qua Wi-Fi"**.
+Không có Internet trên điện thoại: **Hệ thống → Cài dữ liệu từ tệp** (chọn `manifest.txt`, `manifest.txt.sig` và các `.bin`).
+VietHUD có Wi-Fi Internet riêng (mục **Wi-Fi Internet**, tùy chọn): nút **"Để VietHUD tự tải cập nhật qua Wi-Fi"**. Chỉ cập nhật khi bản phát hành **mới hơn** dữ liệu đang dùng.
 
 **An toàn:** dữ liệu chỉ được cài khi `manifest.txt` có chữ ký hợp lệ (`manifest.txt.sig`, ECDSA P-256).
 Cài đặt là nguyên tử (journal lúc khởi động); nếu dữ liệu mới không đọc được, VietHUD tự khôi phục bản cũ.

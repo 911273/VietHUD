@@ -648,3 +648,11 @@ Thông lượng upload (qua STA/hotspot PC): ~170–220 KB/s mạng, ~110 KB/s t
 - **Mọi lần phát hành `manifest.txt` phải ký** (`tools/sign_manifest.py`). Job phát hành tự động trên Pi (`/home/admin/viethud-pipeline`, 02:00 hằng ngày) hiện chưa ký ⇒ sau lần chạy tới, VietHUD sẽ từ chối bản mới ("Chữ ký dữ liệu không hợp lệ") cho tới khi manifest được ký lại. Pipeline OSM/ODbL (`tools/viethud-pipeline`) đã tự ký.
 - Chưa làm: chữ ký cho firmware OTA (`/update` vẫn nhận `.bin` không ký — đã có rollback), gói `.vhpkg` một tệp (B3 hiện chọn nhiều tệp), B2 (không cần vì iPhone chạy B1).
 - Chưa test trên Android thật.
+
+### 20.1 Portal làm lại (2026-09-26, sau phản hồi "phức tạp quá")
+
+- **Một trang duy nhất, không tab** (`src/net/PortalPage.h`, 22 KB, trước 32 KB): thẻ *Dữ liệu bản đồ & cảnh báo* (1 dòng trạng thái + 1 nút + 1 thanh tiến độ, tự kiểm tra khi mở), thẻ *Trạng thái* (6 ô + tên đường), 3 mục gập: *Cài đặt*, *Wi-Fi Internet (tùy chọn)*, *Hệ thống* (nhật ký chuyến, cài dữ liệu từ tệp, nạp firmware, công cụ).
+- Bỏ các trang HTML dựng phía server `/config`, `/update` (GET), `/triplog` → API `GET/POST /api/v1/config`, `GET /api/v1/triplogs`; `POST /update` giữ lại nhưng bắt buộc header `X-VietHUD`, Wi-Fi tự bật lại sau khi nạp firmware. Bỏ `configBuf` 7,5 KB → RAM tĩnh 26,8% → 24,5%.
+- **Không hạ cấp dữ liệu**: portal, bộ cài (`409`) và auto-check OTA chỉ coi là "có bản mới" khi version phát hành (YYYY.MM.DD.HHMM) mới hơn bản đang dùng.
+- **Sửa lỗi nghiêm trọng phát hiện khi test với thẻ nhớ mới** (names.bin toàn quốc 1,7 MB): bảng tên đường nạp vào PSRAM làm PSRAM còn 21 KB → cấp phát tràn sang RAM trong → `esp_wifi_init` NO_MEM / crash trong `ieee80211_hostap_attach` khi bật Wi-Fi. Nay tên đường đọc trực tiếp từ thẻ khi cần (chỉ nhãn đường hiện tại dùng, đã cache theo segment) → PSRAM trống 1 305 KB, RAM trong 157 KB (Wi-Fi tắt) / 108 KB (Wi-Fi bật).
+- Test lại toàn bộ bằng JS thật + thiết bị thật: kiểm tra/cập nhật (30 s gồm reboot), lưu cài đặt (từ chối mật khẩu < 8 ký tự), nhật ký chuyến, danh sách Wi-Fi, firmware OTA (1,98 MB ~11 s; không header → 403; sau reboot không rollback), tên đường hiển thị đúng.

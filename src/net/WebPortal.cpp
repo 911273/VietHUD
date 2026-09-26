@@ -16,6 +16,7 @@
 #include <ESPmDNS.h>  // MDNS — viethud.local (feature B)
 #include <DNSServer.h> // captive portal (feature E)
 #include <Update.h>
+#include <Preferences.h> // "vhupd/wifiOn" — AP back up after a firmware OTA reboot
 #include <esp_heap_caps.h>
 #include <esp_task_wdt.h>
 #include <freertos/FreeRTOS.h>
@@ -29,7 +30,7 @@
 // device brings its own hotspot instead, same reasoning as GNSS being wired
 // directly rather than depending on anything external. SSID/password
 // now live in AppConfig (cfg.wifiSsid/cfg.wifiPassword — editable from
-// Settings > WiFi or /config), not hardcoded here.
+// Settings > WiFi or the portal settings), not hardcoded here.
 static PortalServer server(80); // WebServer + raw-upload read-timeout hook (net/UpdateApi.h)
 static DNSServer dnsServer;                 // captive portal: answers every lookup with the AP IP (feature E)
 static const char *kMdnsHost = "viethud";   // -> http://viethud.local (feature B)
@@ -257,6 +258,14 @@ static void handleApiStatus() {
                  road.cameraSpeedLimitKmh >= 0 ? String(road.cameraSpeedLimitKmh, 0).c_str() : "null");
     }
 
+    // Current street name (UTF-8 Vietnamese) — JSON-safe copy: drop quotes,
+    // backslashes and control bytes rather than escaping them.
+    char roadEsc[sizeof(road.roadName)];
+    size_t ri = 0;
+    for (const char *q = road.roadName; *q && ri < sizeof(roadEsc) - 1; q++)
+        if (*q != '"' && *q != '\\' && (uint8_t)*q >= 0x20) roadEsc[ri++] = *q;
+    roadEsc[ri] = 0;
+
     size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     size_t minFreeInternal = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
 
@@ -270,7 +279,7 @@ static void handleApiStatus() {
              "\"boardTempC\":%.1f,"
              "\"gnss\":{\"fix\":%s,\"linkAlive\":%s,\"satCount\":%d,\"speedKmh\":%.1f,\"rawSpeedKmh\":%.1f,"
              "\"headingValid\":%s,\"headingDeg\":%.0f,\"dir\":\"%s\",\"timeValid\":%s,\"utcHour\":%d,\"utcMinute\":%d},"
-             "\"speedMap\":{\"loaded\":%s,\"limitValid\":%s,\"limitKmh\":%.0f},"
+             "\"speedMap\":{\"loaded\":%s,\"limitValid\":%s,\"limitKmh\":%.0f,\"road\":\"%s\"},"
              "\"cameraAhead\":%s,"
              "\"wifi\":{\"on\":%s,\"apSsid\":\"%s\",\"apIp\":\"%s\",\"clients\":%d,\"staSsid\":\"%s\","
              "\"staConnected\":%s,\"staIp\":\"%s\",\"rssi\":%d,\"staStatus\":%d,\"ntp\":%s,\"savedCount\":%d},"
@@ -282,7 +291,7 @@ static void handleApiStatus() {
              gnss.headingValid ? "true" : "false", (double)gnss.headingDeg, dir,
              gnss.timeValid ? "true" : "false", gnss.utcHour, gnss.utcMinute,
              road.mapLoaded ? "true" : "false", road.valid ? "true" : "false",
-             road.valid ? (double)road.speedLimitKmh : 0.0, cameraBuf,
+             road.valid ? (double)road.speedLimitKmh : 0.0, roadEsc, cameraBuf,
              wifiActuallyEnabled ? "true" : "false", g_apSsid, WiFi.softAPIP().toString().c_str(),
              (int)WiFi.softAPgetStationNum(), cfg.staSsid, staConnected ? "true" : "false",
              staConnected ? WiFi.localIP().toString().c_str() : "", staConnected ? (int)WiFi.RSSI() : 0,
@@ -339,42 +348,32 @@ static void handleApiSpeedMapDebug() {
 }
 
 // ---------------------------------------------------------------------
-// "/triplog" — lists the drive logs actually on the card, each a download
-// link. Added 2026-09-21 after retrieving one real road test's logs the
-// painful way (a temporary firmware hack that dumped the CSV over serial,
-// several reflashes, one SD-peripheral wedge); with the device's own AP
-// already implemented, a phone or laptop at the roadside is a far better
-// path off the card than a USB cable and a rebuild.
+// Trip logs — GET /api/v1/triplogs lists the CSVs on the card (newest first,
+// session ids increment once per boot); /triplog/get?id= streams one. The
+// portal page renders the list. (Replaced the old server-rendered /triplog page.)
 // ---------------------------------------------------------------------
 static const int kMaxListedTripLogs = 64;
 
-static void handleTripLogIndex() {
+static void handleTripLogList() {
     uint32_t ids[kMaxListedTripLogs], sizes[kMaxListedTripLogs];
     int n = sdMgrListTripLogs(ids, sizes, kMaxListedTripLogs);
-
-    String page = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-                     "<style>body{font-family:sans-serif;margin:16px}a{display:block;padding:10px 0;"
-                     "border-bottom:1px solid #ddd}</style><h2>Trip logs</h2>");
-    if (n == 0) {
-        page += F("<p>No logs found (no SD card, or no drive recorded yet).</p>");
-    } else {
-        // Newest first: session ids increment once per boot, so a plain
-        // descending sort is chronological without needing timestamps
-        // (which the CSV itself can't carry reliably anyway — GNSS time
-        // isn't trustworthy until a fix, see TripLogger.h).
-        for (int pass = 0; pass < n; pass++) {
-            int best = -1;
-            for (int i = 0; i < n; i++)
-                if (sizes[i] != 0xFFFFFFFFu && (best < 0 || ids[i] > ids[best])) best = i;
-            if (best < 0) break;
-            char row[160];
-            snprintf(row, sizeof(row), "<a href='/triplog/get?id=%lu'>session_%04lu.csv &mdash; %lu bytes</a>",
-                      (unsigned long)ids[best], (unsigned long)ids[best], (unsigned long)sizes[best]);
-            page += row;
-            sizes[best] = 0xFFFFFFFFu; // consumed
-        }
+    String out = "[";
+    bool first = true;
+    for (int pass = 0; pass < n; pass++) {
+        int best = -1;
+        for (int i = 0; i < n; i++)
+            if (sizes[i] != 0xFFFFFFFFu && (best < 0 || ids[i] > ids[best])) best = i;
+        if (best < 0) break;
+        char row[48];
+        snprintf(row, sizeof(row), "%s{\"id\":%lu,\"size\":%lu}", first ? "" : ",", (unsigned long)ids[best],
+                 (unsigned long)sizes[best]);
+        out += row;
+        first = false;
+        sizes[best] = 0xFFFFFFFFu; // consumed
     }
-    server.send(200, "text/html", page);
+    out += "]";
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", out);
 }
 
 static void handleTripLogGet() {
@@ -411,211 +410,132 @@ static void handleTripLogGet() {
 }
 
 // ---------------------------------------------------------------------
-// "/config" — GET renders the current AppConfig as an editable form, POST
-// parses it back, clamps/sanitizes, applies, and saves to NVS immediately
-// (see WebPortal.h's header comment for why this doesn't need Settings.cpp
-// touchscreen's confirm-modal step). Field list, ranges and step sizes are
-// kept in sync with Settings.cpp's addSliderRow()/addSwitchRow() calls and
-// AppConfig.h's clampConfig() by hand — there's no shared table between
-// this file and Settings.cpp, so a new AppConfig field needs adding in
-// both places, same as NvsStore.cpp already requires today.
+// Settings — GET /api/v1/config returns the web-editable AppConfig fields as
+// JSON; POST (form-urlencoded, X-VietHUD header) updates only the fields it
+// carries, then sanitizes, clamps, applies and saves to NVS. Ranges are
+// enforced by clampConfig() (AppConfig.h) — the page's min/max are only hints.
+// Passwords are never sent back; a blank one means "keep current".
 // ---------------------------------------------------------------------
-static char configBuf[7680];
-
-static size_t appendField(char *buf, size_t cap, size_t len, const char *name, const char *label, float value,
-                           float step, float minV, float maxV) {
-    return len + snprintf(buf + len, len < cap ? cap - len : 0,
-                           "<label>%s<input type=\"number\" step=\"%.3f\" min=\"%.3f\" max=\"%.3f\" name=\"%s\" "
-                           "value=\"%.3f\"></label>",
-                           label, (double)step, (double)minV, (double)maxV, name, (double)value);
+static bool csrfOk() {
+    if (server.header("X-VietHUD") == "1") return true;
+    server.send(403, "application/json", "{\"error\":403}");
+    return false;
 }
 
-static size_t appendCheckbox(char *buf, size_t cap, size_t len, const char *name, const char *label, bool value) {
-    return len + snprintf(buf + len, len < cap ? cap - len : 0,
-                           "<label class=\"chk\"><input type=\"checkbox\" name=\"%s\"%s>%s</label>", name,
-                           value ? " checked" : "", label);
-}
-
-// Password field's value is deliberately left BLANK rather than pre-filled
-// with cfg.wifiPassword — echoing a saved password back into a form is bad
-// practice even on a local-only device, and handleConfigPost() below treats
-// a submitted-blank password field as "leave it unchanged" rather than
-// "clear it", so leaving it blank here has no destructive side effect.
-static size_t appendTextField(char *buf, size_t cap, size_t len, const char *name, const char *label,
-                               const char *value, bool isPassword) {
-    return len + snprintf(buf + len, len < cap ? cap - len : 0,
-                           "<label>%s<input type=\"%s\" name=\"%s\" value=\"%s\"></label>", label,
-                           isPassword ? "password" : "text", name, value);
+static String jsonStr(const char *s) {
+    String o = "\"";
+    for (; *s; s++) {
+        if (*s == '"' || *s == '\\') o += '\\';
+        if ((uint8_t)*s >= 0x20) o += *s;
+    }
+    return o + "\"";
 }
 
 static void handleConfigGet() {
-    size_t len = 0;
-    len += snprintf(configBuf + len, sizeof(configBuf) - len,
-                     "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-                     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>VietHUD - "
-                     "Config</title><style>"
-                     "body{background:#0B0F14;color:#CCD6E0;font-family:sans-serif;margin:0;padding:12px}"
-                     "h1{font-size:18px;color:#fff}nav a{color:#4AA3FF;margin-right:16px;font-size:13px;"
-                     "text-decoration:none}"
-                     "fieldset{border:1px solid #2A3441;border-radius:8px;margin-bottom:12px}"
-                     "legend{color:#7C8A9A;font-size:12px;text-transform:uppercase}"
-                     "label{display:block;margin:8px 0;font-size:13px}"
-                     "input[type=number]{width:100px;float:right;background:#151C24;color:#fff;border:1px solid "
-                     "#2A3441;border-radius:4px;padding:2px 6px}"
-                     "select{width:160px;float:right;background:#151C24;color:#fff;border:1px solid #2A3441;"
-                     "border-radius:4px;padding:2px 6px}"
-                     "label.chk{display:inline-block;width:48%%}label.chk input{float:none;margin-right:6px}"
-                     "button{background:#2E7D4F;color:#fff;border:0;border-radius:6px;padding:10px 20px;"
-                     "font-size:14px}"
-                     "</style></head><body>"
-                     "<nav><a href=\"/\">&lsaquo; Trang ch&iacute;nh</a><a href=\"/config\">C&agrave;i &#273;&#7863;t</a><a href=\"/update\">Firmware</a></nav>"
-                     "<h1>VietHUD - Configuration</h1><form method=\"POST\" action=\"/config\">");
-
-    len += snprintf(configBuf + len, sizeof(configBuf) - len, "<fieldset><legend>Alerts</legend>");
-    len = appendCheckbox(configBuf, sizeof(configBuf), len, "audioEnabled", "Alert audio enabled", cfg.audioEnabled);
-    len = appendField(configBuf, sizeof(configBuf), len, "audioVolume", "Volume (%)", cfg.audioVolume, 1, 0, 100);
-    len += snprintf(configBuf + len, sizeof(configBuf) - len, "</fieldset><fieldset><legend>Display</legend>");
-    len = appendField(configBuf, sizeof(configBuf), len, "brightness", "Brightness (%)", cfg.brightness, 1, 5, 100);
-    len = appendField(configBuf, sizeof(configBuf), len, "autoDimMin", "Auto-dim after (min)", cfg.autoDimMin, 1, 0,
-                       30);
-    len += snprintf(configBuf + len, sizeof(configBuf) - len, "</fieldset><fieldset><legend>Sensors (GNSS)</legend>");
-    len = appendField(configBuf, sizeof(configBuf), len, "gnssSpeedFilterAlpha", "Speed filter smoothing",
-                       cfg.gnssSpeedFilterAlpha, 0.01f, 0.05f, 0.90f);
-    len = appendField(configBuf, sizeof(configBuf), len, "gnssFixTimeoutS", "Fix timeout (s)", cfg.gnssFixTimeoutS,
-                       0.1f, 1, 10);
-    len = appendField(configBuf, sizeof(configBuf), len, "gnssSpeedCalibrationPct", "Speed calibration (%)",
-                       cfg.gnssSpeedCalibrationPct, 0.1f, -15, 15);
-    len = appendField(configBuf, sizeof(configBuf), len, "overspeedOffsetKmh", "Overspeed warning offset (km/h)",
-                       cfg.overspeedOffsetKmh, 1, 0, 10);
-    len = appendField(configBuf, sizeof(configBuf), len, "defaultLimitKmh", "Default limit when unknown (km/h, 0=off)",
-                       cfg.defaultLimitKmh, 1, 0, 90);
-    // (aheadLimitWarnDistM / cameraWarnDistM removed 2026-09-24 — never used;
-    // the lookahead uses a dynamic speed-based warn distance.)
-    len = appendCheckbox(configBuf, sizeof(configBuf), len, "tripLoggingEnabled", "Trip logging (SD card)",
-                          cfg.tripLoggingEnabled);
-    len += snprintf(configBuf + len, sizeof(configBuf) - len, "</fieldset><fieldset><legend>WiFi hotspot (AP)</legend>");
-    len = appendTextField(configBuf, sizeof(configBuf), len, "wifiSsid", "SSID", cfg.wifiSsid, false);
-    len = appendTextField(configBuf, sizeof(configBuf), len, "wifiPassword", "New password (blank = keep current)",
-                           "", true);
-    len = appendField(configBuf, sizeof(configBuf), len, "wifiAutoOffMin", "Auto-off after (min, 0=never)",
-                       cfg.wifiAutoOffMin, 1, 0, 120);
-    len += snprintf(configBuf + len, sizeof(configBuf) - len,
-                     "<p style=\"font-size:11px;color:#7C8A9A\">On/off is on the device screen only (Settings &gt; "
-                     "WiFi, or hold the Dashboard 3s+) — not here, since submitting an off request over WiFi would "
-                     "disconnect this page mid-request.</p></fieldset>"
-                     "<fieldset><legend>Internet (Station / NTP)</legend>"
-                     "<p style=\"font-size:11px;color:#7C8A9A\">Optionally join your phone hotspot / home WiFi so the "
-                     "device can sync the clock over the internet (NTP) without waiting for GPS. Leave SSID blank for "
-                     "hotspot-only. Applied on the next WiFi on/off.</p>");
-    len = appendTextField(configBuf, sizeof(configBuf), len, "staSsid", "Network SSID (blank = off)", cfg.staSsid, false);
-    len = appendTextField(configBuf, sizeof(configBuf), len, "staPassword", "Network password (blank = keep current)",
-                           "", true);
-    len += snprintf(configBuf + len, sizeof(configBuf) - len,
-                     "</fieldset><fieldset><legend>Online data update</legend>"
-                     "<p style=\"font-size:11px;color:#7C8A9A\">Base URL serving the map/warning data + "
-                     "manifest.txt (your Raspberry Pi). The Live page's \"Update data\" button pulls from here.</p>");
-    len = appendTextField(configBuf, sizeof(configBuf), len, "dataUpdateUrl", "Data URL (e.g. https://host/speedmap/)",
-                           cfg.dataUpdateUrl, false);
-    len += snprintf(configBuf + len, sizeof(configBuf) - len,
-                     "</fieldset><button type=\"submit\">Save to device</button></form></body></html>");
-
-    server.send(200, "text/html", configBuf);
+    char b[420];
+    snprintf(b, sizeof(b),
+             "{\"audioEnabled\":%d,\"audioVolume\":%.0f,\"brightness\":%.0f,\"autoDimMin\":%.0f,"
+             "\"overspeedOffsetKmh\":%.0f,\"defaultLimitKmh\":%.0f,\"gnssSpeedCalibrationPct\":%.1f,"
+             "\"tripLoggingEnabled\":%d,\"gnssSpeedFilterAlpha\":%.2f,\"gnssFixTimeoutS\":%.1f,"
+             "\"wifiAutoOffMin\":%.0f,",
+             cfg.audioEnabled ? 1 : 0, (double)cfg.audioVolume, (double)cfg.brightness, (double)cfg.autoDimMin,
+             (double)cfg.overspeedOffsetKmh, (double)cfg.defaultLimitKmh, (double)cfg.gnssSpeedCalibrationPct,
+             cfg.tripLoggingEnabled ? 1 : 0, (double)cfg.gnssSpeedFilterAlpha, (double)cfg.gnssFixTimeoutS,
+             (double)cfg.wifiAutoOffMin);
+    String out = b;
+    out += "\"wifiSsid\":" + jsonStr(cfg.wifiSsid) + ",\"dataUpdateUrl\":" + jsonStr(cfg.dataUpdateUrl) + "}";
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", out);
 }
 
-static float argFloat(const char *name, float fallback) {
-    if (!server.hasArg(name)) return fallback;
-    return server.arg(name).toFloat();
+static void argFloat(const char *name, float &target) {
+    if (server.hasArg(name)) target = server.arg(name).toFloat();
+}
+static void argBool(const char *name, bool &target) {
+    if (server.hasArg(name)) target = server.arg(name) == "1";
+}
+static void argText(const char *name, char *target, size_t cap, bool blankKeeps) {
+    if (!server.hasArg(name)) return;
+    String v = server.arg(name);
+    v.trim();
+    if (blankKeeps && v.length() == 0) return;
+    strncpy(target, v.c_str(), cap - 1);
+    target[cap - 1] = '\0';
 }
 
 static void handleConfigPost() {
-    cfg.brightness = argFloat("brightness", cfg.brightness);
-    cfg.audioVolume = argFloat("audioVolume", cfg.audioVolume);
-    cfg.autoDimMin = argFloat("autoDimMin", cfg.autoDimMin);
-    cfg.gnssSpeedFilterAlpha = argFloat("gnssSpeedFilterAlpha", cfg.gnssSpeedFilterAlpha);
-    cfg.gnssFixTimeoutS = argFloat("gnssFixTimeoutS", cfg.gnssFixTimeoutS);
-    cfg.gnssSpeedCalibrationPct = argFloat("gnssSpeedCalibrationPct", cfg.gnssSpeedCalibrationPct);
-    cfg.overspeedOffsetKmh = argFloat("overspeedOffsetKmh", cfg.overspeedOffsetKmh);
-    cfg.defaultLimitKmh = argFloat("defaultLimitKmh", cfg.defaultLimitKmh);
-    if (server.hasArg("wifiSsid")) {
-        strncpy(cfg.wifiSsid, server.arg("wifiSsid").c_str(), sizeof(cfg.wifiSsid) - 1);
-        cfg.wifiSsid[sizeof(cfg.wifiSsid) - 1] = '\0';
+    if (!csrfOk()) return;
+    argBool("audioEnabled", cfg.audioEnabled);
+    argFloat("audioVolume", cfg.audioVolume);
+    argFloat("brightness", cfg.brightness);
+    argFloat("autoDimMin", cfg.autoDimMin);
+    argFloat("overspeedOffsetKmh", cfg.overspeedOffsetKmh);
+    argFloat("defaultLimitKmh", cfg.defaultLimitKmh);
+    argFloat("gnssSpeedCalibrationPct", cfg.gnssSpeedCalibrationPct);
+    argBool("tripLoggingEnabled", cfg.tripLoggingEnabled);
+    argFloat("gnssSpeedFilterAlpha", cfg.gnssSpeedFilterAlpha);
+    argFloat("gnssFixTimeoutS", cfg.gnssFixTimeoutS);
+    argFloat("wifiAutoOffMin", cfg.wifiAutoOffMin);
+    argText("wifiSsid", cfg.wifiSsid, sizeof(cfg.wifiSsid), true);
+    if (server.hasArg("wifiPassword") && server.arg("wifiPassword").length() > 0 &&
+        server.arg("wifiPassword").length() < 8) {
+        server.send(400, "application/json", "{\"error\":400,\"detail\":\"Mật khẩu Wi-Fi cần ít nhất 8 ký tự\"}");
+        return;
     }
-    // Blank submitted password means "leave it unchanged" — see appendTextField()'s comment.
-    if (server.hasArg("wifiPassword") && server.arg("wifiPassword").length() > 0) {
-        strncpy(cfg.wifiPassword, server.arg("wifiPassword").c_str(), sizeof(cfg.wifiPassword) - 1);
-        cfg.wifiPassword[sizeof(cfg.wifiPassword) - 1] = '\0';
-    }
-    cfg.wifiAutoOffMin = argFloat("wifiAutoOffMin", cfg.wifiAutoOffMin);
-    if (server.hasArg("staSsid")) { // may be intentionally blank (= station off)
-        strncpy(cfg.staSsid, server.arg("staSsid").c_str(), sizeof(cfg.staSsid) - 1);
-        cfg.staSsid[sizeof(cfg.staSsid) - 1] = '\0';
-    }
-    if (server.hasArg("staPassword") && server.arg("staPassword").length() > 0) { // blank = keep current
-        strncpy(cfg.staPassword, server.arg("staPassword").c_str(), sizeof(cfg.staPassword) - 1);
-        cfg.staPassword[sizeof(cfg.staPassword) - 1] = '\0';
-    }
-    if (server.hasArg("dataUpdateUrl")) { // may be intentionally blank (= updater off)
-        strncpy(cfg.dataUpdateUrl, server.arg("dataUpdateUrl").c_str(), sizeof(cfg.dataUpdateUrl) - 1);
-        cfg.dataUpdateUrl[sizeof(cfg.dataUpdateUrl) - 1] = '\0';
-    }
-    // Checkboxes only appear in POST data when checked — an absent arg means unchecked, not "leave unchanged".
-    cfg.audioEnabled = server.hasArg("audioEnabled");
-    cfg.tripLoggingEnabled = server.hasArg("tripLoggingEnabled");
+    argText("wifiPassword", cfg.wifiPassword, sizeof(cfg.wifiPassword), true);
+    argText("dataUpdateUrl", cfg.dataUpdateUrl, sizeof(cfg.dataUpdateUrl), false);
 
     sanitizeConfig(cfg);
     clampConfig(cfg);
-    applyConfig(); // brightness may have changed — same PWM rewrite Settings.cpp's slider triggers
+    applyConfig(); // brightness/volume may have changed — same apply path Settings.cpp's sliders use
     saveConfigToNVS(cfg);
-    Serial.println("[web] config updated + saved to NVS via /config");
-
-    server.sendHeader("Location", "/config");
-    server.send(303); // redirect back so a page refresh doesn't resubmit the form
+    Serial.println("[web] config updated + saved to NVS via /api/v1/config");
+    server.send(200, "application/json", "{\"ok\":true}");
 }
 
 // ---------------------------------------------------------------------
-// "/update" — standard ESP32-Arduino HTTP OTA upload (Update.h, built into
-// the core). GET shows a plain upload form; POST's multipart body is fed
-// into Update.write() as it streams in, then the device reboots into the
-// new firmware. Same risk profile as any OTA mechanism: an interrupted
-// upload can leave a bad image, which is why Update.end(true) is checked
-// before claiming success and the device reboots either way to get back to
-// a known state.
+// POST /update — firmware OTA (multipart, Update.h). Requires the portal's
+// X-VietHUD header so a random page can't push firmware. The bootloader's
+// rollback (main_viethud.cpp verifyRollbackLater) reverts a build that doesn't
+// survive its first 30 s.
 // ---------------------------------------------------------------------
-static const char kUpdateHtml[] PROGMEM = R"HTML(<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VietHUD - OTA Update</title>
-<style>body{background:#0B0F14;color:#CCD6E0;font-family:sans-serif;margin:0;padding:12px}
-h1{font-size:18px;color:#fff}nav a{color:#4AA3FF;margin-right:16px;font-size:13px;text-decoration:none}
-button{background:#2E7D4F;color:#fff;border:0;border-radius:6px;padding:10px 20px;font-size:14px}
-p.warn{color:#E0C020}</style></head><body>
-<nav><a href="/">&lsaquo; Trang ch&iacute;nh</a><a href="/triplog">Trip logs</a><a href="/config">C&agrave;i &#273;&#7863;t</a></nav>
-<h1>VietHUD - OTA Firmware Update</h1>
-<p class="warn">Upload a .bin built for env:viethud. Do not power off during upload — the device reboots automatically when done.</p>
-<form method="POST" action="/update" enctype="multipart/form-data">
-<input type="file" name="update" accept=".bin"><br><br>
-<button type="submit">Upload and flash</button>
-</form></body></html>)HTML";
-
-static void handleUpdateGet() { server.send_P(200, "text/html", kUpdateHtml); }
+static bool sFwAllowed = false;
 
 static void handleUpdateUpload() {
     HTTPUpload &upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
-        Serial.printf("[web] OTA upload start: %s\n", upload.filename.c_str());
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+        sFwAllowed = server.header("X-VietHUD") == "1";
+        Serial.printf("[web] OTA upload start: %s%s\n", upload.filename.c_str(), sFwAllowed ? "" : " (REJECTED: no header)");
+        if (sFwAllowed && !Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+    } else if (!sFwAllowed) {
+        return;
     } else if (upload.status == UPLOAD_FILE_WRITE) {
         if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) Update.printError(Serial);
+        esp_task_wdt_reset();
     } else if (upload.status == UPLOAD_FILE_END) {
         if (Update.end(true)) Serial.printf("[web] OTA success: %u bytes written\n", (unsigned)upload.totalSize);
         else Update.printError(Serial);
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        Update.abort();
     }
 }
 
 static void handleUpdatePost() {
+    if (!sFwAllowed) {
+        server.send(403, "text/plain", "Từ chối");
+        return;
+    }
+    bool ok = !Update.hasError() && Update.isFinished();
     server.sendHeader("Connection", "close");
-    server.send(200, "text/plain", Update.hasError() ? "OTA FAILED — see serial log" : "OTA OK — rebooting...");
+    server.send(ok ? 200 : 500, "text/plain", ok ? "Đã nạp firmware — đang khởi động lại" : "Nạp firmware lỗi");
     delay(500);
-    ESP.restart();
+    if (ok) {
+        Preferences p; // bring the hotspot back after the reboot so the phone can reconnect (same flag as a data install)
+        p.begin("vhupd", false);
+        p.putBool("wifiOn", true);
+        p.end();
+        ESP.restart();
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -895,12 +815,11 @@ static void webTaskFn(void *) {
     server.on("/api/status", HTTP_GET, handleApiStatus);
     server.on("/api/speedlimit", HTTP_GET, handleApiSpeedLimit);
     server.on("/api/speedmap/debug", HTTP_GET, handleApiSpeedMapDebug);
-    server.on("/triplog", HTTP_GET, handleTripLogIndex);
     server.on("/triplog/get", HTTP_GET, handleTripLogGet);
-    server.on("/config", HTTP_GET, handleConfigGet);
-    server.on("/config", HTTP_POST, handleConfigPost);
-    server.on("/update", HTTP_GET, handleUpdateGet);
-    server.on("/update", HTTP_POST, handleUpdatePost, handleUpdateUpload);
+    server.on("/api/v1/triplogs", HTTP_GET, handleTripLogList);
+    server.on("/api/v1/config", HTTP_GET, handleConfigGet);
+    server.on("/api/v1/config", HTTP_POST, handleConfigPost);
+    server.on("/update", HTTP_POST, handleUpdatePost, handleUpdateUpload); // firmware OTA (portal: Hệ thống)
     server.on("/api/action", HTTP_POST, handleApiAction);       // feature G: control panel
     server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);      // WiFi Manager: scan
     server.on("/api/wifi/saved", HTTP_GET, handleWifiSaved);    // WiFi Manager: list saved
