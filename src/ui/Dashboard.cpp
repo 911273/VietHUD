@@ -2110,7 +2110,11 @@ void refreshDashboard() {
         if (road.roadName[0] != '\0') {
             char nameBuf[64];
             abbreviateRoadName(road.roadName, nameBuf, sizeof(nameBuf));
-            lv_label_set_text(streetNameLabel, nameBuf);
+            // Only on a real change: lv_label_set_text() restarts the label's
+            // scroll animation, and this runs every 150 ms, so a name longer
+            // than the badge never actually scrolled (2026-09-27, "ten duong
+            // dai hon o hien thi ... chay tu phai qua trai").
+            if (strcmp(lv_label_get_text(streetNameLabel), nameBuf) != 0) lv_label_set_text(streetNameLabel, nameBuf);
             lv_obj_clear_flag(streetNameBadge, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(streetNameBadge, LV_OBJ_FLAG_HIDDEN);
