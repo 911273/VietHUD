@@ -263,14 +263,14 @@ static void showInstallResult(bool rolledBack) {
     char detail[64];
     installerLastResult(detail, sizeof(detail), false);
     Serial.printf("[install] result screen: %s (%s)\n", rolledBack ? "ROLLED BACK" : "UPDATED", detail);
-    StatusScreen s = makeStatusScreen(rolledBack ? "KHÔI PHỤC DỮ LIỆU CŨ" : "ĐÃ CẬP NHẬT DỮ LIỆU",
+    StatusScreen s = makeStatusScreen(rolledBack ? "PREVIOUS DATA RESTORED" : "DATA UPDATED",
                                       rolledBack ? 0xE8B931 : 0x34C46A);
     lv_label_set_text(s.icon, rolledBack ? LV_SYMBOL_WARNING : LV_SYMBOL_OK);
     char b[160];
     if (rolledBack)
-        snprintf(b, sizeof(b), "Bản cập nhật không dùng được (%s).\nVietHUD đã tự quay lại dữ liệu trước đó.", detail);
+        snprintf(b, sizeof(b), "The update could not be used (%s).\nVietHUD went back to the previous data.", detail);
     else
-        snprintf(b, sizeof(b), "Bản đồ và cảnh báo đã được cài đặt.\nPhiên bản dữ liệu: %s", detail);
+        snprintf(b, sizeof(b), "Maps and alerts installed.\nData version: %s", detail);
     lv_label_set_text(s.msg, b);
     for (int i = 0; i < 250; i++) setupPump();
     lv_obj_delete(s.scr);
@@ -287,15 +287,15 @@ static void showInstallResult(bool rolledBack) {
 // the boot-time installer swaps the data in. This function never returns.
 static void runDataUpdateMode() {
     Serial.println("[update-mode] entered — display+SD only, connecting WiFi for OTA");
-    StatusScreen s = makeStatusScreen("CẬP NHẬT DỮ LIỆU", 0x3DA5FF);
-    lv_label_set_text(s.hint, "Không tắt nguồn trong khi cập nhật");
-    lv_label_set_text(s.msg, "Đang kết nối Wi-Fi...");
+    StatusScreen s = makeStatusScreen("DATA UPDATE", 0x3DA5FF);
+    lv_label_set_text(s.hint, "Do not power off during the update");
+    lv_label_set_text(s.msg, "Connecting to Wi-Fi...");
     for (int i = 0; i < 12; i++) setupPump();
     auto finish = [&](const char *text, bool ok, int ticks) {
         lv_label_set_text(s.icon, ok ? LV_SYMBOL_OK : LV_SYMBOL_WARNING);
         lv_obj_set_style_text_color(s.icon, lv_color_hex(ok ? 0x34C46A : 0xE8B931), 0);
         lv_label_set_text(s.msg, text);
-        lv_label_set_text(s.hint, "Tự khởi động lại...");
+        lv_label_set_text(s.hint, "Restarting...");
         for (int i = 0; i < ticks; i++) setupPump();
         ESP.restart();
     };
@@ -316,7 +316,7 @@ static void runDataUpdateMode() {
             passes[nc++] = cfg.savedNetworks[i].password;
         }
     }
-    if (nc == 0) finish("Chưa có Wi-Fi Internet cho VietHUD.\nHãy cập nhật qua điện thoại (mục Dữ liệu).", false, 400);
+    if (nc == 0) finish("No Internet Wi-Fi set for VietHUD.\nUpdate from a phone instead (Data section).", false, 400);
 
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
@@ -337,7 +337,7 @@ static void runDataUpdateMode() {
                 lastRebegin = millis();
             }
             char b[96];
-            snprintf(b, sizeof(b), "Đang kết nối Wi-Fi \"%s\"... %lus", ssids[c],
+            snprintf(b, sizeof(b), "Connecting to Wi-Fi \"%s\"... %lus", ssids[c],
                      (unsigned long)((millis() - t0) / 1000));
             lv_label_set_text(s.msg, b);
             setupPump();
@@ -346,19 +346,19 @@ static void runDataUpdateMode() {
     }
     if (!up) {
         Serial.printf("[update-mode] WiFi connect FAILED (last status=%d)\n", WiFi.status());
-        finish("Không kết nối được Wi-Fi.\nBật hotspot 2.4 GHz rồi thử lại,\nhoặc cập nhật qua điện thoại.", false, 500);
+        finish("Could not connect to Wi-Fi.\nTurn on a 2.4 GHz hotspot and retry,\nor update from a phone.", false, 500);
     }
     configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
     Serial.printf("[update-mode] STA up: %s  free internal=%u biggest=%u\n", WiFi.localIP().toString().c_str(),
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    lv_label_set_text(s.msg, "Đã kết nối. Đang kiểm tra bản mới...");
+    lv_label_set_text(s.msg, "Connected. Checking for updates...");
     for (int i = 0; i < 10; i++) setupPump();
 
     if (!dataUpdateStart()) {
         DataUpdateStatus st = dataUpdateGetStatus();
         char b[112];
-        snprintf(b, sizeof(b), "Lỗi: %s", st.message);
+        snprintf(b, sizeof(b), "Error: %s", st.message);
         finish(b, false, 450);
     }
     lv_obj_clear_flag(s.bar, LV_OBJ_FLAG_HIDDEN);
@@ -370,7 +370,7 @@ static void runDataUpdateMode() {
             int overall = (st.filesDone * 100 + cur) / st.filesTotal;
             lv_bar_set_value(s.bar, overall, LV_ANIM_OFF);
             char b[48];
-            snprintf(b, sizeof(b), "Tệp %d/%d  ·  %d%%",
+            snprintf(b, sizeof(b), "File %d/%d  ·  %d%%",
                      st.filesDone < st.filesTotal ? st.filesDone + 1 : st.filesTotal, st.filesTotal, overall);
             lv_label_set_text(s.sub, b);
         }
@@ -594,6 +594,20 @@ void loop() {
                 wl[n] = a; wo[n] = b; n++;
             }
             if (n >= 2) gnssSimRoute(wl, wo, n, kmh);
+        } else if (c == 'P') {
+            // Bench: screenshot of the active screen as raw RGB565 over serial.
+            lv_draw_buf_t *snap = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_RGB565);
+            if (snap) {
+                Serial.printf("[snap] %u %u %u\n", (unsigned)snap->header.w, (unsigned)snap->header.h,
+                              (unsigned)snap->header.stride);
+                Serial.flush();
+                Serial.write(snap->data, (size_t)snap->header.stride * snap->header.h);
+                Serial.flush();
+                Serial.println("\n[snap] end");
+                lv_draw_buf_destroy(snap);
+            } else {
+                Serial.println("[snap] failed (out of memory)");
+            }
         } else if (c == 'u') {
             // Bench trigger for the OTA data update. Uses the SAME reliable path
             // as the web + on-screen buttons: set the NVS flag and reboot into

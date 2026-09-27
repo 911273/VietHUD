@@ -122,6 +122,34 @@ uint32_t lastTouchAtMs() { return lastTouchMs; }
 // tick's red override without needing to know which theme is active itself.
 static lv_color_t currentPrimaryTextColor = lv_color_white();
 
+// Day/Night palettes (2026-09-27: "Theme chua hoat dong: Auto/Light/Dark" —
+// applyTheme() used to ignore its argument and always paint the dark theme).
+// Light = light-grey map with darker roads and dark text for bright daylight;
+// Dark = the original near-black cockpit look. Risk colours (red/amber/purple),
+// the P.127 speed sign and the GNSS status colours are the same in both.
+struct ThemePalette {
+    uint32_t bg;          // screen + map background
+    uint32_t roadCurrent, roadMajor, roadMain, roadSmall;
+    uint32_t primaryText; // speed number, clock
+    uint32_t captionText;
+    uint32_t barLine;     // top/bottom bar divider line
+    uint32_t badgeBg, badgeBorder, badgeText, accent;
+    uint32_t cardBg, cardBorder, cardText, cardTrack;
+    uint32_t neutral;     // temperature (normal), audio icon (on)
+    uint32_t toastBg, toastText;
+};
+static const ThemePalette kDarkPalette = {
+    0x04060A, 0x7FD3E0, 0xB4BCC6, 0x8A94A0, 0x616A76, 0xFFFFFF, 0xD0E0F0, 0x182232,
+    0x0C1522, 0x1F314A, 0xF0F4F8, 0x00E5FF, 0x0C1420, 0x28384C, 0xFFFFFF, 0x182434,
+    0x93A0AE, 0x151C24, 0xFFFFFF};
+static const ThemePalette kLightPalette = {
+    0xE6EAEE, 0x00838F, 0x4A5561, 0x6E7985, 0x98A2AD, 0x0A0E14, 0x2A3440, 0xB8C2CC,
+    0xFFFFFF, 0xC2CBD4, 0x10151C, 0x00838F, 0xFFFFFF, 0xC2CBD4, 0x10151C, 0xD8DEE4,
+    0x4A5561, 0xFFFFFF, 0x10151C};
+static bool gLightTheme = false;
+static const ThemePalette &pal() { return gLightTheme ? kLightPalette : kDarkPalette; }
+static bool gThemeRepaintMap = false; // map canvas must be repainted in the new colours
+
 static void applyTheme(bool daytime); // defined below buildDashboard(), which calls it once at the end to set the initial theme
 
 // ---------------------------------------------------------------------
@@ -176,6 +204,9 @@ static lv_obj_t *egoHalo = nullptr;
 // South "S", etc., using the 8 compass directions. Not a rotating rose; just
 // the current-travel label. kCompass8[round(heading/45)%8].
 static lv_obj_t *compassLabel = nullptr;
+static lv_obj_t *gVignette[4] = {nullptr, nullptr, nullptr, nullptr}; // edge-fade strips (top, bottom, left, right)
+static lv_grad_dsc_t *gVignetteGrad[4] = {nullptr, nullptr, nullptr, nullptr};
+static lv_obj_t *gTopBar = nullptr, *gBottomBar = nullptr;
 // Board temperature readout (user-requested 2026-09-25): the device sits on a
 // car windscreen and gets hot, so the ESP32-S3 die temperature is shown in the
 // bottom-RIGHT corner (mirroring the heading letter bottom-left), colour-coded
@@ -381,7 +412,7 @@ static void updateAudioTopIcon() {
     audioIconInit = true;
     lastAudioIconState = cfg.audioEnabled;
     lv_label_set_text(audioTopIcon, cfg.audioEnabled ? LV_SYMBOL_VOLUME_MAX : LV_SYMBOL_MUTE);
-    lv_obj_set_style_text_color(audioTopIcon, cfg.audioEnabled ? lv_color_hex(0xB8C6D4) : lv_color_hex(0xFF5A4F), 0);
+    lv_obj_set_style_text_color(audioTopIcon, cfg.audioEnabled ? lv_color_hex(pal().neutral) : lv_color_hex(0xFF5A4F), 0);
 }
 
 // Guards onDashReleasedOrLost's body from running more than once per
@@ -439,8 +470,8 @@ static void onDashLongPressedRepeat(lv_event_t *) {
     if (cfg.audioEnabled) audioPlayBeep(1); // audible confirmation it's back on
     Serial.printf("[ui] alert audio %s via 2.5 s hold\n", cfg.audioEnabled ? "ON" : "OFF");
     if (wifiToastLabel) {
-        lv_label_set_text(wifiToastLabel, cfg.audioEnabled ? LV_SYMBOL_VOLUME_MAX "  Âm thanh: BẬT"
-                                                           : LV_SYMBOL_MUTE "  Âm thanh: TẮT");
+        lv_label_set_text(wifiToastLabel, cfg.audioEnabled ? LV_SYMBOL_VOLUME_MAX "  Sound: ON"
+                                                           : LV_SYMBOL_MUTE "  Sound: OFF");
         lv_obj_clear_flag(wifiToastLabel, LV_OBJ_FLAG_HIDDEN);
         wifiToastUntilMs = millis() + 1500;
     }
@@ -494,10 +525,10 @@ static RoadClassStyle mapClassStyle(uint8_t roadClass) {
     // ẩn"): soft greys that read on the dark map without shouting; the road
     // you're on keeps a muted cyan accent so it's still findable at a glance.
     switch (roadClass) {
-        case kMapLineCurrentRoad: return {lv_color_hex(0x7FD3E0), 5};  // muted cyan — current road
-        case 1: return {lv_color_hex(0xB4BCC6), 4};  // major — light neutral grey
-        case 2: return {lv_color_hex(0x8A94A0), 3};  // main — mid grey
-        default: return {lv_color_hex(0x616A76), 2}; // small/other — dim grey (still visible on 0x04060A)
+        case kMapLineCurrentRoad: return {lv_color_hex(pal().roadCurrent), 5}; // current road (cyan accent)
+        case 1: return {lv_color_hex(pal().roadMajor), 4};  // major
+        case 2: return {lv_color_hex(pal().roadMain), 3};   // main
+        default: return {lv_color_hex(pal().roadSmall), 2}; // small/other
     }
 }
 
@@ -606,41 +637,8 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
     lv_obj_set_style_line_rounded(egoArrow, true, 0);
     lv_obj_clear_flag(egoArrow, LV_OBJ_FLAG_CLICKABLE);
 
-    // --- Edge-fade vignette (user-requested 2026-09-24: "gradient mờ dần về
-    // các cạnh ... nhìn cho hiện đại"). Four screen-fixed strips, each a linear
-    // gradient from the dark bg colour at the edge fading to transparent toward
-    // the centre, so the map reads clear in the middle and melts into the bezel
-    // at the edges. Radial gradients are disabled in lv_conf, so 4 linear edges
-    // approximate a vignette (corners darkest where two overlap). Above the map
-    // + ego, below the later UI (created after this), so text stays crisp.
-    {
-        const lv_color_t edge = lv_color_hex(0x02040A);
-        const lv_opa_t EDGE_OPA = 190;
-        int fw = gCanvasW, fh = gCanvasH;
-        int vw = fw / 5, vh = fh / 4; // fade band thickness
-        static lv_grad_dsc_t gTop, gBot, gLeft, gRight;
-        auto mkStrip = [&](int x, int y, int w, int h, lv_grad_dsc_t &g, lv_grad_dir_t dir, bool edgeAtStart) {
-            lv_obj_t *o = lv_obj_create(parent);
-            lv_obj_remove_style_all(o);
-            lv_obj_set_pos(o, x, y);
-            lv_obj_set_size(o, w, h);
-            lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE);
-            g.dir = dir;
-            g.stops_count = 2;
-            // stop 0 = start of the axis (top for VER, left for HOR); stop 1 = end
-            g.stops[0].color = edge; g.stops[0].frac = 0;
-            g.stops[1].color = edge; g.stops[1].frac = 255;
-            g.stops[0].opa = edgeAtStart ? EDGE_OPA : LV_OPA_TRANSP;
-            g.stops[1].opa = edgeAtStart ? LV_OPA_TRANSP : EDGE_OPA;
-            lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
-            lv_obj_set_style_bg_grad(o, &g, 0);
-        };
-        mkStrip(0, 0, fw, vh, gTop, LV_GRAD_DIR_VER, true);            // top edge dark -> down clear
-        mkStrip(0, fh - vh, fw, vh, gBot, LV_GRAD_DIR_VER, false);     // bottom edge dark
-        mkStrip(0, 0, vw, fh, gLeft, LV_GRAD_DIR_HOR, true);          // left edge dark
-        mkStrip(fw - vw, 0, vw, fh, gRight, LV_GRAD_DIR_HOR, false);  // right edge dark
-    }
+    // (Edge fade: drawn into the map itself — see updateMapCanvas(). The old
+    // overlay strips here couldn't blend cleanly on RGB565.)
 
     // --- Heading readout: one label in the bottom-left corner showing the
     // current travel direction as a compass letter (N/NE/E/SE/S/SW/W/NW),
@@ -698,16 +696,18 @@ static void updateMapCanvas() {
     // No GPS fix yet: clear the canvas to the map background once (vector-only
     // map — there is nothing to draw until a position arrives), then wait.
     if (!v.valid) {
-        if (!sMapDrawnOnce) {
+        if (!sMapDrawnOnce || gThemeRepaintMap) {
             sMapDrawnOnce = true;
-            lv_canvas_fill_bg(mapCanvas, lv_color_hex(0x04060A), LV_OPA_COVER);
+            gThemeRepaintMap = false;
+            lv_canvas_fill_bg(mapCanvas, lv_color_hex(pal().bg), LV_OPA_COVER);
             lv_image_set_rotation(mapCanvas, 0);
         }
         return;
     }
 
     // Only redraw when map generation actually changed (movement >= 3m or turn >= 3 deg)
-    if (v.generation == lastDrawnMapGeneration) return;
+    if (v.generation == lastDrawnMapGeneration && !gThemeRepaintMap) return;
+    gThemeRepaintMap = false;
     lastDrawnMapGeneration = v.generation;
     sMapDrawnOnce = true;
 
@@ -720,48 +720,84 @@ static void updateMapCanvas() {
     float radiusM = (v.zoomRadiusM > 10.0f) ? v.zoomRadiusM : 300.0f;
     float pxPerM = (float)gRefMinDim / radiusM;
 
-    lv_canvas_fill_bg(mapCanvas, lv_color_hex(0x04060A), LV_OPA_COVER);
+    lv_canvas_fill_bg(mapCanvas, lv_color_hex(pal().bg), LV_OPA_COVER);
 
     lv_layer_t layer;
     lv_canvas_init_layer(mapCanvas, &layer);
 
     esp_task_wdt_reset();
 
-    // Pass 1: Vector Road Lines (the map — vector only, always drawn)
+    // Heading-up rotation for this frame (applied to the canvas below); needed
+    // first so each road piece's on-screen position is known for the edge fade.
+    int32_t rot = 0;
+    if (cfg.mapHeadingUp) {
+        rot = (int32_t)lroundf(-v.headingUpDeg * 10.0f);
+        rot %= 3600;
+        if (rot < 0) rot += 3600;
+    }
+    // Edge fade (2026-09-27, "ban do tao gradient mo dan ve ben trai, ben phai
+    // khoang 100px moi ben"): roads fade out over 100 px at the left/right screen
+    // edges (80 px top/bottom). Done per road piece in the canvas, NOT with
+    // overlay strips: an overlay in the map's own background colour can't blend
+    // cleanly on RGB565 (every partial opacity lands one shade darker, leaving a
+    // flat band with a hard edge) — and it cost two full-height blends a frame.
+    const float rr = rot * (float)M_PI / 1800.0f;
+    const float cR = cosf(rr), sR = sinf(rr);
+    const float cc = (float)gMapCenter;
+    auto edgeOpa = [&](float x, float y) -> lv_opa_t {
+        float dx = x - cc, dy = y - cc;
+        float sx = egoAnchorX + dx * cR - dy * sR;
+        float sy = egoAnchorY + dx * sR + dy * cR;
+        float fx = fminf(sx, gCanvasW - sx) / 100.0f;
+        float fy = fminf(sy, gCanvasH - sy) / 80.0f;
+        float f = fminf(fx, fy);
+        if (f <= 0.0f) return 0;
+        if (f >= 1.0f) return LV_OPA_COVER;
+        return (lv_opa_t)(f * f * (3.0f - 2.0f * f) * 255.0f); // smoothstep
+    };
+    // Draw a line as pieces of <= kPiecePx, each with the fade opacity at its middle.
+    const float kPiecePx = 16.0f;
+    lv_draw_line_dsc_t lineDsc;
+    auto fadedLine = [&](float x1, float y1, float x2, float y2, lv_color_t col, int32_t width, lv_opa_t baseOpa) {
+        float len = sqrtf((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+        int n = (int)ceilf(len / kPiecePx);
+        if (n < 1) n = 1;
+        for (int k = 0; k < n; k++) {
+            float t0 = (float)k / n, t1 = (float)(k + 1) / n;
+            float ax = x1 + (x2 - x1) * t0, ay = y1 + (y2 - y1) * t0;
+            float bx = x1 + (x2 - x1) * t1, by = y1 + (y2 - y1) * t1;
+            lv_opa_t o = edgeOpa((ax + bx) * 0.5f, (ay + by) * 0.5f);
+            if (o < 8) continue;
+            lv_draw_line_dsc_init(&lineDsc);
+            lineDsc.color = col;
+            lineDsc.width = width;
+            lineDsc.opa = (lv_opa_t)((o * baseOpa) / 255);
+            // Rounded ends only when opaque: overlapping round caps of two
+            // translucent pieces would double-blend into darker dots.
+            lineDsc.round_start = lineDsc.round_end = (lineDsc.opa >= LV_OPA_MAX) ? 1 : 0;
+            lineDsc.p1.x = (lv_value_precise_t)ax;
+            lineDsc.p1.y = (lv_value_precise_t)ay;
+            lineDsc.p2.x = (lv_value_precise_t)bx;
+            lineDsc.p2.y = (lv_value_precise_t)by;
+            lv_draw_line(&layer, &lineDsc);
+        }
+    };
+
     esp_task_wdt_reset();
 
     // Pass 1: Vector Road Lines
-    lv_draw_line_dsc_t lineDsc;
     for (int i = 0; i < v.lineCount; i++) {
         const MapLine &ln = v.lines[i];
         RoadClassStyle style = mapClassStyle(ln.roadClass);
-        lv_draw_line_dsc_init(&lineDsc);
-        lineDsc.color = style.color;
-        lineDsc.width = style.width;
-        lineDsc.round_start = 1;
-        lineDsc.round_end = 1;
-        lineDsc.p1.x = ln.x1;
-        lineDsc.p1.y = ln.y1;
-        lineDsc.p2.x = ln.x2;
-        lineDsc.p2.y = ln.y2;
-        lv_draw_line(&layer, &lineDsc);
+        fadedLine(ln.x1, ln.y1, ln.x2, ln.y2, style.color, style.width, LV_OPA_COVER);
     }
 
     // Pass 2: Breadcrumb trail (Polyline track)
     if (cfg.showVehicleTrail) {
         for (int i = 1; i < v.trailCount; i++) {
-            lv_draw_line_dsc_init(&lineDsc);
             int denom = v.trailCount > 1 ? v.trailCount - 1 : 1;
-            lineDsc.color = lv_color_hex(ACCENT_COLOR);
-            lineDsc.opa = (lv_opa_t)(60 + (195 * i) / denom);
-            lineDsc.width = 3;
-            lineDsc.round_start = 1;
-            lineDsc.round_end = 1;
-            lineDsc.p1.x = v.trailX[i - 1];
-            lineDsc.p1.y = v.trailY[i - 1];
-            lineDsc.p2.x = v.trailX[i];
-            lineDsc.p2.y = v.trailY[i];
-            lv_draw_line(&layer, &lineDsc);
+            fadedLine(v.trailX[i - 1], v.trailY[i - 1], v.trailX[i], v.trailY[i], lv_color_hex(ACCENT_COLOR), 3,
+                      (lv_opa_t)(60 + (195 * i) / denom));
         }
     }
 
@@ -769,9 +805,11 @@ static void updateMapCanvas() {
     lv_draw_rect_dsc_t dotDsc;
     for (int i = 0; i < v.markerCount; i++) {
         const MapMarker &m = v.markers[i];
+        lv_opa_t o = edgeOpa(m.x, m.y);
+        if (o < 8) continue;
         lv_draw_rect_dsc_init(&dotDsc);
         dotDsc.bg_color = mapMarkerColor(m.kind);
-        dotDsc.bg_opa = LV_OPA_COVER;
+        dotDsc.bg_opa = o;
         dotDsc.radius = LV_RADIUS_CIRCLE;
         lv_area_t area = {m.x - 5, m.y - 5, m.x + 5, m.y + 5};
         lv_draw_rect(&layer, &dotDsc, &area);
@@ -785,15 +823,7 @@ static void updateMapCanvas() {
     // stays fixed and the map spins/translates beneath it. Angle is 0.1° units,
     // clockwise-positive; -heading (mod 360) makes the travel direction up.
     // cfg.mapHeadingUp off = north-up (rotation 0), the simpler/proven mode.
-    {
-        int32_t rot = 0;
-        if (cfg.mapHeadingUp) {
-            rot = (int32_t)lroundf(-v.headingUpDeg * 10.0f);
-            rot %= 3600;
-            if (rot < 0) rot += 3600;
-        }
-        lv_image_set_rotation(mapCanvas, rot);
-    }
+    lv_image_set_rotation(mapCanvas, rot); // computed above (also used by the edge fade)
     esp_task_wdt_reset();
 
     // Periodic map-render diagnostics (every ~3s) so the map pipeline is
@@ -860,6 +890,7 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 
     // ---------------- Top status bar (Full width 480, Glassmorphism) ----------------
     lv_obj_t *topBar = makePane(scr, 0, 0, scrW, topH);
+    gTopBar = topBar;
     lv_obj_set_style_bg_opa(topBar, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_color(topBar, lv_color_hex(0x182232), 0);
     lv_obj_set_style_border_width(topBar, 1, 0);
@@ -953,7 +984,7 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     lv_obj_set_style_bg_opa(signPane, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(signPane, 0, 0);
 
-    static const int kSignDiam = 88;
+    static const int kSignDiam = 104; // 88 -> 104 (2026-09-27, "tang kich thuoc bien bao gioi han toc do")
     speedLimitSign = lv_obj_create(signPane);
     lv_obj_set_size(speedLimitSign, kSignDiam, kSignDiam);
     lv_obj_align(speedLimitSign, LV_ALIGN_CENTER, 0, 0);
@@ -961,7 +992,7 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(speedLimitSign, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(speedLimitSign, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(speedLimitSign, lv_color_hex(0xE60000), 0);
-    lv_obj_set_style_border_width(speedLimitSign, 9, 0);
+    lv_obj_set_style_border_width(speedLimitSign, 11, 0);
     lv_obj_set_style_shadow_color(speedLimitSign, lv_color_hex(0x000000), 0);
     lv_obj_set_style_shadow_width(speedLimitSign, 12, 0);
     lv_obj_set_style_shadow_opa(speedLimitSign, LV_OPA_50, 0);
@@ -983,6 +1014,7 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 
     // ---------------- Bottom row: Cảnh báo phụ (Traffic Card) ----------------
     lv_obj_t *bottomBar = makePane(scr, 0, scrH - kBottomBarH, scrW, kBottomBarH);
+    gBottomBar = bottomBar;
     lv_obj_set_style_border_color(bottomBar, lv_color_hex(0x182232), 0); // same line as the top bar
     lv_obj_set_style_border_width(bottomBar, 1, 0);
     lv_obj_set_style_border_side(bottomBar, LV_BORDER_SIDE_TOP, 0);
@@ -1024,6 +1056,7 @@ static void buildDashboardPortrait(lv_obj_t *scr) {
 
     // ---------------- Top status bar (Full width 320, Glassmorphism) ----------------
     lv_obj_t *topBar = makePane(scr, 0, 0, scrW, topH);
+    gTopBar = topBar;
     lv_obj_set_style_bg_opa(topBar, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_color(topBar, lv_color_hex(0x182232), 0);
     lv_obj_set_style_border_width(topBar, 1, 0);
@@ -1121,7 +1154,7 @@ static void buildDashboardPortrait(lv_obj_t *scr) {
     // Biển báo tốc độ cho phép (đặt cùng hàng Y=44, chiều cao 120)
     lv_obj_t *signPane = makePane(scr, scrW - 138 - 12, 44, 138, 120);
 
-    static const int kSignDiam = 88;
+    static const int kSignDiam = 104; // 88 -> 104 (2026-09-27, "tang kich thuoc bien bao gioi han toc do")
     speedLimitSign = lv_obj_create(signPane);
     lv_obj_set_size(speedLimitSign, kSignDiam, kSignDiam);
     lv_obj_align(speedLimitSign, LV_ALIGN_CENTER, 0, 0);
@@ -1129,7 +1162,7 @@ static void buildDashboardPortrait(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(speedLimitSign, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(speedLimitSign, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(speedLimitSign, lv_color_hex(0xE60000), 0);
-    lv_obj_set_style_border_width(speedLimitSign, 9, 0);
+    lv_obj_set_style_border_width(speedLimitSign, 11, 0);
     lv_obj_set_style_shadow_color(speedLimitSign, lv_color_hex(0x000000), 0);
     lv_obj_set_style_shadow_width(speedLimitSign, 12, 0);
     lv_obj_set_style_shadow_opa(speedLimitSign, LV_OPA_50, 0);
@@ -1268,7 +1301,7 @@ void buildDashboard() {
     lv_obj_add_flag(wifiToastLabel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(wifiToastLabel); // above the flash overlay/hold ring too
 
-    applyTheme(true); // initial default matches GnssSnapshot's own daytime=true default, until a real fix says otherwise
+    applyTheme(cfg.themeMode == 1.0f); // Light only if forced; Auto/Dark start dark until GNSS time says it's day
 }
 
 
@@ -1283,29 +1316,58 @@ void buildDashboard() {
 // and Night would undermine the "color only means risk" rule (spec section
 // 14.2), not serve it.
 static void applyTheme(bool daytime) {
-    // Ultra-High Contrast Automotive Cockpit Theme:
-    // Pure deep black background (#000000) for maximum legibility and zero light bleed.
-    // 100% Crisp White (#FFFFFF) and luminous silver for all text and readouts.
-    lv_color_t rootBg = lv_color_hex(0x000000);
-    lv_color_t captionText = lv_color_hex(0xD0E0F0); // Crisp high-contrast silver-white
-    lv_color_t primaryText = lv_color_white();       // 100% Pure White for speedometer
-    lv_color_t clockText = lv_color_white();         // Pure White for digital clock
-    lv_color_t gearColor = lv_color_hex(0xCCD8E6);   // Bright silver for settings
-    lv_color_t dividerColor = lv_color_hex(0x1C2530);
-    lv_color_t bottomText = lv_color_hex(0xD0E0F0);
+    gLightTheme = daytime;
+    const ThemePalette &P = pal();
+    lv_color_t bg = lv_color_hex(P.bg);
 
-    lv_obj_set_style_bg_color(dashboardScreen, rootBg, 0);
-    lv_obj_set_style_bg_color(dashRoot, rootBg, 0);
+    lv_obj_set_style_bg_color(dashboardScreen, bg, 0);
+    lv_obj_set_style_bg_color(dashRoot, bg, 0);
 
-    lv_obj_set_style_text_color(clockLabel, clockText, 0);
-    lv_obj_set_style_text_color(gearIcon, gearColor, 0);
-    for (int i = 0; i < 2; i++) lv_obj_set_style_line_color(colDividerLine[i], dividerColor, 0);
+    lv_obj_set_style_text_color(clockLabel, lv_color_hex(P.primaryText), 0);
+    lv_obj_set_style_text_color(gearIcon, lv_color_hex(P.captionText), 0);
+    for (int i = 0; i < 2; i++) lv_obj_set_style_line_color(colDividerLine[i], lv_color_hex(P.barLine), 0);
+    if (gTopBar) lv_obj_set_style_border_color(gTopBar, lv_color_hex(P.barLine), 0);
+    if (gBottomBar) lv_obj_set_style_border_color(gBottomBar, lv_color_hex(P.barLine), 0);
 
-    currentPrimaryTextColor = primaryText;
-    lv_obj_set_style_text_color(speedLabel, primaryText, 0);
-    lv_obj_set_style_text_color(kmhCaption, captionText, 0);
+    currentPrimaryTextColor = lv_color_hex(P.primaryText);
+    lv_obj_set_style_text_color(speedLabel, currentPrimaryTextColor, 0);
+    lv_obj_set_style_text_color(kmhCaption, lv_color_hex(P.captionText), 0);
+    lv_obj_set_style_text_color(bottomInfoLabel, lv_color_hex(P.captionText), 0);
 
-    lv_obj_set_style_text_color(bottomInfoLabel, bottomText, 0);
+    if (streetNameBadge) {
+        lv_obj_set_style_bg_color(streetNameBadge, lv_color_hex(P.badgeBg), 0);
+        lv_obj_set_style_border_color(streetNameBadge, lv_color_hex(P.badgeBorder), 0);
+    }
+    if (streetNameLabel) lv_obj_set_style_text_color(streetNameLabel, lv_color_hex(P.badgeText), 0);
+    if (streetNameIcon) lv_obj_set_style_text_color(streetNameIcon, lv_color_hex(P.accent), 0);
+    if (compassLabel) lv_obj_set_style_text_color(compassLabel, lv_color_hex(P.accent), 0);
+    if (egoArrow) lv_obj_set_style_line_color(egoArrow, lv_color_hex(P.accent), 0);
+    if (egoHalo) {
+        lv_obj_set_style_bg_color(egoHalo, lv_color_hex(P.accent), 0);
+        lv_obj_set_style_border_color(egoHalo, lv_color_hex(P.accent), 0);
+    }
+    if (trafficCard) {
+        lv_obj_set_style_bg_color(trafficCard, lv_color_hex(P.cardBg), 0);
+        lv_obj_set_style_border_color(trafficCard, lv_color_hex(P.cardBorder), 0);
+        lv_obj_set_style_shadow_opa(trafficCard, daytime ? LV_OPA_20 : LV_OPA_60, 0);
+    }
+    if (alertDistLabel) lv_obj_set_style_text_color(alertDistLabel, lv_color_hex(P.cardText), 0);
+    if (alertProgressBar) lv_obj_set_style_bg_color(alertProgressBar, lv_color_hex(P.cardTrack), 0);
+    if (wifiToastLabel) {
+        lv_obj_set_style_bg_color(wifiToastLabel, lv_color_hex(P.toastBg), 0);
+        lv_obj_set_style_text_color(wifiToastLabel, lv_color_hex(P.toastText), 0);
+    }
+    for (int i = 0; i < 4; i++) {
+        if (!gVignette[i]) continue;
+        gVignetteGrad[i]->stops[0].color = bg;
+        gVignetteGrad[i]->stops[1].color = bg;
+        lv_obj_set_style_bg_grad(gVignette[i], gVignetteGrad[i], 0); // re-set -> LVGL refreshes the style
+    }
+    audioIconInit = false; // re-colour on the next updateAudioTopIcon()
+    updateAudioTopIcon();
+    gThemeRepaintMap = true;            // repaint the map canvas in the new colours
+    lastDrawnMapGeneration = 0;
+    Serial.printf("[ui] theme -> %s\n", daytime ? "LIGHT" : "DARK");
 }
 
 // GREEN = normal, RED = fault, blinking AMBER = pending/searching — see the
@@ -1440,7 +1502,7 @@ void refreshDashboard() {
         lv_color_t col;
         if (tier == 2) col = ((nowT / 400) % 2 == 0) ? lv_color_hex(0xFF3B30) : lv_color_hex(0x601515); // blink
         else if (tier == 1) col = lv_color_hex(0xE0A000);                                              // amber
-        else col = lv_color_hex(0x93A0AE);                                                             // neutral
+        else col = lv_color_hex(pal().neutral);                                                        // neutral
         uint32_t cu = lv_color_to_u32(col);
         if (cu != sLastTempColor) { sLastTempColor = cu; lv_obj_set_style_text_color(tempLabel, col, 0); }
         if (tier > sLastTier && cfg.audioSystem) {           // crossing UP into a hotter tier
@@ -1604,9 +1666,11 @@ void refreshDashboard() {
         }
     }
 
+    // 0 = Auto: Light by day, Dark by night (GNSS sunrise/sunset). Without a
+    // GNSS clock yet the day/night isn't known -> stay Dark (no glare at night).
     bool effectiveDaytime = cfg.themeMode == 1.0f    ? true
                              : cfg.themeMode == 2.0f ? false
-                                                      : gnss.daytime; // 0 = Auto
+                                                      : (gnss.timeValid && gnss.daytime);
     static bool lastDaytime = true;
     static float lastThemeMode = -1; // forces the very first tick to apply, whatever cfg.themeMode loaded as
     if (effectiveDaytime != lastDaytime || cfg.themeMode != lastThemeMode) {
@@ -1702,6 +1766,15 @@ void refreshDashboard() {
         lv_label_set_text(speedLimitValueLabel, buf);
     } else {
         lv_label_set_text(speedLimitValueLabel, "--");
+    }
+    {
+        // 48 px digits for 2-digit limits; 3 digits (100/120) keep 36 px to fit the ring.
+        static int sLastLimitFont = -1;
+        int want = strlen(lv_label_get_text(speedLimitValueLabel)) >= 3 ? 36 : 48;
+        if (want != sLastLimitFont) {
+            sLastLimitFont = want;
+            lv_obj_set_style_text_font(speedLimitValueLabel, want == 48 ? &lv_font_montserrat_48 : &lv_font_montserrat_36, 0);
+        }
     }
     {
         static bool sLimitColorSet = false; // the sign value is always black — set it once, not every tick

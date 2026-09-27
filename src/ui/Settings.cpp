@@ -107,7 +107,7 @@ static void onSliderChanged(lv_event_t *e) {
     if (b->target == &cfg.brightnessMode) applyConfig(); // Auto/Manual backlight applies live
     if (b->target == &cfg.screenRotation) {
         saveConfigToNVS(cfg);
-        lv_label_set_text(settingsStatusLabel, "Da luu xoay man hinh! Khoi dong lai de ap dung...");
+        lv_label_set_text(settingsStatusLabel, "Rotation saved. Restart to apply.");
         if (restartConfirmOverlay) {
             lv_obj_clear_flag(restartConfirmOverlay, LV_OBJ_FLAG_HIDDEN);
         }
@@ -123,7 +123,7 @@ static void onSwitchChanged(lv_event_t *e) {
     // 2026-09-24 ("ghi nhớ lưu chọn bản đồ ... sau khi khởi động"). Switches are
     // discrete/infrequent, so a NVS write per toggle is fine (unlike sliders).
     saveConfigToNVS(cfg);
-    lv_label_set_text(settingsStatusLabel, "Da luu");
+    lv_label_set_text(settingsStatusLabel, "Saved");
 }
 
 // Not wired through the generic SwitchBinding/onSwitchChanged above:
@@ -242,7 +242,7 @@ static void showPhoneConnectedToast() {
         lv_obj_set_style_pad_hor(connToast, 14, 0);
         lv_obj_set_style_pad_ver(connToast, 6, 0);
         lv_obj_set_style_text_color(connToast, lv_color_hex(0xDFF5E6), 0);
-        lv_label_set_text(connToast, LV_SYMBOL_OK " Điện thoại đã kết nối · trang cài đặt: 192.168.4.1");
+        lv_label_set_text(connToast, LV_SYMBOL_OK " Phone connected · settings page: 192.168.4.1");
         lv_obj_align(connToast, LV_ALIGN_TOP_MID, 0, 40);
     }
     lv_obj_clear_flag(connToast, LV_OBJ_FLAG_HIDDEN);
@@ -308,7 +308,7 @@ static void buildWifiScanOverlay(lv_obj_t *parent) {
     lv_obj_add_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *title = lv_label_create(wifiScanOverlay);
-    lv_label_set_text(title, LV_SYMBOL_WIFI "  Kết nối điện thoại");
+    lv_label_set_text(title, LV_SYMBOL_WIFI "  Connect phone");
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
     lv_obj_set_pos(title, 12, 8);
 
@@ -323,7 +323,7 @@ static void buildWifiScanOverlay(lv_obj_t *parent) {
     lv_obj_set_width(cap, qsz + 12);
     lv_obj_set_style_text_align(cap, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(cap, lv_color_hex(0xCCD6E0), 0);
-    lv_label_set_text(cap, "Quét bằng camera để vào Wi-Fi");
+    lv_label_set_text(cap, "Scan with the camera to join");
     lv_obj_set_pos(cap, 14, qy + qsz + 16);
 
     // Right column: the same credentials in text (manual join), then live status,
@@ -385,7 +385,7 @@ static void buildWifiScanOverlay(lv_obj_t *parent) {
     lv_obj_set_style_shadow_width(closeBtn, 0, 0);
     lv_obj_add_event_cb(closeBtn, onWifiScanClose, LV_EVENT_CLICKED, NULL);
     lv_obj_t *closeLbl = lv_label_create(closeBtn);
-    lv_label_set_text(closeLbl, "Đóng");
+    lv_label_set_text(closeLbl, "Close");
     lv_obj_center(closeLbl);
 }
 
@@ -398,10 +398,10 @@ static bool bridgeStatusText(char *buf, size_t cap, int *pct) {
     *pct = p.bytesTotal ? (int)((uint64_t)p.bytesDone * 100 / p.bytesTotal) : 0;
     if (!active) return false;
     switch (p.state) {
-    case INST_VERIFYING: snprintf(buf, cap, LV_SYMBOL_REFRESH " Đang kiểm tra dữ liệu..."); break;
-    case INST_COMMITTED: snprintf(buf, cap, LV_SYMBOL_OK " Dữ liệu hợp lệ — khởi động lại để cài"); break;
+    case INST_VERIFYING: snprintf(buf, cap, LV_SYMBOL_REFRESH " Checking data..."); break;
+    case INST_COMMITTED: snprintf(buf, cap, LV_SYMBOL_OK " Data OK — restart to install"); break;
     default:
-        snprintf(buf, cap, LV_SYMBOL_DOWNLOAD " Đang nhận dữ liệu từ điện thoại  %d%%\n%u / %u KB · tệp %u/%u", *pct,
+        snprintf(buf, cap, LV_SYMBOL_DOWNLOAD " Receiving data from phone  %d%%\n%u / %u KB · file %u/%u", *pct,
                  (unsigned)(p.bytesDone / 1024), (unsigned)(p.bytesTotal / 1024),
                  (unsigned)(p.filesDone < p.filesTotal ? p.filesDone + 1 : p.filesTotal), (unsigned)p.filesTotal);
     }
@@ -434,9 +434,9 @@ static void refreshBridgeToast() {
     }
     InstallerProgress p = installerProgress();
     char t[64];
-    if (p.state == INST_VERIFYING) snprintf(t, sizeof(t), LV_SYMBOL_REFRESH " Đang kiểm tra dữ liệu...");
-    else if (p.state == INST_COMMITTED) snprintf(t, sizeof(t), LV_SYMBOL_OK " Sắp khởi động lại để cài dữ liệu");
-    else snprintf(t, sizeof(t), LV_SYMBOL_DOWNLOAD " Nhận dữ liệu từ điện thoại %d%%", pct);
+    if (p.state == INST_VERIFYING) snprintf(t, sizeof(t), LV_SYMBOL_REFRESH " Checking data...");
+    else if (p.state == INST_COMMITTED) snprintf(t, sizeof(t), LV_SYMBOL_OK " Restarting soon to install data");
+    else snprintf(t, sizeof(t), LV_SYMBOL_DOWNLOAD " Receiving data from phone %d%%", pct);
     if (strcmp(lv_label_get_text(bridgeToast), t) != 0) lv_label_set_text(bridgeToast, t);
     if (lv_obj_has_flag(bridgeToast, LV_OBJ_FLAG_HIDDEN)) lv_obj_clear_flag(bridgeToast, LV_OBJ_FLAG_HIDDEN);
 }
@@ -481,13 +481,13 @@ static void refreshScanListIfOpen() {
         webPortalApSsid(ap, sizeof(ap));
         bool secured = strlen(cfg.wifiPassword) >= 8;
         char buf[240];
-        int n = snprintf(buf, sizeof(buf), "Tên: %s\nMật khẩu: %s\nTrang: 192.168.4.1",
-                         ap, secured ? cfg.wifiPassword : "(không có)");
+        int n = snprintf(buf, sizeof(buf), "Name: %s\nPassword: %s\nPage: 192.168.4.1",
+                         ap, secured ? cfg.wifiPassword : "(none)");
         // Also on a WiFi network (home / phone hotspot): the portal is reachable
         // at this address from any device on that same network.
         char staIp[24];
         if (webPortalStaIp(staIp, sizeof(staIp)) && n > 0 && n < (int)sizeof(buf))
-            snprintf(buf + n, sizeof(buf) - n, "\nMạng \"%s\": %s", cfg.staSsid, staIp);
+            snprintf(buf + n, sizeof(buf) - n, "\nNetwork \"%s\": %s", cfg.staSsid, staIp);
         if (strcmp(lv_label_get_text(scanSavedLbl), buf) != 0) lv_label_set_text(scanSavedLbl, buf);
     }
 
@@ -497,7 +497,7 @@ static void refreshScanListIfOpen() {
         bool bridging = bridgeStatusText(buf, sizeof(buf), &pct);
         uint32_t color = 0x3DA5FF;
         if (!bridging && !wifiWanted) {
-            snprintf(buf, sizeof(buf), "Wi-Fi đang tắt.\nGạt công tắc để bật và kết nối điện thoại.");
+            snprintf(buf, sizeof(buf), "Wi-Fi is off.\nTurn the switch on to connect a phone.");
             color = 0xE5B53A;
         } else if (!bridging) {
             int clients = webPortalClientCount();
@@ -505,14 +505,14 @@ static void refreshScanListIfOpen() {
             char inet[80] = "";
             if (webPortalStaIp(ip, sizeof(ip))) {
                 if (dataUpdateAvailable())
-                    snprintf(inet, sizeof(inet), "\nCó dữ liệu mới %s — mở trang để cập nhật", dataUpdateRemoteVersion());
+                    snprintf(inet, sizeof(inet), "\nNew data %s available — open the page to update", dataUpdateRemoteVersion());
             }
             if (clients > 0) {
-                snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Điện thoại đã kết nối (%d)\nTrang cài đặt tự mở trên điện thoại\n(hoặc vào 192.168.4.1)%s",
+                snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Phone connected (%d)\nThe settings page opens on the phone\n(or go to 192.168.4.1)%s",
                          clients, inet);
                 color = 0x34C46A;
             } else {
-                snprintf(buf, sizeof(buf), "Chờ điện thoại kết nối...\nKhông cần Wi-Fi nhà để cập nhật dữ liệu.%s", inet);
+                snprintf(buf, sizeof(buf), "Waiting for a phone...\nNo home Wi-Fi needed to update data.%s", inet);
                 color = 0x8FA0B4;
             }
         }
@@ -621,13 +621,20 @@ static void onChoiceBtnClicked(lv_event_t *e) {
     }
     clampConfig(cfg);
     lv_label_set_text(settingsStatusLabel, "");
+    Serial.printf("[ui] choice %.0f selected\n", (double)*b->target);
+    // Persist immediately, like the switches (2026-09-27: a Theme / brightness
+    // mode choice used to be lost on reboot unless the footer Save was pressed).
+    if (b->target != &cfg.screenRotation) {
+        saveConfigToNVS(cfg);
+        lv_label_set_text(settingsStatusLabel, "Saved");
+    }
     // Rotation can't apply live (see AppConfig.h's screenRotation comment —
     // both screens are laid out once at boot for whichever orientation was
     // active then) — say so immediately rather than let the button silently
     // do nothing until the next restart.
     if (b->target == &cfg.screenRotation) {
         saveConfigToNVS(cfg);
-        lv_label_set_text(settingsStatusLabel, "Da luu xoay man hinh! Khoi dong lai de ap dung...");
+        lv_label_set_text(settingsStatusLabel, "Rotation saved. Restart to apply.");
         if (restartConfirmOverlay) {
             lv_obj_clear_flag(restartConfirmOverlay, LV_OBJ_FLAG_HIDDEN);
         }
@@ -642,7 +649,7 @@ static void addChoiceRow(lv_obj_t *parent, int &y, const char *name, float *targ
     lv_obj_set_pos(nameLbl, 4, y);
     y += 15;
 
-    int parentW = lv_obj_get_width(parent);
+    int parentW = lv_obj_get_content_width(parent) - 8; // content area, minus room for the scrollbar
     const int gap = 4, leftMargin = 4, rightMargin = 4;
     int btnW = (parentW - leftMargin - rightMargin - gap * (count - 1)) / count;
     if (btnW > 90) btnW = 90; // don't stretch to absurd width on a wide landscape panel
@@ -674,7 +681,7 @@ static void addSwitchRow(lv_obj_t *parent, int &y, const char *name, bool *targe
     // widget itself is small regardless of panel width, and every switch
     // label in this app is short enough to clear even a ~220px-wide
     // portrait column before the switch's own position below.
-    int swX = lv_obj_get_width(parent) - 46;
+    int swX = lv_obj_get_content_width(parent) - 44 - 10; // fully inside the content area (was clipped)
 
     lv_obj_t *nameLbl = lv_label_create(parent);
     lv_label_set_text(nameLbl, name);
@@ -682,6 +689,7 @@ static void addSwitchRow(lv_obj_t *parent, int &y, const char *name, bool *targe
     lv_obj_set_pos(nameLbl, 4, y + 3);
 
     lv_obj_t *sw = lv_switch_create(parent);
+    lv_obj_set_size(sw, 44, 22);
     lv_obj_set_pos(sw, swX, y);
     if (*target) lv_obj_add_state(sw, LV_STATE_CHECKED);
 
@@ -712,7 +720,7 @@ static lv_obj_t *addReadonlyRow(lv_obj_t *parent, int &y, const char *name) {
 
     lv_obj_t *valLbl = lv_label_create(parent);
     lv_obj_set_style_text_color(valLbl, lv_color_white(), 0);
-    lv_obj_set_pos(valLbl, lv_obj_get_width(parent) - 90, y + 5);
+    lv_obj_set_pos(valLbl, lv_obj_get_content_width(parent) - 112, y + 5); // room for "NOT CONNECTED"-length values
 
     y += 22;
     return valLbl;
@@ -742,10 +750,10 @@ static lv_obj_t *wifiStatusVal; // Settings > WiFi tab — see refreshSensorsPan
 static lv_obj_t *dataUpdateStatusVal = nullptr; // Settings > WiFi tab, online data update progress
 static void onDataUpdateBtnClicked(lv_event_t *) {
     if (cfg.dataUpdateUrl[0] == '\0') {
-        if (dataUpdateStatusVal) lv_label_set_text(dataUpdateStatusVal, "Chua dat URL (Config)");
+        if (dataUpdateStatusVal) lv_label_set_text(dataUpdateStatusVal, "No data URL set (Config)");
         return;
     }
-    if (dataUpdateStatusVal) lv_label_set_text(dataUpdateStatusVal, "Khoi dong lai de cap nhat...");
+    if (dataUpdateStatusVal) lv_label_set_text(dataUpdateStatusVal, "Restarting to update...");
     dataUpdateSchedule(); // reboots into update mode (download runs there with RAM free for TLS)
 }
 // Settings > Sensors > "Speed Map" group — see refreshSensorsPanel(). Region/
@@ -823,7 +831,9 @@ static void refreshSensorsPanel(lv_timer_t *) {
 
     RoadInfoSnapshot road = roadInfoSnapshot();
     if (road.valid) {
-        lv_label_set_text_fmt(speedMapLimitVal, "%.0f km/h", (double)road.speedLimitKmh);
+        char lb[16];
+        snprintf(lb, sizeof(lb), "%.0f km/h", (double)road.speedLimitKmh); // libc: LVGL fmt has no %f
+        lv_label_set_text(speedMapLimitVal, lb);
     } else {
         lv_label_set_text(speedMapLimitVal, "--");
     }
@@ -833,7 +843,9 @@ static void refreshSensorsPanel(lv_timer_t *) {
         // 0.0-1.0 number is available via /api/speedmap/debug for anyone
         // who wants it, not shown on this screen to keep it scannable.
         const char *bucket = road.confidence >= 0.8f ? "HIGH" : (road.confidence >= 0.5f ? "MEDIUM" : "LOW");
-        lv_label_set_text_fmt(speedMapMatchVal, "%s (%.2f)", bucket, (double)road.confidence);
+        char mb[32];
+        snprintf(mb, sizeof(mb), "%s (%.2f)", bucket, (double)road.confidence);
+        lv_label_set_text(speedMapMatchVal, mb);
         lv_label_set_text_fmt(speedMapRoadIdVal, "%lu", (unsigned long)road.roadId);
     } else {
         lv_label_set_text(speedMapMatchVal, "--");
@@ -1122,7 +1134,7 @@ void buildSettingsScreen() {
     lv_obj_set_style_pad_all(navRail, 4, 0);
     lv_obj_clear_flag(navRail, LV_OBJ_FLAG_SCROLLABLE);
 
-    static const char *kCategoryNames[kCategoryCount] = {"Display", "Map", "Sensors", "WiFi", "Âm thanh"};
+    static const char *kCategoryNames[kCategoryCount] = {"Display", "Map", "Sensors", "WiFi", "Audio"};
     for (int i = 0; i < kCategoryCount; i++) {
         lv_obj_t *btn = lv_button_create(navRail);
         lv_obj_set_size(btn, NAV_W - 8, 42);
@@ -1188,11 +1200,11 @@ void buildSettingsScreen() {
     addSliderRow(categoryPanels[0], y, "Brightness", &cfg.brightness, 5, 100, 1.0f, " %");
     // Backlight mode (2026-09-26): Auto caps the backlight at 50 % at night
     // (same GNSS sunrise/sunset as the Auto theme); Manual = always the slider.
-    static const char *kBrightnessModeLabels[2] = {"Tự động", "Thủ công"};
-    addChoiceRow(categoryPanels[0], y, "Chế độ sáng", &cfg.brightnessMode, kBrightnessModeLabels, 2);
+    static const char *kBrightnessModeLabels[2] = {"Auto", "Manual"};
+    addChoiceRow(categoryPanels[0], y, "Brightness mode", &cfg.brightnessMode, kBrightnessModeLabels, 2);
     {
         lv_obj_t *hint = lv_label_create(categoryPanels[0]);
-        lv_label_set_text(hint, "Tự động: buổi tối giảm độ sáng còn 50%");
+        lv_label_set_text(hint, "Auto: 50% brightness at night");
         lv_obj_set_style_text_color(hint, lv_color_hex(0x7C8A9A), 0);
         lv_obj_set_pos(hint, 4, y);
         y += 22;
@@ -1227,22 +1239,22 @@ void buildSettingsScreen() {
     {
         lv_obj_t *ap = categoryPanels[4];
         int ya = 4;
-        addSwitchRow(ap, ya, "Âm thanh cảnh báo", &cfg.audioEnabled);
-        addSliderRow(ap, ya, "Âm lượng", &cfg.audioVolume, 0, 100, 1.0f, " %");
+        addSwitchRow(ap, ya, "Alert sound", &cfg.audioEnabled);
+        addSliderRow(ap, ya, "Volume", &cfg.audioVolume, 0, 100, 1.0f, " %");
         lv_obj_t *hint = lv_label_create(ap);
-        lv_label_set_text(hint, "Giữ màn hình chính 2.5 giây để bật/tắt nhanh.\nPhát âm thanh cho:");
+        lv_label_set_text(hint, "Hold the main screen 2.5 s to toggle sound.\nPlay sound for:");
         lv_obj_set_style_text_color(hint, lv_color_hex(0x7C8A9A), 0);
         lv_obj_set_pos(hint, 4, ya);
         ya += 40;
-        addSwitchRow(ap, ya, "Quá tốc độ", &cfg.audioOverspeed);
+        addSwitchRow(ap, ya, "Overspeed", &cfg.audioOverspeed);
         addSwitchRow(ap, ya, "Camera", &cfg.audioCamera);
-        addSwitchRow(ap, ya, "Đổi tốc độ phía trước", &cfg.audioLimitAhead);
-        addSwitchRow(ap, ya, "Khu dân cư", &cfg.audioResident);
-        addSwitchRow(ap, ya, "Cấm vượt", &cfg.audioNoOvertake);
-        addSwitchRow(ap, ya, "Trạm thu phí", &cfg.audioToll);
-        addSwitchRow(ap, ya, "Đèn tín hiệu", &cfg.audioLight);
-        addSwitchRow(ap, ya, "Khu vực nguy hiểm", &cfg.audioDanger);
-        addSwitchRow(ap, ya, "GPS / nhiệt độ", &cfg.audioSystem);
+        addSwitchRow(ap, ya, "Speed limit ahead", &cfg.audioLimitAhead);
+        addSwitchRow(ap, ya, "Residential area", &cfg.audioResident);
+        addSwitchRow(ap, ya, "No overtaking", &cfg.audioNoOvertake);
+        addSwitchRow(ap, ya, "Toll booth", &cfg.audioToll);
+        addSwitchRow(ap, ya, "Traffic light", &cfg.audioLight);
+        addSwitchRow(ap, ya, "Danger zone", &cfg.audioDanger);
+        addSwitchRow(ap, ya, "GPS / temperature", &cfg.audioSystem);
     }
 
     // Demo mode (user-requested 2026-09-22, "demo hien thi truoc de toi chinh
@@ -1253,11 +1265,12 @@ void buildSettingsScreen() {
     // point at, and there must not be (demo/DemoMode.h).
     {
         lv_obj_t *nameLbl = lv_label_create(categoryPanels[0]);
-        lv_label_set_text(nameLbl, "Demo mode (xem UI)");
+        lv_label_set_text(nameLbl, "Demo mode");
         lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
         lv_obj_set_pos(nameLbl, 4, y + 3);
         demoEnableSwitch = lv_switch_create(categoryPanels[0]);
-        lv_obj_set_pos(demoEnableSwitch, lv_obj_get_width(categoryPanels[0]) - 46, y);
+        lv_obj_set_size(demoEnableSwitch, 44, 22);
+        lv_obj_set_pos(demoEnableSwitch, lv_obj_get_content_width(categoryPanels[0]) - 44 - 10, y); // same as addSwitchRow
         // A stock lv_switch's default hit area is small (~40x20px) — same
         // "enlarge the touch target, not just the visual size" fix this
         // file already applies to backBtn/restoreBtn/restartBtn/saveBtn
@@ -1277,8 +1290,8 @@ void buildSettingsScreen() {
     // -----------------------------------------------------------------
     y = 4;
     // Vector map only (raster JPEG background removed 2026-09-26).
-    addSwitchRow(categoryPanels[1], y, "Huong xe len tren (xoay)", &cfg.mapHeadingUp);
-    addSwitchRow(categoryPanels[1], y, "Vehicle Trail (track)", &cfg.showVehicleTrail);
+    addSwitchRow(categoryPanels[1], y, "Heading up (rotate map)", &cfg.mapHeadingUp);
+    addSwitchRow(categoryPanels[1], y, "Vehicle trail", &cfg.showVehicleTrail);
 
     // Speed Map diagnostics (spec section 25) — offline microSD map-matching
     // status, see map/SpeedLimitManager.h. This group is why categoryPanels[1]
@@ -1361,7 +1374,7 @@ void buildSettingsScreen() {
         lv_label_set_long_mode(wifiHint, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(wifiHint, lv_obj_get_width(categoryPanels[3]) - 8);
         lv_obj_set_style_text_color(wifiHint, lv_color_hex(0xCCD6E0), 0);
-        lv_label_set_text(wifiHint, "Đang mở mã QR để kết nối điện thoại...");
+        lv_label_set_text(wifiHint, "Opening the QR code to connect a phone...");
         lv_obj_set_pos(wifiHint, 6, 8);
     }
 

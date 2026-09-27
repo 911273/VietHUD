@@ -44,20 +44,20 @@ struct DemoScene {
 // each sign type. Durations are long enough to actually read the screen and
 // hear the voice line finish, short enough that a full lap is about a minute.
 static const DemoScene kScenes[] = {
-    {"Chua co GPS",        4000,  -1,  -1, D_NONE,          0,   0,  -1, true,  ""},
-    {"Dung yen, GH 60",    4000,   0,  60, D_NONE,          0,   0,  -1, true,  "D. Dai Co Viet"},
-    {"Chay 62, GH 60",     4000,  62,  60, D_NONE,          0,   0,  -1, true,  "D. Dai Co Viet"},
-    {"Qua toc do 78/60",   6000,  78,  60, D_NONE,          0,   0,  -1, true,  "Ham Kim Lien"},
-    {"GH truoc 40, 100m",  9000,  70,  60, D_AHEAD_LIMIT, 100,   0,  40, true,  "D. Xa Dan"},
+    {"No GPS",             4000,  -1,  -1, D_NONE,          0,   0,  -1, true,  ""},
+    {"Stopped, limit 60",    4000,   0,  60, D_NONE,          0,   0,  -1, true,  "D. Dai Co Viet"},
+    {"Driving 62, limit 60",     4000,  62,  60, D_NONE,          0,   0,  -1, true,  "D. Dai Co Viet"},
+    {"Overspeed 78/60",   6000,  78,  60, D_NONE,          0,   0,  -1, true,  "Ham Kim Lien"},
+    {"Limit 40 ahead, 100m",  9000,  70,  60, D_AHEAD_LIMIT, 100,   0,  40, true,  "D. Xa Dan"},
     {"Camera 100->20m",   14000,  64,  60, D_CAMERA,      100,  20,  60, true,  "D. Nguyen Trai"},
-    {"Camera khong GH",    7000,  55,  -1, D_CAMERA,      100,  20,  -1, true,  "D. Nguyen Trai"},
-    {"Vao khu dan cu",    10000,  58,  60, D_RESIDENT,    350,  20,  -1, true,  "D. Nguyen Trai"},
-    {"Het khu dan cu",     7000,  52,  50, D_RESIDENT,    300,  40,  -1, false, "QL 1A - Giai Phong"},
-    {"Cam vuot",          10000,  61,  60, D_NO_OVERTAKE, 350,  20,  -1, true,  "QL 1A - Giai Phong"},
-    {"Het cam vuot",       6000,  63,  60, D_NO_OVERTAKE, 250,  40,  -1, false, "QL 1A - Giai Phong"},
-    {"Den tin hieu",      10000,  45,  50, D_TRAFFIC_LIGHT, 350, 15, -1, true,  "Dai lo Thang Long"},
-    {"Tram thu phi",       8000,  70,  80, D_TOLL,        350,  40,  -1, true,  "Cao toc Phap Van"},
-    {"Doan nguy hiem",     9000,  62,  60, D_DANGER,      350,  30,  -1, true,  "Deo Hai Van"},
+    {"Camera, no limit",    7000,  55,  -1, D_CAMERA,      100,  20,  -1, true,  "D. Nguyen Trai"},
+    {"Enter residential",    10000,  58,  60, D_RESIDENT,    350,  20,  -1, true,  "D. Nguyen Trai"},
+    {"Leave residential",     7000,  52,  50, D_RESIDENT,    300,  40,  -1, false, "QL 1A - Giai Phong"},
+    {"No overtaking",          10000,  61,  60, D_NO_OVERTAKE, 350,  20,  -1, true,  "QL 1A - Giai Phong"},
+    {"End no overtaking",       6000,  63,  60, D_NO_OVERTAKE, 250,  40,  -1, false, "QL 1A - Giai Phong"},
+    {"Traffic light",      10000,  45,  50, D_TRAFFIC_LIGHT, 350, 15, -1, true,  "Dai lo Thang Long"},
+    {"Toll booth",       8000,  70,  80, D_TOLL,        350,  40,  -1, true,  "Cao toc Phap Van"},
+    {"Danger zone",     9000,  62,  60, D_DANGER,      350,  30,  -1, true,  "Deo Hai Van"},
 };
 static const int kSceneCount = sizeof(kScenes) / sizeof(kScenes[0]);
 
