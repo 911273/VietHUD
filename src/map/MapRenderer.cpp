@@ -1,7 +1,6 @@
 #include "MapRenderer.h"
 #include "SpeedLimitManager.h" // speedLimitManagerGetNearbySegments/GetNearbyMarkers, RoadSegment, SIGN_TYPE_*
 #include "SnapToRoad.h"        // Orthogonal projection onto matched road segment
-#include "demo/DemoMode.h"    // demoModeIsEnabled() for synthetic markers
 #include <math.h>
 
 // ---------------------------------------------------------------------
@@ -205,27 +204,7 @@ void mapRendererComputeFromSegments(const GnssSnapshot &gnss, const RoadSegment 
 
     // Markers (cameras and signs)
     v.markerCount = 0;
-    if (demoModeIsEnabled()) {
-        // Place "ahead" markers along the (north-up) travel direction, so after
-        // the canvas is rotated to heading-up they sit straight ahead of the
-        // car. egoHeading is the demo's own heading here.
-        float hr = egoHeading * (float)M_PI / 180.0f;
-        float sinH = sinf(hr), cosH = cosf(hr);
-        auto addDemoMarkerAhead = [&](float distM, uint8_t kind) {
-            if (distM > 0 && distM <= radiusM && v.markerCount < MapViewSnapshot::kMaxMarkers) {
-                MapMarker &m = v.markers[v.markerCount++];
-                m.x = (int16_t)(gAnchorX + distM * scale * sinH);
-                m.y = (int16_t)(gAnchorY - distM * scale * cosH);
-                m.kind = kind;
-            }
-        };
-
-        if (road.cameraAheadValid) addDemoMarkerAhead(road.cameraAheadDistanceM, MAP_MARKER_CAMERA);
-        if (road.residentAreaAheadValid) addDemoMarkerAhead(road.residentAreaAheadDistM, MAP_MARKER_RESIDENT_AREA);
-        if (road.noOvertakingAheadValid) addDemoMarkerAhead(road.noOvertakingAheadDistM, MAP_MARKER_NO_OVERTAKING);
-        if (road.trafficLightAheadValid) addDemoMarkerAhead(road.trafficLightAheadDistM, MAP_MARKER_TRAFFIC_LIGHT);
-        if (road.tollBoothAheadValid) addDemoMarkerAhead(road.tollBoothAheadDistM, MAP_MARKER_TOLL_BOOTH);
-    } else {
+    {
         NearbyMarkerRaw rawMarkers[MapViewSnapshot::kMaxMarkers];
         int markerCount = 0;
         speedLimitManagerGetNearbyMarkers(egoLat, egoLon, radiusM, rawMarkers, MapViewSnapshot::kMaxMarkers,

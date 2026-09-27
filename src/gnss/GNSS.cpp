@@ -1,7 +1,6 @@
 #include "GNSS.h"
 #include "core/AppConfig.h"
 #include "core/SharedState.h"
-#include "demo/DemoMode.h" // demoModeIsEnabled() — the demo publishes instead of this task while on
 #include "pincfg.h"
 #include <Arduino.h>
 #include <TinyGPSPlus.h>
@@ -425,10 +424,6 @@ static void gnssTaskFn(void *) {
         // parked just because the fix dropped.
         if (!haveRecentFix || snap.egoSpeedKmh > kGnssMotionThresholdKmh) lastMovingMs = millis();
 
-        // Suppressed while the UI demo owns the shared state (demo/DemoMode.h)
-        // — this task keeps running and keeps its own filter/fix state warm,
-        // so switching the demo off hands back a live reading within one
-        // 50ms tick rather than a stale or re-converging one.
         if (gSimActive) {
             uint32_t nowS = millis();
             if ((int32_t)(nowS - gSimEndMs) >= 0) {
@@ -483,7 +478,7 @@ static void gnssTaskFn(void *) {
                 snap.fixSeq = 0x80000000u | gSimFixSeq;
             }
         }
-        if (!demoModeIsEnabled()) gnssPublish(snap);
+        gnssPublish(snap);
 
         uint32_t now = millis();
         if (now - lastDebugMs > 3000) {

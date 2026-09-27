@@ -50,8 +50,7 @@ void mapRendererSetCanvasSize(int widthPx, int heightPx);
 void mapRendererSetGeometry(int canvasSide, int anchorX, int anchorY, int refMinDim);
 
 // Zoom radius for a given speed — 300m under 40km/h, 600m 40-80, 1000m
-// above 80 (spec's own tiers). Exposed so demo/DemoMode.cpp reports the same
-// number this module actually uses rather than a second hardcoded copy.
+// above 80 (spec's own tiers).
 float mapRendererZoomRadiusM(float speedKmh);
 
 // Manual digital-zoom multiplier (the on-screen Zoom button, ui/Dashboard.cpp).
@@ -74,18 +73,9 @@ void mapRendererUpdate(const GnssSnapshot &gnss);
 
 // Pure transform, no SD access, no throttle gate — given an
 // already-supplied segment list, computes and publishes a MapViewSnapshot
-// exactly as mapRendererUpdate() would after its own SD fetch. Used by
-// mapRendererUpdate() itself AND by demo/DemoMode.cpp directly, so the demo
-// exercises this real rotation/projection code with a small synthetic road
-// network instead of fabricating pre-transformed screen coordinates by
-// hand — consistent with how DemoMode already drives every other real
-// widget-update path with fabricated SENSOR input, never a fabricated
-// UI-layer shortcut.
+// exactly as mapRendererUpdate() would after its own SD fetch.
 void mapRendererComputeFromSegments(const GnssSnapshot &gnss, const struct RoadSegment *segs, int segCount);
 
 // Clears this module's internal breadcrumb-trail history and throttle-gate
-// "last position" state, and publishes a blank/invalid MapViewSnapshot —
-// called when demo/DemoMode.cpp turns off, mirroring
-// demoModeSetEnabled()'s own RoadInfoSnapshot reset, so leftover fake trail
-// points from a demo session never bleed into the next real drive.
+// "last position" state, and publishes a blank/invalid MapViewSnapshot.
 void mapRendererReset();

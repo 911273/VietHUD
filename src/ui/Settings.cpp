@@ -4,7 +4,6 @@
 #include "core/AppConfig.h"
 #include "core/NvsStore.h"
 #include "core/SharedState.h" // gnssSnapshot()/roadInfoSnapshot() for the Sensors diagnostics panel
-#include "demo/DemoMode.h"    // scripted UI demo — Settings > Display switch
 #include "map/SpeedLimitManager.h" // speedSourceStr() — Speed Map group in the Sensors tab
 #include "net/WebPortal.h"    // webPortalIsEnabled()/webPortalRequestEnable() — WiFi tab
 #include "net/DataUpdater.h"  // dataUpdateStart()/GetStatus() — WiFi tab "Update data" button
@@ -70,10 +69,6 @@ static lv_obj_t *wifiQrObj = nullptr;         // lv_qrcode
 static lv_obj_t *scanConnLbl = nullptr;       // live connection status inside the overlay
 static lv_obj_t *scanSavedLbl = nullptr;      // "saved networks" summary inside the overlay
 static char g_qrPayload[128] = "";            // last-built WIFI: QR string (rebuild only on change)
-// Demo mode (Settings > Display) — like WiFi's switch above, deliberately not
-// an AppConfig/NVS field, so it can never survive a reboot into real driving.
-// See demo/DemoMode.h.
-static lv_obj_t *demoEnableSwitch, *demoSceneVal;
 
 // Formats a settings value: no decimal for whole numbers ("100 m", "3 min"),
 // one decimal otherwise ("0.3", "1.5"). Cleaner than the old always-"%.1f"
@@ -136,19 +131,6 @@ static void onWifiSwitchChanged(lv_event_t *e) {
     bool on = lv_obj_has_state(wifiEnableSwitch, LV_STATE_CHECKED);
     webPortalRequestEnable(on);
     Serial.printf("[uidemo] WiFi %s via Settings switch\n", on ? "ON" : "OFF");
-}
-
-// Same non-AppConfig treatment as WiFi's switch above — see its comment and
-// demo/DemoMode.h for why this state must not persist.
-static void onDemoSwitchChanged(lv_event_t *) {
-    // Diagnostic print (user-reported 2026-09-22: "gat Demo mode khong an,
-    // Settings tu thoat" — a switch tap seemingly doing nothing followed by
-    // the 5s idle-return firing, which only happens if NO touch registered
-    // at all in that window, not even a miss elsewhere on screen). This
-    // confirms whether the tap is reaching this handler at all, before
-    // assuming the ext_click_area enlargement just below is the real fix.
-    Serial.println("[settings] Demo mode switch event fired");
-    demoModeSetEnabled(lv_obj_has_state(demoEnableSwitch, LV_STATE_CHECKED));
 }
 
 // On-screen keyboard for wifiSsidTa/wifiPasswordTa — this screen's first use
@@ -798,12 +780,6 @@ static void refreshSensorsPanel(lv_timer_t *) {
     snprintf(buf, sizeof(buf), "%.1f km/h", (double)gnss.egoSpeedKmh);
     lv_label_set_text(gnssSpeedFilteredVal, buf);
 
-    // Which demo scene is on screen right now, so the tour can be described
-    // while watching it (and so it's obvious at a glance that the numbers on
-    // the Dashboard are synthetic, not a real fix).
-    lv_label_set_text(demoSceneVal, demoModeSceneName());
-    lv_obj_set_style_text_color(demoSceneVal, demoModeIsEnabled() ? lv_color_hex(0xE0C020) : lv_color_hex(0x7C8A9A),
-                                 0);
 
     // WiFi is a QR-only screen now — all its live status (AP creds, STA
     // connection, update-available) is drawn straight onto the full-screen QR
@@ -1256,34 +1232,6 @@ void buildSettingsScreen() {
         addSwitchRow(ap, ya, "Danger zone", &cfg.audioDanger);
         addSwitchRow(ap, ya, "GPS / temperature", &cfg.audioSystem);
     }
-
-    // Demo mode (user-requested 2026-09-22, "demo hien thi truoc de toi chinh
-    // sua") — plays a scripted tour of every Dashboard state so the UI can be
-    // reviewed without a GNSS fix or a speed-map database on the card. Built
-    // by hand rather than via addSwitchRow() for the same reason as the WiFi
-    // tab's own switch: there's no bool in cfg for the generic binding to
-    // point at, and there must not be (demo/DemoMode.h).
-    {
-        lv_obj_t *nameLbl = lv_label_create(categoryPanels[0]);
-        lv_label_set_text(nameLbl, "Demo mode");
-        lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
-        lv_obj_set_pos(nameLbl, 4, y + 3);
-        demoEnableSwitch = lv_switch_create(categoryPanels[0]);
-        lv_obj_set_size(demoEnableSwitch, 44, 22);
-        lv_obj_set_pos(demoEnableSwitch, lv_obj_get_content_width(categoryPanels[0]) - 44 - 10, y); // same as addSwitchRow
-        // A stock lv_switch's default hit area is small (~40x20px) — same
-        // "enlarge the touch target, not just the visual size" fix this
-        // file already applies to backBtn/restoreBtn/restartBtn/saveBtn
-        // after real user reports of unresponsiveness (those all sit at a
-        // panel edge, a specifically worse region for capacitive touch;
-        // this one doesn't, but user-reported 2026-09-22 unresponsiveness
-        // here too — "gat Demo mode khong an, Settings tu thoat" — a small
-        // control is still a small control wherever it sits).
-        lv_obj_set_ext_click_area(demoEnableSwitch, 20);
-        lv_obj_add_event_cb(demoEnableSwitch, onDemoSwitchChanged, LV_EVENT_VALUE_CHANGED, NULL);
-        y += 26;
-    }
-    demoSceneVal = addReadonlyRow(categoryPanels[0], y, "Demo scene");
 
     // -----------------------------------------------------------------
     // Map tab (categoryPanels[1]) — vector map display options
