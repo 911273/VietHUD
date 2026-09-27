@@ -6,7 +6,6 @@
 #include "map/SpeedLimitManager.h" // speedLimitManagerGetInfo()/speedSourceStr() — /api/speedlimit, /api/speedmap/debug
 #include "ui/Dashboard.h" // applyConfig() — a web-submitted brightness change needs the same PWM rewrite Settings.cpp's slider does
 #include "audio/AudioPlayer.h" // audioSelfTest() — web control panel "test audio" action
-#include "demo/DemoMode.h"      // demoModeSetEnabled()/IsEnabled() — web control panel demo toggle
 #include "net/DataUpdater.h"    // dataUpdateStart()/GetStatus() — online data update action
 #include "net/UpdateApi.h"      // Phone Update Bridge API (/api/v1/*)
 #include "net/PortalPage.h"     // kPortalHtml — the "/" single-page portal
@@ -547,7 +546,7 @@ static void handleUpdatePost() {
 // ---------------------------------------------------------------------
 // "/api/action" (POST ?do=...) — the Live page's control panel (feature G).
 // Small, explicit actions only; runs in the web task's context so it can call
-// audio/demo/SD helpers directly. Every action is idempotent-ish and safe to
+// audio/SD helpers directly. Every action is idempotent-ish and safe to
 // fire from a phone. Reboot sends its reply first, then restarts after a beat.
 // ---------------------------------------------------------------------
 static void handleApiAction() {
@@ -555,10 +554,6 @@ static void handleApiAction() {
     if (a == "audiotest") {
         audioSelfTest();
         server.send(200, "text/plain", "Audio self-test started");
-    } else if (a == "demo") {
-        bool on = !demoModeIsEnabled();
-        demoModeSetEnabled(on);
-        server.send(200, "text/plain", on ? "Demo mode ON" : "Demo mode OFF");
     } else if (a == "clearlogs") {
         int n = sdMgrDeleteAllTripLogs();
         char msg[48];

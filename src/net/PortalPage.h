@@ -69,7 +69,7 @@ h3{font-size:14px;margin:16px 0 4px;color:var(--m);font-weight:600}
  <input type="file" id="dF" multiple><button class="g" onclick="fromFiles()">Cài dữ liệu từ tệp</button>
  <h3>Firmware</h3><input type="file" id="fwF" accept=".bin"><button class="g" onclick="fwUp()">Nạp firmware</button><div class="s" id="fwM"></div>
  <h3>Công cụ</h3><div class="row2">
-  <button class="g" onclick="act('audiotest')">Thử loa</button><button class="g" onclick="act('demo')">Bật/tắt demo</button>
+  <button class="g" onclick="act('audiotest')">Thử loa</button>
   <button class="r" onclick="if(confirm('Xoá toàn bộ nhật ký chuyến đi?'))act('clearlogs').then(tlLoad)">Xoá nhật ký</button>
   <button class="r" onclick="if(confirm('Khởi động lại VietHUD?'))act('reboot')">Khởi động lại</button></div>
  <div class="s" id="aM"></div>

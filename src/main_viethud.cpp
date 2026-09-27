@@ -43,7 +43,6 @@
 #include "core/AppConfig.h"
 #include "core/NvsStore.h"
 #include "core/SharedState.h"
-#include "demo/DemoMode.h"
 #include "display/DisplayDriver.h"
 #include "gnss/GNSS.h"
 #include "map/SpeedLimitManager.h"
@@ -479,7 +478,6 @@ void setup() {
     if (installerTakeWifiOnRequest()) webPortalRequestEnable(true);
     speedLimitManagerStart(); // Core 0 — microSD speed-limit/camera/sign map matching, see map/SpeedLimitManager.h
     tripLoggerStart(); // Core 0 — microSD trip/event CSV logging, see log/TripLogger.h
-    demoModeStart(); // Core 0 — scripted UI demo, idles until switched on in Settings > Display (demo/DemoMode.h)
     // (Was disabled 2026-09-15 after two SPI-peripheral-contention
     // regressions — see pincfg.h's SD_MMC_CLK_PIN comment. Root cause: the
     // TF slot was never SPI at all, it's the ESP32-S3's dedicated SD_MMC
@@ -520,23 +518,10 @@ void loop() {
     // stuck, without needing to reproduce with a debugger attached.
     if (now0 - lastHb > 1000) { lastHb = now0; Serial.printf("[hb %lu]\n", now0); }
 
-    // TEMPORARY serial-triggered demo toggle (2026-09-22) — added purely to
-    // verify the live background-map feature while the touch controller is
-    // reporting a stuck/wrong X coordinate on real hardware (a real,
-    // pre-existing bug, separate from the map work — see [touch] log lines
-    // showing x=0 on every touch regardless of where the panel was actually
-    // pressed), which makes the Settings > Display > Demo mode SWITCH
-    // unreachable by touch right now. Type 'd' + Enter in the serial
-    // monitor to toggle it without touching the screen at all. Remove once
-    // the touch calibration bug is fixed and the real switch is reachable
-    // again — this bypasses the UI entirely and isn't meant to ship.
+    // Bench serial commands (see docs/VIETHUD_FW_2.2.0.md, "Lenh serial").
     while (Serial.available()) {
         char c = (char)Serial.read();
-        if (c == 'd') {
-            bool now2 = !demoModeIsEnabled();
-            demoModeSetEnabled(now2);
-            Serial.printf("[debug] demo mode toggled via serial -> %s\n", now2 ? "ON" : "OFF");
-        } else if (c == 'a') {
+        if (c == 'a') {
             audioSelfTest(); // play every chime + voice clip once, for speaker bench verification
         } else if (c == 'w') {
             bool on = !webPortalIsEnabled();

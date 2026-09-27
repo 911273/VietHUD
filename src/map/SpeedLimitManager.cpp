@@ -4,7 +4,6 @@
 #include "TrackContinuity.h" // HMM layer/continuity tracking (elevated vs surface roads) // Route — the forward-route engine (SD-free, unit-testable); see that header for why it's separate
 #include "core/AppConfig.h" // cfg.aheadLimitWarnDistM / cfg.cameraWarnDistM — user-tunable, see that file's own comment
 #include "core/SharedState.h"
-#include "demo/DemoMode.h" // demoModeIsEnabled() — the demo publishes instead of this task while on
 #include "gnss/GNSS.h" // kGnssMotionThresholdKmh — ahead-lookahead only runs while actually moving
 #include "MapRenderer.h" // mapRendererUpdate() — live background map, driven from this same task loop
 #include <Arduino.h>
@@ -1787,20 +1786,12 @@ static void speedLimitTaskFn(void *) {
             }
 
             lastPublished = out;
-            // Suppressed while the UI demo owns the shared state — same gate
-            // and same reasoning as gnss/GNSS.cpp's own publish (demo/DemoMode.h).
-            // Matching itself keeps running so its tile cache and continuity
-            // state stay warm across a demo session.
-            if (!demoModeIsEnabled()) {
-                roadInfoPublish(out);
-                // Live background map (2026-09-22) — rides this same ~500ms
-                // loop rather than a new task; mapRendererUpdate() itself
-                // gates on real movement/heading delta (see MapRenderer.cpp's
-                // own comment) so a stationary or straight-driving car costs
-                // nothing extra here. Suppressed under demo the same way
-                // roadInfoPublish() is — demo/DemoMode.cpp drives the map
-                // directly via mapRendererComputeFromSegments() with its own
-                // synthetic road network instead.
+            roadInfoPublish(out);
+            // Live background map (2026-09-22) — rides this same ~500ms loop
+            // rather than a new task; mapRendererUpdate() itself gates on real
+            // movement/heading delta (see MapRenderer.cpp's own comment) so a
+            // stationary or straight-driving car costs nothing extra here.
+            {
                 uint32_t tMap0 = micros();
                 mapRendererUpdate(gnss);
                 uint32_t tMap = micros() - tMap0;
