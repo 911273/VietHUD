@@ -1,4 +1,6 @@
 #include "SdCardManager.h"
+#include "OsmTrafficSignals.h" // built-in OSM traffic lights merged into the sign list
+#include "SignMerge.h"         // mergeOsmLights() (host-tested)
 #include "pincfg.h"
 #include <Arduino.h>
 #include <SD_MMC.h>
@@ -114,6 +116,30 @@ static int cmpCamLat(const void *a, const void *b) {
 static int cmpSignLat(const void *a, const void *b) {
     int32_t x = ((const SignPt *)a)->latE7, y = ((const SignPt *)b)->latE7;
     return (x > y) - (x < y);
+}
+// Built-in OpenStreetMap traffic lights (src/map/OsmTrafficSignals.cpp,
+// 2026-09-27): the WYN alert data has NO traffic lights in inner Hanoi (0 vs
+// 364 signalized intersections in OSM). Appended as SIGN_TYPE_TRAFFIC_LIGHT
+// (with the OSM traffic_signals:direction when tagged, else any approach),
+// skipping any the card already has within 30 m. trafficSigns is unsorted here.
+static void mergeOsmTrafficSignals() {
+    const int nOsm = kOsmTrafficSignalCount;
+    if (nOsm <= 0) return;
+    size_t want = (size_t)(trafficSignCount + nOsm) * sizeof(SignPt);
+    if (psramRoomFor(want) < want) {
+        Serial.println("[sdmgr] WARN: no PSRAM room for built-in OSM traffic lights");
+        return;
+    }
+    SignPt *grown = (SignPt *)heap_caps_realloc(trafficSigns, want, MALLOC_CAP_SPIRAM);
+    if (!grown) return;
+    trafficSigns = grown;
+    int32_t *scratch = (int32_t *)heap_caps_malloc((size_t)(trafficSignCount + 1) * 2 * sizeof(int32_t), MALLOC_CAP_SPIRAM);
+    if (!scratch) return;
+    int added = 0, dupes = 0;
+    trafficSignCount = mergeOsmLights(trafficSigns, trafficSignCount, trafficSignCount + nOsm, kOsmTrafficSignals, nOsm,
+                                      (uint8_t)SIGN_TYPE_TRAFFIC_LIGHT, 30.0f, scratch, &added, &dupes);
+    heap_caps_free(scratch);
+    Serial.printf("[sdmgr] built-in OSM traffic lights: %d added, %d already on the card\n", added, dupes);
 }
 
 // Road Names Database in PSRAM. roadNameCount is uint32 (was uint16): the full-VN
@@ -455,11 +481,6 @@ bool sdMgrMount() {
                 }
                 free(chunk);
                 if (readTotal < n) Serial.printf("[sdmgr] WARN: PSRAM room for only part of signs.bin (%d of %d read)\n", readTotal, n);
-                if (trafficSignCount > 0 && trafficSignCount < cap) {
-                    void *shrunk = heap_caps_realloc(trafficSigns, (size_t)trafficSignCount * sizeof(SignPt), MALLOC_CAP_SPIRAM);
-                    if (shrunk) trafficSigns = (SignPt *)shrunk;
-                }
-                qsort(trafficSigns, trafficSignCount, sizeof(SignPt), cmpSignLat);
                 Serial.printf("[sdmgr] signs.bin: %d camera row(s) skipped (in cameras.bin)\n", skippedCam);
             } else {
                 Serial.println("[sdmgr] PSRAM allocation for traffic signs failed");
@@ -468,6 +489,12 @@ bool sdMgrMount() {
         signFile.close();
     }
     Serial.printf("[sdmgr] signs.bin: %d traffic sign(s) loaded\n", trafficSignCount);
+    mergeOsmTrafficSignals();
+    if (trafficSigns && trafficSignCount > 0) {
+        void *shrunk = heap_caps_realloc(trafficSigns, (size_t)trafficSignCount * sizeof(SignPt), MALLOC_CAP_SPIRAM);
+        if (shrunk) trafficSigns = (SignPt *)shrunk;
+        qsort(trafficSigns, trafficSignCount, sizeof(SignPt), cmpSignLat);
+    }
     Serial.printf("[sdmgr] PSRAM after points: %u KB free, largest block %u KB\n",
                   (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
                   (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));

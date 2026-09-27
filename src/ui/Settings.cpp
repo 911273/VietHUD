@@ -848,8 +848,18 @@ static void checkIdleReturnToDashboard(lv_timer_t *) {
     // keyboard or the full-screen WiFi setup overlay is open (both only appear
     // from WiFi flows, and the same "don't interrupt text entry" reasoning
     // applies to any field).
-    if (g_activeCategory == kCategoryWifi) return;
-    if (wifiScanOverlay && !lv_obj_has_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN)) return;
+    // The WiFi (QR) screen gets a longer window instead: back to the Dashboard
+    // after 1 minute without a touch (2026-09-27, "Setting/WiFi quay ve man hinh
+    // home sau 1 phut") — but never while a phone is transferring data.
+    bool wifiOpen = wifiScanOverlay && !lv_obj_has_flag(wifiScanOverlay, LV_OBJ_FLAG_HIDDEN);
+    if (g_activeCategory == kCategoryWifi || wifiOpen) {
+        static const uint32_t kWifiIdleTimeoutMs = 60000;
+        if (wifiOpen && !updateApiBusy() && millis() - lastTouchAtMs() > kWifiIdleTimeoutMs) {
+            Serial.println("[ui] WiFi screen idle 60 s -> Dashboard");
+            onWifiScanClose(nullptr);
+        }
+        return;
+    }
     if (wifiKeyboard && !lv_obj_has_flag(wifiKeyboard, LV_OBJ_FLAG_HIDDEN)) return;
     static const uint32_t kIdleTimeoutMs = 5000;
     if (millis() - lastTouchAtMs() > kIdleTimeoutMs) {

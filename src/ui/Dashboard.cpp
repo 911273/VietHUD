@@ -232,7 +232,7 @@ static const int kTopBarH = 40;
 static const int kBottomBarH = 40;
 static int gMapSideS = 578, gMapCenter = 289; // oversized heading-up canvas: square side + its center (rotation pivot)
 static int gRefMinDim = 160;                  // on-screen minDim framing the zoom (see buildMapCanvas)
-static float gMapZoomScale = 1.0f; // Default 2.0x digital zoom (~2.2m/px)
+static float gMapZoomScale = 2.0f; // default 2.0x (2026-09-27 user request); tap cycles 2.0 -> 2.5 -> 1.5
 uint32_t g_mapDrawUs = 0, g_mapDrawCount = 0;
 
 // --- Top bar ---
