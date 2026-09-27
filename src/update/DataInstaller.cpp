@@ -49,8 +49,8 @@ struct DatasetDef {
     const char *files[6];
 };
 static const DatasetDef kDatasets[] = {
-    {"map", "Bản đồ đường", {"tiles.bin", "index.bin", "metadata.bin", "names.bin", "seg_names.bin", nullptr}},
-    {"alerts", "Cảnh báo giao thông", {"signs.bin", "cameras.bin", nullptr}},
+    {"map", "Road map", {"tiles.bin", "index.bin", "metadata.bin", "names.bin", "seg_names.bin", nullptr}},
+    {"alerts", "Traffic alerts", {"signs.bin", "cameras.bin", nullptr}},
 };
 static const int kDatasetCount = sizeof(kDatasets) / sizeof(kDatasets[0]);
 
@@ -289,7 +289,7 @@ static void restoreSession() {
         sha256Hex(text, len, S->manifestSha);
         S->active = true;
         updateProgressTotals();
-        setMsg(allReceived() ? INST_READY : INST_RECEIVING, "Tiếp tục phiên cập nhật dở");
+        setMsg(allReceived() ? INST_READY : INST_RECEIVING, "Resuming the unfinished update");
     }
     heap_caps_free(text);
 }
@@ -299,18 +299,18 @@ int installerOpenSession(const char *text, size_t len, const char *sigB64, char 
         snprintf(err, errCap, "%s", m);
         return code;
     };
-    if (!ensureSession()) return fail(503, "Hết bộ nhớ");
-    if (!sdMgrMkdir(STAGE)) return fail(503, "Không đọc được thẻ nhớ");
+    if (!ensureSession()) return fail(503, "Out of memory");
+    if (!sdMgrMkdir(STAGE)) return fail(503, "Cannot read the SD card");
     restoreSession();
-    if (sdMgrExists(JOURNAL)) return fail(409, "Đang chờ khởi động lại để cài bản trước");
-    if (sdMgrExists(APPLIED)) return fail(409, "Đang xác nhận bản vừa cài — thử lại sau 1 phút");
-    if (!text || len == 0 || len > kMaxManifest) return fail(400, "Manifest không hợp lệ");
-    if (!installerVerifySignature(text, len, sigB64)) return fail(401, "Chữ ký dữ liệu không hợp lệ");
+    if (sdMgrExists(JOURNAL)) return fail(409, "Waiting for a restart to install the previous update");
+    if (sdMgrExists(APPLIED)) return fail(409, "Confirming the last install — retry in 1 minute");
+    if (!text || len == 0 || len > kMaxManifest) return fail(400, "Invalid manifest");
+    if (!installerVerifySignature(text, len, sigB64)) return fail(401, "Invalid data signature");
     {   // Never downgrade: release versions are "YYYY.MM.DD.HHMM" (lexicographic = chronological).
         char rv[24] = "", lv[24] = "";
         sscanf(text, "version %23s", rv);
         installerLocalVersion(lv, sizeof(lv));
-        if (installerVersionOlder(rv, lv)) return fail(409, "Bản phát hành cũ hơn dữ liệu đang dùng");
+        if (installerVersionOlder(rv, lv)) return fail(409, "The release is older than the data in use");
     }
 
     char mSha[65];
@@ -323,7 +323,7 @@ int installerOpenSession(const char *text, size_t len, const char *sigB64, char 
             S->recv[i] = sz > 0 ? (uint32_t)sz : 0;
         }
         updateProgressTotals();
-        setMsg(allReceived() ? INST_READY : INST_RECEIVING, "Tiếp tục nhận dữ liệu");
+        setMsg(allReceived() ? INST_READY : INST_RECEIVING, "Resuming data transfer");
         return 201;
     }
 
@@ -334,7 +334,7 @@ int installerOpenSession(const char *text, size_t len, const char *sigB64, char 
     sdMgrClearDir(STAGE);
     memset(S, 0, sizeof(*S));
     S->restoreTried = true;
-    if (!loadNeeded(text, len)) return fail(400, "Manifest không hợp lệ");
+    if (!loadNeeded(text, len)) return fail(400, "Invalid manifest");
     if (S->n == 0) {
         // Every file already matches, but the (signed) manifest itself may be a
         // newer release (new version line, or entries we already had). Adopt it
@@ -361,14 +361,14 @@ int installerOpenSession(const char *text, size_t len, const char *sigB64, char 
         }
         if (cur) heap_caps_free(cur);
         S->active = false;
-        setMsg(INST_IDLE, "Dữ liệu đã là bản mới nhất");
-        return fail(200, "Dữ liệu đã là bản mới nhất");
+        setMsg(INST_IDLE, "Data is already up to date");
+        return fail(200, "Data is already up to date");
     }
     uint64_t need = 512 * 1024;
     for (int i = 0; i < S->n; i++) need += S->f[i].size;
     uint64_t freeB = sdMgrFreeBytes();
     if (freeB < need) {
-        snprintf(err, errCap, "Thẻ nhớ đầy: cần %u MB, còn %u MB", (unsigned)(need >> 20), (unsigned)(freeB >> 20));
+        snprintf(err, errCap, "SD card full: need %u MB, %u MB free", (unsigned)(need >> 20), (unsigned)(freeB >> 20));
         return 507;
     }
     uint8_t rnd[16];
@@ -382,11 +382,11 @@ int installerOpenSession(const char *text, size_t len, const char *sigB64, char 
     int sl = snprintf(sidLine, sizeof(sidLine), "sid %s\n", S->sid);
     if (!sdMgrWriteSmallFile(STAGE_MANIFEST, text, len) || !sdMgrWriteSmallFile(STAGE_SIG, sigB64, strlen(sigB64)) ||
         !sdMgrWriteSmallFile(STAGE_SESSION, sidLine, sl))
-        return fail(503, "Không ghi được thẻ nhớ");
+        return fail(503, "Cannot write to the SD card");
     S->active = true;
     updateProgressTotals();
     char m[72];
-    snprintf(m, sizeof(m), "Chờ nhận %d tệp (%u KB)", S->n, (unsigned)(sProg.bytesTotal / 1024));
+    snprintf(m, sizeof(m), "Waiting for %d files (%u KB)", S->n, (unsigned)(sProg.bytesTotal / 1024));
     setMsg(INST_RECEIVING, m);
     return 201;
 }
@@ -424,7 +424,7 @@ int installerWriteBegin(const char *name, uint32_t offset, uint32_t *expected) {
     }
     if (!sdMgrWriterOpen(pp, true)) return 503;
     sWriteIdx = idx;
-    if (sProg.state != INST_RECEIVING) setMsg(INST_RECEIVING, "Đang nhận dữ liệu");
+    if (sProg.state != INST_RECEIVING) setMsg(INST_RECEIVING, "Receiving data");
     return 200;
 }
 
@@ -478,7 +478,7 @@ uint32_t installerWriteEnd() {
     uint32_t r = S->recv[sWriteIdx];
     sWriteIdx = -1;
     updateProgressTotals();
-    if (allReceived()) setMsg(INST_READY, "Đã nhận đủ dữ liệu");
+    if (allReceived()) setMsg(INST_READY, "All data received");
     return r;
 }
 
@@ -493,7 +493,7 @@ void installerAbort() {
     }
     sProg.bytesDone = sProg.bytesTotal = 0;
     sProg.filesDone = sProg.filesTotal = 0;
-    setMsg(INST_IDLE, "Đã hủy cập nhật");
+    setMsg(INST_IDLE, "Update cancelled");
 }
 
 static void readDatasetVersions(char vers[][24]) {
@@ -517,13 +517,13 @@ int installerCommit(bool checkMoving, char *err, size_t errCap) {
         return code;
     };
     restoreSession();
-    if (!S || !S->active) return fail(410, "Không có phiên cập nhật");
-    if (!allReceived()) return fail(412, "Chưa nhận đủ dữ liệu");
+    if (!S || !S->active) return fail(410, "No update session");
+    if (!allReceived()) return fail(412, "Data not fully received");
     if (checkMoving) {
         GnssSnapshot g = gnssSnapshot();
-        if (g.fix && g.egoSpeedKmh > 8.0f) return fail(423, "Xe đang chạy — dừng xe để cài đặt");
+        if (g.fix && g.egoSpeedKmh > 8.0f) return fail(423, "Vehicle moving — stop to install");
     }
-    setMsg(INST_VERIFYING, "Đang kiểm tra dữ liệu (SHA-256)...");
+    setMsg(INST_VERIFYING, "Checking data (SHA-256)...");
     for (int i = 0; i < S->n; i++) {
         char pp[64];
         partPath(S->f[i].name, ".part", pp, sizeof(pp));
@@ -540,7 +540,7 @@ int installerCommit(bool checkMoving, char *err, size_t errCap) {
             S->recv[i] = 0;
             updateProgressTotals();
             char m[72];
-            snprintf(m, sizeof(m), "Tệp %s bị lỗi khi truyền — gửi lại", S->f[i].name);
+            snprintf(m, sizeof(m), "File %s was corrupted in transfer — resend", S->f[i].name);
             setMsg(INST_FAILED, m);
             return fail(422, m);
         }
@@ -552,8 +552,8 @@ int installerCommit(bool checkMoving, char *err, size_t errCap) {
         partPath(S->f[i].name, ".new", np, sizeof(np));
         sdMgrRemove(np);
         if (!sdMgrMove(pp, np)) {
-            setMsg(INST_FAILED, "Lỗi ghi thẻ nhớ");
-            return fail(503, "Lỗi ghi thẻ nhớ");
+            setMsg(INST_FAILED, "SD card write error");
+            return fail(503, "SD card write error");
         }
     }
     // After this install EVERY file matches the new signed manifest (untouched
@@ -569,8 +569,8 @@ int installerCommit(bool checkMoving, char *err, size_t errCap) {
     for (int i = 0; i < S->n; i++) jl += snprintf(jb + jl, sizeof(jb) - jl, "%s\n", S->f[i].name);
     sdMgrRemove(JOURNAL_TMP);
     if (!sdMgrWriteSmallFile(JOURNAL_TMP, jb, jl) || !sdMgrMove(JOURNAL_TMP, JOURNAL)) {
-        setMsg(INST_FAILED, "Lỗi ghi nhật ký cài đặt");
-        return fail(503, "Lỗi ghi nhật ký cài đặt");
+        setMsg(INST_FAILED, "Install journal write error");
+        return fail(503, "Install journal write error");
     }
     sdMgrRemove(STAGE_SESSION);
     S->active = false;
@@ -578,7 +578,7 @@ int installerCommit(bool checkMoving, char *err, size_t errCap) {
     p.begin("vhupd", false);
     p.putBool("wifiOn", true); // bring the AP back after the reboot so the phone sees the result
     p.end();
-    setMsg(INST_COMMITTED, "Dữ liệu hợp lệ — khởi động lại để cài đặt");
+    setMsg(INST_COMMITTED, "Data OK — restart to install");
     return 200;
 }
 
@@ -665,7 +665,7 @@ bool installerBootApply() {
             int boots = bootCounter(1, false);
             Serial.printf("[install] unconfirmed install, boot #%d\n", boots);
             if (boots >= 3) {
-                rollback("Khởi động lỗi nhiều lần");
+                rollback("Repeated boot failures");
                 sRolledBackThisBoot = true;
             }
         }
@@ -700,7 +700,7 @@ bool installerBootApply() {
 
 void installerAfterMount(bool mountOk) {
     if (mountOk || !sdMgrExists(APPLIED)) return;
-    rollback("Dữ liệu mới không đọc được");
+    rollback("New data could not be read");
     Preferences p;
     p.begin("vhupd", false);
     p.putBool("rbShow", true); // show "KHÔI PHỤC DỮ LIỆU CŨ" after the restart below

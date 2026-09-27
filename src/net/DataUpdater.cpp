@@ -81,7 +81,7 @@ static bool downloadToStage(const String &base, int idx, uint8_t *buf, size_t bu
     if (https) sclient.setInsecure();
     HTTPClient http;
     if (!http.begin(https ? (WiFiClient &)sclient : client, url)) {
-        setStatus(DU_FAILED, "Lỗi kết nối máy chủ");
+        setStatus(DU_FAILED, "Server connection error");
         return false;
     }
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
@@ -90,7 +90,7 @@ static bool downloadToStage(const String &base, int idx, uint8_t *buf, size_t bu
     int code = http.GET();
     if (code != 200 && code != 206) {
         char m[64];
-        snprintf(m, sizeof(m), "Lỗi tải %s (HTTP %d)", name, code);
+        snprintf(m, sizeof(m), "Download error %s (HTTP %d)", name, code);
         setStatus(DU_FAILED, m);
         http.end();
         return false;
@@ -109,7 +109,7 @@ static bool downloadToStage(const String &base, int idx, uint8_t *buf, size_t bu
         size_t avail = stream->available();
         if (!avail) {
             if (millis() - lastDataMs > 15000) {
-                setStatus(DU_FAILED, "Mất kết nối khi đang tải");
+                setStatus(DU_FAILED, "Connection lost while downloading");
                 ok = false;
                 break;
             }
@@ -129,7 +129,7 @@ static bool downloadToStage(const String &base, int idx, uint8_t *buf, size_t bu
         }
         if ((uint32_t)r > size - got) r = size - got;
         if (!installerWriteData(p, r)) {
-            setStatus(DU_FAILED, "Lỗi ghi thẻ nhớ");
+            setStatus(DU_FAILED, "SD card write error");
             ok = false;
             break;
         }
@@ -147,7 +147,7 @@ static int runUpdate(uint8_t *dlBuf, size_t dlBufSize) {
     s_status.filesTotal = 0;
     s_status.filesDone = 0;
     s_status.percent = 0;
-    setStatus(DU_RUNNING, "Đang tải danh sách dữ liệu...");
+    setStatus(DU_RUNNING, "Loading the data list...");
 
     String base = cfg.dataUpdateUrl;
     if (base.length() && !base.endsWith("/")) base += "/";
@@ -156,17 +156,17 @@ static int runUpdate(uint8_t *dlBuf, size_t dlBufSize) {
 
     String manifest, sig;
     if (!httpGetText(base + DU_MANIFEST_NAME, manifest)) {
-        setStatus(DU_FAILED, "Không tải được danh sách dữ liệu");
+        setStatus(DU_FAILED, "Could not load the data list");
         return 0;
     }
     if (!httpGetText(base + DU_MANIFEST_NAME ".sig", sig)) {
-        setStatus(DU_FAILED, "Bản cập nhật chưa được ký");
+        setStatus(DU_FAILED, "The update is not signed");
         return 0;
     }
     char err[80];
     int rc = installerOpenSession(manifest.c_str(), manifest.length(), sig.c_str(), err, sizeof(err));
     if (rc == 200) {
-        setStatus(DU_SUCCESS, "Dữ liệu đã là bản mới nhất");
+        setStatus(DU_SUCCESS, "Data is already up to date");
         return 2;
     }
     if (rc != 201) {
@@ -181,7 +181,7 @@ static int runUpdate(uint8_t *dlBuf, size_t dlBufSize) {
         s_status.filesDone = k;
         s_status.percent = 0;
         char m[64];
-        snprintf(m, sizeof(m), "Đang tải %s (%d/%d)", name, k + 1, n);
+        snprintf(m, sizeof(m), "Downloading %s (%d/%d)", name, k + 1, n);
         setStatus(DU_RUNNING, m);
         bool ok = false;
         for (int attempt = 0; attempt < 3 && !ok; attempt++) { // resumes via Range after a drop
@@ -191,14 +191,14 @@ static int runUpdate(uint8_t *dlBuf, size_t dlBufSize) {
         if (!ok) return 0; // FAILED set inside; parts stay on the card for the next try
         s_status.filesDone = k + 1;
     }
-    setStatus(DU_RUNNING, "Đang kiểm tra dữ liệu...");
+    setStatus(DU_RUNNING, "Checking data...");
     rc = installerCommit(false, err, sizeof(err));
     if (rc != 200) {
         setStatus(DU_FAILED, err);
         return 0;
     }
     char done[64];
-    snprintf(done, sizeof(done), "Đã tải %d tệp — khởi động lại để cài", n);
+    snprintf(done, sizeof(done), "Downloaded %d files — restart to install", n);
     setStatus(DU_SUCCESS, done);
     return 1;
 }
@@ -209,7 +209,7 @@ static void dataUpdateTask(void *) {
     uint8_t *dlBuf = (uint8_t *)heap_caps_malloc(DL, MALLOC_CAP_SPIRAM);
     int result = 0;
     if (dlBuf) result = runUpdate(dlBuf, DL);
-    else setStatus(DU_FAILED, "Hết bộ nhớ");
+    else setStatus(DU_FAILED, "Out of memory");
     if (dlBuf) heap_caps_free(dlBuf);
 
     s_running = false;
@@ -229,7 +229,7 @@ void dataUpdateSchedule() {
     p.begin("dataupd", false);
     p.putBool("pending", true);
     p.end();
-    setStatus(DU_RUNNING, "Khởi động lại để cập nhật...");
+    setStatus(DU_RUNNING, "Restarting to update...");
     delay(700); // let the HTTP reply / UI update flush
     ESP.restart();
 }
@@ -315,11 +315,11 @@ const char *dataUpdateLocalVersion() { return s_localVersion; }
 bool dataUpdateStart() {
     if (s_running) return false;
     if (strlen(cfg.dataUpdateUrl) == 0) {
-        setStatus(DU_FAILED, "Chưa đặt địa chỉ dữ liệu");
+        setStatus(DU_FAILED, "No data URL set");
         return false;
     }
     if (WiFi.status() != WL_CONNECTED) {
-        setStatus(DU_FAILED, "VietHUD chưa có Internet");
+        setStatus(DU_FAILED, "VietHUD has no Internet");
         return false;
     }
     s_running = true;
