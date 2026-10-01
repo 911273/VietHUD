@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VietHUD SpeedMap Studio - Trình Chỉnh Sửa Dữ Liệu Cảnh Báo Trực Quan (V5.3)</title>
+  
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="studio-header">
+    <div class="logo-area">
+      <div class="hud-pulse"></div>
+      <span class="logo-title">SPEEDMAP STUDIO</span>
+      <span class="logo-badge">V5.3 AUTO-PERSIST</span>
+    </div>
+
+    <!-- Quick Location Hotspots -->
+    <div class="quick-nav">
+      <span class="quick-label">⚡ Điểm nóng:</span>
+      <select id="hotspotSelect" class="hud-select" onchange="jumpToHotspot(this.value)">
+        <option value="21.0460,105.7814,16">Hà Nội - Phạm Văn Đồng / Trần Cung</option>
+        <option value="21.0360,105.7830,16">Hà Nội - Cầu Giấy / Trần Thái Tông</option>
+        <option value="21.0285,105.8542,15">Hà Nội - Hoàn Kiếm / Tràng Tiền</option>
+        <option value="21.0041,105.8427,15">Hà Nội - Giải Phóng (QL1A)</option>
+        <option value="20.9782,105.8361,15">Hà Nội - Vành Đai 3 & Pháp Vân</option>
+        <option value="10.7769,106.7009,15">TP. HCM - Quận 1 (Bến Thành)</option>
+        <option value="10.7936,106.7460,15">TP. HCM - Mai Chí Thọ & Cao Tốc</option>
+        <option value="10.8495,106.7725,15">TP. HCM - Xa Lộ Hà Nội</option>
+        <option value="16.0544,108.2022,15">Đà Nẵng - Cầu Rồng / QL1A</option>
+      </select>
+    </div>
+
+    <!-- Search Coordinates -->
+    <div class="coord-search">
+      <input type="text" id="coordInput" class="hud-input" placeholder="Tọa độ: 21.0285, 105.8542" onkeydown="if(event.key==='Enter') searchCoordinates()">
+      <button class="hud-btn primary" onclick="searchCoordinates()">Tìm</button>
+    </div>
+
+    <!-- Global Save as New Dataset Action Button -->
+    <div class="header-actions">
+      <button class="hud-btn save-glow" id="saveDatasetBtn" onclick="openSaveModal()">
+        💾 Lưu Thành Dữ Liệu Mới <span class="badge-count" id="dirtyChangesBadge">0</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Application Body -->
+  <div class="studio-workspace">
+    <!-- Left Sidebar: 3-Tier Layer Controller with Instant Toggles -->
+    <aside class="studio-sidebar">
+      
+      <!-- GROUP 1: LAYER BẢN ĐỒ NỀN -->
+      <div class="panel-section">
+        <div class="section-title">
+          <div class="title-left">
+            <span class="section-number">1</span>
+            <span>LAYER BẢN ĐỒ NỀN</span>
+          </div>
+          <label class="switch-toggle" title="Bật / Tắt hiển thị bản đồ nền">
+            <input type="checkbox" id="masterBasemapToggle" checked onchange="toggleMasterBasemap(this.checked)">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="panel-card" id="basemapCard">
+          <div class="basemap-radio-list">
+            <label class="basemap-option active" id="lbl_osm">
+              <input type="radio" name="basemap" value="osm" checked onchange="setBaseMap('osm')">
+              <div class="opt-content">
+                <span class="opt-name">🗺️ OpenStreetMap Standard</span>
+                <span class="opt-desc">Bản đồ chuẩn OSM, miễn phí 100%, không API key</span>
+              </div>
+            </label>
+            <label class="basemap-option" id="lbl_cyclosm">
+              <input type="radio" name="basemap" value="cyclosm" onchange="setBaseMap('cyclosm')">
+              <div class="opt-content">
+                <span class="opt-name">🚴 OSM CyclOSM (Đường sá rõ nét)</span>
+                <span class="opt-desc">Hiển thị rõ các làn đường và tên đường</span>
+              </div>
+            </label>
+            <label class="basemap-option" id="lbl_satellite">
+              <input type="radio" name="basemap" value="satellite" onchange="setBaseMap('satellite')">
+              <div class="opt-content">
+                <span class="opt-name">🛰️ Esri Satellite (Ảnh Vệ Tinh)</span>
+                <span class="opt-desc">Soi lề đường, dải phân cách, cột camera thực địa</span>
+              </div>
+            </label>
+            <label class="basemap-option" id="lbl_street">
+              <input type="radio" name="basemap" value="street" onchange="setBaseMap('street')">
+              <div class="opt-content">
+                <span class="opt-name">🛣️ Esri Street Map</span>
+                <span class="opt-desc">Bản đồ giao thông sáng rõ</span>
+              </div>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- GROUP 2: LAYER VECTOR TIM ĐƯỜNG -->
+      <div class="panel-section">
+        <div class="section-title">
+          <div class="title-left">
+            <span class="section-number">2</span>
+            <span>LAYER VECTOR TIM ĐƯỜNG</span>
+          </div>
+          <div class="title-right">
+            <button class="hud-btn-mini" onclick="openRoadModal()">⚙️ Đổi tệp</button>
+            <label class="switch-toggle" title="Bật / Tắt toàn bộ vector tim đường">
+              <input type="checkbox" id="masterRoadToggle" checked onchange="toggleMasterRoads(this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="panel-card" id="roadCard">
+          <div class="file-tag-box">
+            <span class="file-tag-lbl">Tệp:</span>
+            <span class="file-tag-name" id="dispRoadTiles">speedmap\tiles.bin</span>
+            <span class="layer-count right" id="countRoads">0 segs</span>
+          </div>
+
+          <div class="sub-filter-header-row">
+            <span>Bật/Tắt theo từng cấp đường:</span>
+            <div class="mini-btn-group">
+              <a href="javascript:void(0)" onclick="setAllRoadClasses(true)">Tất cả</a> |
+              <a href="javascript:void(0)" onclick="setAllRoadClasses(false)">Bỏ chọn</a>
+            </div>
+          </div>
+          <div class="road-class-list">
+            <label class="road-class-item">
+              <div class="rc-info">
+                <input type="checkbox" class="chk-rc" id="rc_0" checked onchange="toggleRoadClass(0, this.checked)">
+                <span class="rc-line gold"></span>
+                <span>Cao tốc (Motorway)</span>
+              </div>
+              <span class="class-count" id="count_rc_0">0</span>
+            </label>
+            <label class="road-class-item">
+              <div class="rc-info">
+                <input type="checkbox" class="chk-rc" id="rc_1" checked onchange="toggleRoadClass(1, this.checked)">
+                <span class="rc-line red"></span>
+                <span>Quốc lộ (Trunk / National)</span>
+              </div>
+              <span class="class-count" id="count_rc_1">0</span>
+            </label>
+            <label class="road-class-item">
+              <div class="rc-info">
+                <input type="checkbox" class="chk-rc" id="rc_2" checked onchange="toggleRoadClass(2, this.checked)">
+                <span class="rc-line cyan"></span>
+                <span>Tỉnh lộ (Primary)</span>
+              </div>
+              <span class="class-count" id="count_rc_2">0</span>
+            </label>
+            <label class="road-class-item">
+              <div class="rc-info">
+                <input type="checkbox" class="chk-rc" id="rc_3" checked onchange="toggleRoadClass(3, this.checked)">
+                <span class="rc-line blue"></span>
+                <span>Đường chính (Secondary)</span>
+              </div>
+              <span class="class-count" id="count_rc_3">0</span>
+            </label>
+            <label class="road-class-item">
+              <div class="rc-info">
+                <input type="checkbox" class="chk-rc" id="rc_4" checked onchange="toggleRoadClass(4, this.checked)">
+                <span class="rc-line indigo"></span>
+                <span>Đường phụ (Tertiary)</span>
+              </div>
+              <span class="class-count" id="count_rc_4">0</span>
+            </label>
+            <label class="road-class-item">
+              <div class="rc-info">
+                <input type="checkbox" class="chk-rc" id="rc_5" checked onchange="toggleRoadClass(5, this.checked)">
+                <span class="rc-line slate"></span>
+                <span>Đường đô thị / Dân sinh</span>
+              </div>
+              <span class="class-count" id="count_rc_5">0</span>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- GROUP 3: CÁC LAYER CẢNH BÁO GIAO THÔNG -->
+      <div class="panel-section">
+        <div class="section-title">
+          <div class="title-left">
+            <span class="section-number">3</span>
+            <span>CẢNH BÁO TỪNG LOẠI ĐỘC LẬP</span>
+          </div>
+          <div class="mini-btn-group">
+            <button class="hud-btn-mini" onclick="setAllAlerts(true)">Bật tất cả</button>
+            <button class="hud-btn-mini" onclick="setAllAlerts(false)">Tắt tất cả</button>
+          </div>
+        </div>
+        
+        <div class="panel-card source-config-card">
+          <div class="source-row">
+            <span class="s-label">📁 Tệp Camera:</span>
+            <span class="s-val" id="dispCamFile">cameras.csv</span>
+            <button class="hud-btn-mini" onclick="openCamModal()">Đổi</button>
+          </div>
+          <div class="source-row">
+            <span class="s-label">📁 Tệp Biển báo:</span>
+            <span class="s-val" id="dispSignFile">signs.bin</span>
+            <button class="hud-btn-mini" onclick="openSignModal()">Đổi</button>
+          </div>
+        </div>
+
+        <div class="alert-layers-list">
+          <div class="alert-layer-item">
+            <div class="alert-left">
+              <label class="switch-toggle mini">
+                <input type="checkbox" id="layer_traffic_light" checked onchange="toggleAlertLayer('traffic_light', this.checked)">
+                <span class="slider"></span>
+              </label>
+              <span class="alert-emoji">🚦</span>
+              <span class="layer-name">Đèn Giao Thông</span>
+            </div>
+            <span class="layer-count" id="count_traffic_light">0</span>
+          </div>
+
+          <div class="alert-layer-item">
+            <div class="alert-left">
+              <label class="switch-toggle mini">
+                <input type="checkbox" id="layer_red_light_cam" checked onchange="toggleAlertLayer('red_light_cam', this.checked)">
+                <span class="slider"></span>
+              </label>
+              <span class="alert-icon-badge cyan">📸</span>
+              <span class="layer-name">Camera Phạt Nguội / Đèn Đỏ</span>
+            </div>
+            <span class="layer-count" id="count_red_light_cam">0</span>
+          </div>
+
+          <div class="alert-layer-item">
+            <div class="alert-left">
+              <label class="switch-toggle mini">
+                <input type="checkbox" id="layer_speed_cam" checked onchange="toggleAlertLayer('speed_cam', this.checked)">
+                <span class="slider"></span>
+              </label>
+              <span class="alert-icon-badge amber">📷</span>
+              <span class="layer-name">Camera Bắn Tốc Độ</span>
+            </div>
+            <span class="layer-count" id="count_speed_cam">0</span>
+          </div>
+
+          <div class="alert-layer-item">
+            <div class="alert-left">
+              <label class="switch-toggle mini">
+                <input type="checkbox" id="layer_sign_speed" checked onchange="toggleAlertLayer('sign_speed', this.checked)">
+                <span class="slider"></span>
+              </label>
+              <span class="sign-chip-icon red-circle mini">60</span>
+              <span class="layer-name">Biển Giới Hạn Tốc Độ (P.127)</span>
+            </div>
+            <span class="layer-count" id="count_sign_speed">0</span>
+          </div>
+
+          <div class="alert-layer-item">
+            <div class="alert-left">
+              <label class="switch-toggle mini">
+                <input type="checkbox" id="layer_sign_r420" checked onchange="toggleAlertLayer('sign_r420', this.checked)">
+                <span class="slider"></span>
+              </label>
+              <span class="sign-chip-icon blue-box mini">R.420</span>
+              <span class="layer-name">Vào Khu Dân Cư (R.420)</span>
+            </div>
+            <span class="layer-count" id="count_sign_r420">0</span>
+          </div>
+
+          <div class="alert-layer-item">
+            <div class="alert-left">
+              <label class="switch-toggle mini">
+                <input type="checkbox" id="layer_sign_r421" checked onchange="toggleAlertLayer('sign_r421', this.checked)">
+                <span class="slider"></span>
+              </label>
+              <span class="sign-chip-icon blue-box slash mini">R.421</span>
+              <span class="layer-name">Hết Khu Dân Cư (R.421)</span>
+            </div>
+            <span class="layer-count" id="count_sign_r421">0</span>
+          </div>
+
+          <div class="alert-layer-item">
+            <div class="alert-left">
+              <label class="switch-toggle mini">
+                <input type="checkbox" id="layer_sign_overtake" checked onchange="toggleAlertLayer('sign_overtake', this.checked)">
+                <span class="slider"></span>
+              </label>
+              <span class="alert-emoji">🚫</span>
+              <span class="layer-name">Cấm Vượt / Hết Cấm</span>
+            </div>
+            <span class="layer-count" id="count_sign_overtake">0</span>
+          </div>
+
+          <div class="alert-layer-item">
+            <div class="alert-left">
+              <label class="switch-toggle mini">
+                <input type="checkbox" id="layer_toll" checked onchange="toggleAlertLayer('toll', this.checked)">
+                <span class="slider"></span>
+              </label>
+              <span class="alert-emoji">🎫</span>
+              <span class="layer-name">Trạm Thu Phí</span>
+            </div>
+            <span class="layer-count" id="count_toll">0</span>
+          </div>
+
+          <div class="alert-layer-item">
+            <div class="alert-left">
+              <label class="switch-toggle mini">
+                <input type="checkbox" id="layer_danger" checked onchange="toggleAlertLayer('danger', this.checked)">
+                <span class="slider"></span>
+              </label>
+              <span class="alert-emoji">⚠️</span>
+              <span class="layer-name">Cảnh Báo Khác</span>
+            </div>
+            <span class="layer-count" id="count_danger">0</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Map Viewport Container -->
+    <main class="studio-map-container">
+      <div id="map"></div>
+
+      <!-- Quick Interactive Actions on Map -->
+      <div class="map-quick-actions">
+        <button class="action-btn junction-tool-btn pulse-glow" id="junctionModeBtn" onclick="toggleJunctionMode()" title="Tự động cắm bộ đèn đỏ / camera cho tất cả các nhánh tại ngã 3, ngã 4">
+          🚦 Cắm Ngã 3/Ngã 4
+        </button>
+        <button class="action-btn add-btn" id="addAlertModeBtn" onclick="toggleAddAlertMode()" title="Bấm vào bản đồ để cắm điểm cảnh báo mới">
+          ➕ Thêm Cảnh Báo
+        </button>
+        <button class="action-btn" id="rulerBtn" onclick="toggleRuler()" title="Thước đo khoảng cách giữa 2 điểm">
+          📏 Thước Đo
+        </button>
+        <button class="action-btn" onclick="refreshCurrentView()" title="Tải lại dữ liệu góc nhìn này">
+          🔄 Làm mới
+        </button>
+      </div>
+
+      <!-- Quick Add Toolbar with Pre-selected Type -->
+      <div class="add-mode-toolbar" id="addModeToolbar">
+        <div class="add-toolbar-header">
+          <span>🎯 BƯỚC 1: BẤM CHỌN LOẠI CẢNH BÁO CẦN THÊM</span>
+          <button class="close-btn" onclick="toggleAddAlertMode()">✕</button>
+        </div>
+        <div class="add-type-pills">
+          <button class="add-type-pill active" data-type="traffic_light" onclick="selectNewAlertType('traffic_light', this)">
+            🚦 Đèn giao thông
+          </button>
+          <button class="add-type-pill" data-type="red_light_cam" onclick="selectNewAlertType('red_light_cam', this)">
+            📸 Cam phạt nguội
+          </button>
+          <button class="add-type-pill" data-type="speed_cam" onclick="selectNewAlertType('speed_cam', this)">
+            📷 Cam tốc độ
+          </button>
+          <button class="add-type-pill" data-type="sign_speed" onclick="selectNewAlertType('sign_speed', this)">
+            🔴 Biển tốc độ
+          </button>
+          <button class="add-type-pill" data-type="sign_r420" onclick="selectNewAlertType('sign_r420', this)">
+            🏙️ Khu dân cư (R.420)
+          </button>
+          <button class="add-type-pill" data-type="sign_overtake" onclick="selectNewAlertType('sign_overtake', this)">
+            🚫 Cấm vượt
+          </button>
+        </div>
+        <div class="add-toolbar-hint">
+          👉 BƯỚC 2: Nhấp chuột vào bất kỳ đoạn đường nào trên bản đồ để cắm điểm (Tự động kéo vào mép lề)
+        </div>
+      </div>
+
+      <!-- PRO HUD INSPECTOR & ULTRA-FAST VISUAL EDITOR -->
+      <div class="hud-inspector pro-inspector" id="hudInspector">
+        <div class="inspector-header">
+          <div class="header-type-badge">
+            <span class="badge-icon" id="inspBadgeIcon">🎯</span>
+            <span class="inspector-badge" id="inspTypeBadge">ĐIỂM CẢNH BÁO</span>
+          </div>
+          <div class="header-ctrl-group">
+            <span class="dataset-source-tag" id="inspDatasetTag">📁 signs.bin</span>
+            <button class="close-btn" onclick="closeInspector()">✕</button>
+          </div>
+        </div>
+
+        <div class="inspector-body-scroll">
+          <!-- 1. Real-time Distance & Road Matched Box -->
+          <!-- JUNCTION DETECTED BANNER -->
+          <div class="junction-detected-banner" id="junctionDetectedBanner" style="display:none;">
+            <div class="junc-banner-text">⚡ Phát hiện <b id="junctionBannerType">Ngã 4</b> tại đây!</div>
+            <button class="hud-btn mini primary pulse-glow" onclick="openJunctionModalForCurrentPoint()">
+              🚦 Cắm Toàn Ngã Tư
+            </button>
+          </div>
+
+          <!-- ROAD CLASS (HIERARCHY) EDITOR -->
+          <div class="road-class-edit-section">
+            <div class="sec-header-row">
+              <span class="sub-section-lbl">CẤP ĐỘ ĐƯỜNG (HIERARCHY):</span>
+              <span class="current-class-badge" id="dispRoadClassBadge">Cấp 3: Đường chính</span>
+            </div>
+            <div class="class-pill-grid">
+              <button class="class-pill" data-cls="0" onclick="selectNewRoadClass(0)">0: Cao tốc</button>
+              <button class="class-pill" data-cls="1" onclick="selectNewRoadClass(1)">1: Quốc lộ</button>
+              <button class="class-pill" data-cls="2" onclick="selectNewRoadClass(2)">2: Tỉnh lộ</button>
+              <button class="class-pill" data-cls="3" onclick="selectNewRoadClass(3)">3: Đ.Chính</button>
+              <button class="class-pill" data-cls="4" onclick="selectNewRoadClass(4)">4: Đ.Phụ</button>
+              <button class="class-pill" data-cls="5" onclick="selectNewRoadClass(5)">5: Đô thị/Nhánh</button>
+              <button class="class-pill" data-cls="6" onclick="selectNewRoadClass(6)">6: Nội bộ/Ngõ</button>
+            </div>
+            <div class="scope-select-row">
+              <label class="scope-radio-lbl">
+                <input type="radio" name="roadClassScope" value="single" checked> Chỉ đoạn này (#<span id="dispSegIdText">0</span>)
+              </label>
+              <label class="scope-radio-lbl">
+                <input type="radio" name="roadClassScope" value="named_road"> Toàn tuyến <b id="dispScopeRoadName">--</b>
+              </label>
+            </div>
+            <button class="hud-btn secondary full-width-btn mb-10" onclick="saveRoadClassChange()" title="Ghi trực tiếp cấp độ đường mới vào tiles.bin">
+              💾 CẬP NHẬT CẤP ĐỘ ĐƯỜNG (GHI tiles.bin)
+            </button>
+          </div>
+
+          <div class="road-matched-info">
+            <div class="road-name-line">
+              <span class="road-tag">TIM ĐƯỜNG:</span>
+              <span class="road-name-text" id="inspRoadName">--</span>
+            </div>
+            <div class="road-sub-details">
+              <span>Đoạn: <b id="inspSegId">#--</b></span>
+              <span>Cấp: <b id="inspRoadClass">--</b></span>
+              <span>Giới hạn: <b id="inspRoadLimit">--</b></span>
+            </div>
+          </div>
+
+          <div class="metric-hero-compact">
+            <div class="mhc-left">
+              <span class="mhc-lbl">Khoảng cách tim đường:</span>
+              <span class="mhc-val" id="inspDist">0.0</span> <span class="mhc-unit">m</span>
+            </div>
+            <span class="status-pill green" id="inspStatus">CHUẨN LỀ ĐƯỜNG</span>
+          </div>
+
+          <!-- 2. ONE-CLICK ROAD SNAP ASSISTANCE -->
+          <div class="snap-box">
+            <span class="sub-section-lbl">KÉO VỊ TRÍ TỰ ĐỘNG (AUTO-SNAP):</span>
+            <div class="snap-btn-row">
+              <button class="snap-btn" onclick="snapCurrentPoint('right')" title="Kéo ra mép lề đường bên phải (cách tim đường 3m)">
+                👉 Lề phải (3m)
+              </button>
+              <button class="snap-btn" onclick="snapCurrentPoint('left')" title="Kéo ra mép lề đường bên trái (cách tim đường 3m)">
+                👈 Lề trái (3m)
+              </button>
+              <button class="snap-btn" onclick="snapCurrentPoint('center')" title="Kéo khớp đúng tim đường">
+                🎯 Tim đường
+              </button>
+            </div>
+          </div>
+
+          <!-- 3. VISUAL CATEGORY SELECTOR CARDS -->
+          <div class="category-select-section">
+            <span class="sub-section-lbl">LOẠI CẢNH BÁO (BẤM ĐỔI TỨC THÌ):</span>
+            <div class="cat-cards-grid">
+              <div class="cat-card" data-cat="traffic_light" onclick="setEditCategory('traffic_light')">
+                <span class="cat-icon">🚦</span>
+                <span class="cat-name">Đèn giao thông</span>
+                <span class="cat-dest-hint">📁 signs.bin</span>
+              </div>
+              <div class="cat-card" data-cat="red_light_cam" onclick="setEditCategory('red_light_cam')">
+                <span class="cat-icon">📸</span>
+                <span class="cat-name">Cam phạt nguội đèn đỏ</span>
+                <span class="cat-dest-hint">📁 cameras.csv</span>
+              </div>
+              <div class="cat-card" data-cat="speed_cam" onclick="setEditCategory('speed_cam')">
+                <span class="cat-icon">📷</span>
+                <span class="cat-name">Cam bắn tốc độ</span>
+                <span class="cat-dest-hint">📁 cameras.csv</span>
+              </div>
+              <div class="cat-card" data-cat="sign_speed" onclick="setEditCategory('sign_speed')">
+                <span class="cat-icon red-circle-dot">60</span>
+                <span class="cat-name">Biển tốc độ</span>
+                <span class="cat-dest-hint">📁 signs.bin</span>
+              </div>
+              <div class="cat-card" data-cat="sign_r420" onclick="setEditCategory('sign_r420')">
+                <span class="cat-icon">🏙️</span>
+                <span class="cat-name">Vào KDC</span>
+                <span class="cat-dest-hint">📁 signs.bin</span>
+              </div>
+              <div class="cat-card" data-cat="sign_r421" onclick="setEditCategory('sign_r421')">
+                <span class="cat-icon">🏡</span>
+                <span class="cat-name">Hết KDC</span>
+                <span class="cat-dest-hint">📁 signs.bin</span>
+              </div>
+              <div class="cat-card" data-cat="sign_overtake" onclick="setEditCategory('sign_overtake')">
+                <span class="cat-icon">🚫</span>
+                <span class="cat-name">Cấm vượt</span>
+                <span class="cat-dest-hint">📁 signs.bin</span>
+              </div>
+              <div class="cat-card" data-cat="toll" onclick="setEditCategory('toll')">
+                <span class="cat-icon">🎫</span>
+                <span class="cat-name">Trạm thu phí</span>
+                <span class="cat-dest-hint">📁 signs.bin</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 4. QUICK SPEED LIMIT SELECTOR -->
+          <div class="speed-select-section" id="speedSection">
+            <div class="sec-header-row">
+              <span class="sub-section-lbl">TỐC ĐỘ GIỚI HẠN (KM/H):</span>
+              <input type="number" id="editSpeed" class="hud-input mini speed-custom-input" placeholder="60" oninput="onSpeedCustomInput(this.value)">
+            </div>
+            <div class="speed-pill-row">
+              <span class="speed-pill" onclick="setEditSpeed(40)">40</span>
+              <span class="speed-pill" onclick="setEditSpeed(50)">50</span>
+              <span class="speed-pill" onclick="setEditSpeed(60)">60</span>
+              <span class="speed-pill" onclick="setEditSpeed(70)">70</span>
+              <span class="speed-pill" onclick="setEditSpeed(80)">80</span>
+              <span class="speed-pill" onclick="setEditSpeed(90)">90</span>
+              <span class="speed-pill" onclick="setEditSpeed(100)">100</span>
+              <span class="speed-pill" onclick="setEditSpeed(120)">120</span>
+            </div>
+          </div>
+
+          <!-- 5. HEADING & ROTATION TOOLBAR -->
+          <div class="heading-select-section">
+            <div class="sec-header-row">
+              <span class="sub-section-lbl">HƯỚNG CAMERA / BIỂN BÁO:</span>
+              <div class="heading-disp-box">
+                <span class="heading-val" id="dispHeadingVal">0°</span>
+                <input type="hidden" id="editHeading" value="0">
+              </div>
+            </div>
+            <div class="heading-tools-row">
+              <button class="tool-btn" onclick="alignHeadingToRoad(0)" title="Căn góc xuôi theo hướng đường">
+                🧭 Xuôi đường
+              </button>
+              <button class="tool-btn" onclick="alignHeadingToRoad(180)" title="Xoay ngược lại 180 độ">
+                🔄 Ngược chiều (180°)
+              </button>
+              <button class="tool-btn mini" onclick="adjustHeading(-15)">↺ -15°</button>
+              <button class="tool-btn mini" onclick="adjustHeading(15)">↻ +15°</button>
+            </div>
+          </div>
+
+          <!-- 6. Coordinates & Notes -->
+          <div class="coords-notes-section">
+            <div class="form-group mb-6">
+              <label>Ghi chú / Mô tả:</label>
+              <input type="text" id="editDesc" class="hud-input mini full" placeholder="Ví dụ: Đèn đỏ ngã tư Trần Cung">
+            </div>
+            <div class="coords-display-compact">
+              <span>Toạ độ: <b id="dispCurrentCoords">0.000000, 0.000000</b></span>
+              <input type="hidden" id="editLat">
+              <input type="hidden" id="editLon">
+            </div>
+          </div>
+        </div>
+
+        <!-- Direct Action Buttons: Instant Save & Disk Write -->
+        <div class="inspector-footer-actions">
+          <button class="hud-btn primary save-action-btn pulse-glow" onclick="saveCurrentAlertChanges('overwrite_with_backup')" title="Ghi đè trực tiếp vào file cameras.csv đang mở trong VS Code (kèm sao lưu .bak an toàn)">
+            🚀 LƯU VÀO FILE GỐC (cameras.csv)
+          </button>
+          <button class="hud-btn secondary save-action-btn" onclick="saveCurrentAlertChanges('new_files')" title="Lưu thành bộ file riêng biệt trong thư mục speedmap">
+            💾 Lưu Tệp Mới
+          </button>
+          <button class="hud-btn danger" onclick="deleteCurrentAlert()" title="Xóa điểm này">
+            🗑️ Xóa
+          </button>
+        </div>
+      </div>
+
+      <!-- Top Overlay Stats Banner -->
+      <div class="map-stats-badge">
+        <span id="topStatAlerts">🚨 0 cảnh báo</span>
+        <span class="stat-divider">|</span>
+        <span id="topStatPerf">⚡ Turbo Engine: Active</span>
+      </div>
+
+      <!-- HUD Loading Spinner -->
+      <div class="hud-loader" id="hudLoader">
+        <div class="hud-spinner"></div>
+        <span>ĐANG TẢI DỮ LIỆU...</span>
+      </div>
+    </main>
+  </div>
+
+  <!-- MODAL: UNIFIED SAVE ALL AS NEW DATASET -->
+  <div class="modal-backdrop" id="saveModal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <span class="modal-title">💾 XUẤT & LƯU TẤT CẢ DỮ LIỆU CẢNH BÁO MỚI</span>
+        <button class="close-btn" onclick="closeSaveModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="save-intro-banner">
+          <p>Tất cả các điểm Camera, Đèn giao thông và Biển báo đã chỉnh sửa hoặc thêm mới sẽ được đóng gói thành các <b>tệp dữ liệu độc lập mới</b>. File gốc ban đầu được giữ an toàn 100%.</p>
+          <div class="changes-summary-pill" id="modalChangesCount">0 chỉnh sửa</div>
+        </div>
+
+        <!-- 1-Click Primary Action -->
+        <div class="unified-save-options">
+          <button class="hud-btn primary save-glow giant-btn" onclick="executeSaveAll('new_files')">
+            💾 XUẤT BỘ FILE MỚI (TỰ ĐỘNG LƯU CẢ CAMERA + BIỂN BÁO/ĐÈN ĐỎ)
+          </button>
+          <div class="save-desc-sub">Tự động tạo 2 tệp mới riêng biệt trong thư mục speedmap: <code>cameras_edited_*.csv</code> và <code>signs_edited_*.bin</code></div>
+
+          <div class="or-download-divider">
+            <span>HOẶC CẬP NHẬT TRỰC TIẾP FILE ĐANG DÙNG</span>
+          </div>
+
+          <button class="hud-btn secondary full-width-btn" onclick="executeSaveAll('overwrite_with_backup')">
+            🛡️ Ghi đè vào file đang dùng (Tự động tạo bản sao lưu .bak an toàn)
+          </button>
+
+          <div class="or-download-divider">
+            <span>TẢI TẬP TIN TRỰC TIẾP VỀ MÁY (BROWSER DOWNLOAD)</span>
+          </div>
+
+          <div class="download-btn-row">
+            <button class="hud-btn secondary full-btn" onclick="downloadDataset('cameras', 'csv')">
+              ⬇️ Tải cameras.csv
+            </button>
+            <button class="hud-btn secondary full-btn" onclick="downloadDataset('signs', 'bin')">
+              ⬇️ Tải signs.bin
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="hud-btn secondary" onclick="closeSaveModal()">Đóng</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: ĐỔI TỆP VECTOR TIM ĐƯỜNG -->
+  <div class="modal-backdrop" id="roadModal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <span class="modal-title">⚙️ CẤU HÌNH TỆP VECTOR TIM ĐƯỜNG</span>
+        <button class="close-btn" onclick="closeRoadModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group mb-8">
+          <label class="form-lbl">Tệp Tiles (tiles.bin):</label>
+          <input type="text" id="inputRoadTiles" class="hud-input full font-mono">
+        </div>
+        <div class="form-group mb-8">
+          <label class="form-lbl">Tệp Index (index.bin):</label>
+          <input type="text" id="inputRoadIndex" class="hud-input full font-mono">
+        </div>
+        <div class="form-group mb-8">
+          <label class="form-lbl">Tệp Names (names.bin):</label>
+          <input type="text" id="inputRoadNames" class="hud-input full font-mono">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="hud-btn secondary" onclick="closeRoadModal()">Hủy</button>
+        <button class="hud-btn primary" onclick="submitRoadFiles()">Áp Dụng</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: ĐỔI TỆP CAMERA -->
+  <div class="modal-backdrop" id="camModal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <span class="modal-title">📷 CẤU HÌNH TỆP DỮ LIỆU CAMERA</span>
+        <button class="close-btn" onclick="closeCamModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group mb-12">
+          <label class="form-lbl">Đường dẫn tệp Camera (.csv hoặc .bin):</label>
+          <input type="text" id="inputCamPath" class="hud-input full font-mono">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="hud-btn secondary" onclick="closeCamModal()">Hủy</button>
+        <button class="hud-btn primary" onclick="submitCamFile()">Tải Tệp</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: CẮM ĐÈN ĐỎ & CAMERA CHO TẤT CẢ CÁC TRỤC NGÃ 3 / NGÃ 4 -->
+  <div class="modal-backdrop" id="junctionModal">
+    <div class="modal-box junction-modal-box">
+      <div class="modal-header">
+        <span class="modal-title">🚦 CẮM BỘ ĐÈN ĐỎ & CAMERA CHO TẤT CẢ CÁC TRỤC NGÃ 3 / NGÃ 4</span>
+        <button class="close-btn" onclick="closeJunctionModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="junction-summary-banner">
+          <span class="junc-icon">📍</span>
+          <div>
+            <div class="junc-title" id="juncModalTitle">Giao lộ: 4 nhánh hội tụ</div>
+            <div class="junc-sub" id="juncModalSub">Toạ độ tâm ngã tư: 21.045964, 105.781096</div>
+          </div>
+        </div>
+
+        <div class="form-group mb-10">
+          <label class="form-lbl">CHỌN LOẠI CẦN CẮM CHO CÁC TRỤC ĐƯỜNG:</label>
+          <div class="junc-type-options">
+            <div class="junc-type-card active" id="juncTypeTL" onclick="selectJunctionTargetType('traffic_light')">
+              <span class="j-icon">🚦</span>
+              <span class="j-lbl">Đèn tín hiệu ngã 4</span>
+              <span class="j-dest">📁 signs.bin</span>
+            </div>
+            <div class="junc-type-card" id="juncTypeCam" onclick="selectJunctionTargetType('red_light_cam')">
+              <span class="j-icon">📸</span>
+              <span class="j-lbl">Cam phạt nguội vượt đèn</span>
+              <span class="j-dest">📁 cameras.csv</span>
+            </div>
+            <div class="junc-type-card" id="juncTypeBoth" onclick="selectJunctionTargetType('both')">
+              <span class="j-icon">🚦+📸</span>
+              <span class="j-lbl">Lắp cả Đèn + Cam</span>
+              <span class="j-dest">Cả 2 file</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-group mb-10">
+          <div class="sec-header-row">
+            <label class="form-lbl">Khoảng cách vạch dừng / đèn trước ngã tư:</label>
+            <span class="font-mono text-cyan font-bold" id="dispJuncDist">15 mét</span>
+          </div>
+          <input type="range" id="juncDistRange" class="hud-range" min="8" max="30" value="15" step="1" oninput="updateJunctionPreviewDist(this.value)">
+        </div>
+
+        <div class="form-group">
+          <label class="form-lbl">DANH SÁCH CÁC NHÁNH ĐƯỜNG TIẾP CẬN GIAO LỘ:</label>
+          <div class="junc-arms-list" id="juncArmsList">
+            <!-- Populated via JS -->
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="hud-btn secondary" onclick="closeJunctionModal()">Hủy</button>
+        <button class="hud-btn primary pulse-glow giant-action" onclick="executeBatchJunctionAlerts()">
+          🚀 TỰ ĐỘNG CẮM & GHI FILE TẤT CẢ CÁC NHÁNH
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: ĐỔI TỆP BIỂN BÁO -->
+  <div class="modal-backdrop" id="signModal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <span class="modal-title">🛑 CẤU HÌNH TỆP BIỂN BÁO</span>
+        <button class="close-btn" onclick="closeSignModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group mb-12">
+          <label class="form-lbl">Đường dẫn tệp Biển Báo (signs.bin):</label>
+          <input type="text" id="inputSignPath" class="hud-input full font-mono">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="hud-btn secondary" onclick="closeSignModal()">Hủy</button>
+        <button class="hud-btn primary" onclick="submitSignFile()">Tải Tệp</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Leaflet & App JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

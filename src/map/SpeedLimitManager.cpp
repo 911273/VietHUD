@@ -1137,6 +1137,34 @@ static bool findAheadLimitChange(const GnssSnapshot &gnss, float currentLimitKmh
     return findAheadLimitChangeStraight(gnss, currentLimitKmh, outDistM, outLimitKmh);
 }
 
+// Tunnel/underpass entrance ahead (2026-10-01). Read straight off the forward
+// route's segment flags (SEGFLAG_TUNNEL) — no sign point needed, and the route
+// already follows the road through bends/junctions. Reports the first place
+// within the dynamic warn distance where the route goes from a non-tunnel
+// segment into a tunnel one; nothing while the car is already inside, and
+// nothing past an unpassed fork (the tunnel may be on the other branch).
+// Route-only: there is no honest straight-line fallback for this.
+static bool findTunnelAhead(const GnssSnapshot &gnss, float &outDistM) {
+    if (gRouteCount <= 0 || !gCarOnRoute) return false;
+    float maxM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
+    bool prevTunnel = false;
+    for (int i = 0; i < gRoute.count(); i++) {
+        const RouteSeg &s = gRoute.seg(i);
+        bool t = (s.flags & SEGFLAG_TUNNEL) != 0;
+        if (s.startDistM + s.lenM <= gCarDistM) continue; // fully behind the car
+        if (s.startDistM <= gCarDistM) { prevTunnel = t; continue; } // the segment the car is on
+        float d = s.startDistM - gCarDistM;
+        if (d > maxM) return false;
+        if (t && !prevTunnel) {
+            if (routeBeyondUnpassedFork(s.startDistM)) return false;
+            outDistM = d;
+            return true;
+        }
+        prevTunnel = t;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------
 // Upcoming speed-camera warning (feature-requested 2026-09-21, "tai du lieu
 // ve canh bao giao thong, gom camera cung nhu gioi han toc do"). Scans the
@@ -1770,6 +1798,11 @@ static void speedLimitTaskFn(void *) {
             if (moving && (gnss.headingValid || routeUsable)) {
                 matchCameraAhead(gnss, out, out);
                 matchSignsAhead(gnss, out);
+                float tunnelDistM;
+                if (findTunnelAhead(gnss, tunnelDistM)) {
+                    out.tunnelAheadValid = true;
+                    out.tunnelAheadDistM = tunnelDistM;
+                }
             }
 
             // Fallback limit (user-requested 2026-09-24): when we have a real
@@ -1816,7 +1849,7 @@ static void speedLimitTaskFn(void *) {
             if (gnss.fix && gnss.egoSpeedKmh > kGnssMotionThresholdKmh && now - sLastWarnLogMs >= 1000) {
                 sLastWarnLogMs = now;
                 Serial.printf("[warn] lat=%.6f lon=%.6f road=%lu lim=%.0f(%s) cam=%s%.0fm/%.0f sign=%u@%.0fm limAhead=%s%.0f@%.0fm "
-                              "res=%d nov=%d toll=%d light=%d danger=%d\n",
+                              "res=%d nov=%d toll=%d light=%d danger=%d tunnel=%s%.0f\n",
                               (double)gnss.latDeg, (double)gnss.lonDeg, (unsigned long)out.roadId,
                               (double)out.speedLimitKmh, speedSourceStr(out.source), out.cameraAheadValid ? "" : "-",
                               (double)(out.cameraAheadValid ? out.cameraAheadDistanceM : 0),
@@ -1825,7 +1858,8 @@ static void speedLimitTaskFn(void *) {
                               (double)(out.aheadLimitValid ? out.aheadSpeedLimitKmh : 0),
                               (double)(out.aheadLimitValid ? out.aheadDistanceM : 0), out.residentAreaAheadValid,
                               out.noOvertakingAheadValid, out.tollBoothAheadValid, out.trafficLightAheadValid,
-                              out.dangerAheadValid);
+                              out.dangerAheadValid, out.tunnelAheadValid ? "" : "-",
+                              (double)(out.tunnelAheadValid ? out.tunnelAheadDistM : 0));
             }
             if (now - lastDebugMs > 3000) {
                 lastDebugMs = now;

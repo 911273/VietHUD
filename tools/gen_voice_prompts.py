@@ -9,6 +9,8 @@ utterance in one voice instead of two clips stitched together:
   speed_next/<N>.mp3    "Giới hạn tốc độ tiếp theo là N ki-lô-mét trên giờ"
   camera_limit/<N>.mp3  "Phía trước có camera giám sát tốc độ, giới hạn N ki-lô-mét trên giờ"
   camera_ahead.mp3      "Phía trước có camera giám sát tốc độ"
+  overspeed.mp3, resident_*.mp3, no_overtake_*.mp3, toll/light/danger/tunnel_ahead.mp3
+                        one-clip alert prompts (2026-10-01)
 
 Output format matches the device (audio/AudioPlayer.cpp: I2S at 16 kHz):
 MP3, 16 kHz, mono. Copy the output into /speedmap/sounds/vi/ on the SD card.
@@ -37,6 +39,18 @@ def prompts():
         yield f"speed_next/{v}.mp3", f"Giới hạn tốc độ tiếp theo là {v} {UNIT}."
         yield f"camera_limit/{v}.mp3", f"Phía trước có camera giám sát tốc độ, giới hạn {v} {UNIT}."
     yield "camera_ahead.mp3", "Phía trước có camera giám sát tốc độ."
+    # One-clip alert prompts (2026-10-01), same voice; the firmware switches to
+    # them when tunnel_ahead.mp3 is on the card (ui/Dashboard.cpp
+    # alertPromptsAvailable()), else keeps the old clips.
+    yield "overspeed.mp3", "Bạn đang chạy quá tốc độ, chú ý giảm tốc độ."
+    yield "resident_start.mp3", "Bắt đầu khu đông dân cư."
+    yield "resident_end.mp3", "Hết khu đông dân cư."
+    yield "no_overtake_start.mp3", "Phía trước có biển cấm vượt."
+    yield "no_overtake_end.mp3", "Hết đoạn cấm vượt."
+    yield "toll_ahead.mp3", "Phía trước có trạm thu phí."
+    yield "light_ahead.mp3", "Chú ý đèn tín hiệu giao thông phía trước."
+    yield "danger_ahead.mp3", "Phía trước có đoạn đường nguy hiểm, chú ý quan sát."
+    yield "tunnel_ahead.mp3", "Sắp đến hầm đường bộ, chú ý bật đèn và giảm tốc độ."
 
 
 async def synth(text, voice, dst):
