@@ -1,4 +1,5 @@
 #include "AudioPlayer.h"
+#include "map/SdCardManager.h" // sdMgrExists() — self-test picks the voice set on the card
 #include "core/AppConfig.h" // cfg.audioEnabled — master alert-audio toggle (Settings > Display)
 #include <Arduino.h>
 #include <driver/i2s.h>
@@ -241,6 +242,17 @@ void audioSelfTest() {
         "welcome/voice.mp3", "speedcamera.mp3", "slowdown/voice.mp3", "tocdogioihan.mp3",
         "batdaukhudancu.mp3", "hetkhudongdancu.mp3", "camvuot.mp3", "hetcamvuot.mp3",
         "tramthuphi.mp3", "chuydentinhieugiaothong.mp3", "sapdenbienbao.mp3", "speed/50.mp3"};
+    // The 2026-10-01 generated alert set (tools/gen_voice_prompts.py), played
+    // instead of the old one-clip prompts when the card has it — both lists
+    // together would overflow the 20-deep queue.
+    static const char *kGenerated[] = {
+        "welcome/voice.mp3", "camera_ahead.mp3", "overspeed.mp3", "speed_next/50.mp3",
+        "resident_start.mp3", "resident_end.mp3", "no_overtake_start.mp3", "no_overtake_end.mp3",
+        "toll_ahead.mp3", "light_ahead.mp3", "danger_ahead.mp3", "tunnel_ahead.mp3"};
+    if (sdMgrExists("/speedmap/sounds/vi/tunnel_ahead.mp3")) {
+        for (auto f : kGenerated) audioQueueVoice(f);
+        return;
+    }
     for (auto f : kAll) audioQueueVoice(f);
 }
 

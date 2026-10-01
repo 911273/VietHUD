@@ -149,6 +149,13 @@ struct RoadInfoSnapshot {
     bool dangerAheadValid = false;
     float dangerAheadDistM = -1;
 
+    // Tunnel / underpass entrance ahead on the forward route (added 2026-10-01).
+    // Comes from the road data itself (SEGFLAG_TUNNEL: OSM tunnel=* or
+    // layer<=-1), not from a sign point — distance to where the route first
+    // enters a tunnel segment. Not set while the car is already inside one.
+    bool tunnelAheadValid = false;
+    float tunnelAheadDistM = -1;
+
     // General upcoming sign hint
     uint8_t nextSignType = 0;
     float nextSignDistanceM = -1;

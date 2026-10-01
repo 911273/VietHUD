@@ -1414,6 +1414,24 @@ static bool newPromptsAvailable() {
     Serial.printf("[audio] full-sentence prompts %s\n", sState ? "found" : "not on card (using old prompts)");
     return sState == 1;
 }
+// Second generated set (2026-10-01): one-clip prompts for overspeed, resident
+// area, no-overtaking, toll, light, hazard and tunnel, same voice as the set
+// above (tools/gen_voice_prompts.py). tunnel_ahead.mp3 marks the set; same
+// check-once / recheck-a-minute rule as newPromptsAvailable().
+static bool alertPromptsAvailable() {
+    static int8_t sState = -1;
+    static uint32_t sCheckedMs = 0;
+    if (sState == 1) return true;
+    if (sState == 0 && millis() - sCheckedMs < 60000) return false;
+    sCheckedMs = millis();
+    sState = sdMgrExists("/speedmap/sounds/vi/tunnel_ahead.mp3") ? 1 : 0;
+    Serial.printf("[audio] alert prompts %s\n", sState ? "found" : "not on card (using old prompts)");
+    return sState == 1;
+}
+// Queues `generated` when the card has the 2026-10-01 set, else `legacy`.
+static void queueAlertVoice(const char *generated, const char *legacy) {
+    audioQueueVoice(alertPromptsAvailable() ? generated : legacy);
+}
 // "Giới hạn tốc độ tiếp theo là N km/h". false -> caller plays the old prompt.
 static bool queueNextLimitPrompt(float kmh) {
     int k = (int)lroundf(kmh);
@@ -1747,7 +1765,7 @@ void refreshDashboard() {
         if (cfg.audioOverspeed && (!lastSpeeding || (now - lastSpeedingAudioMs > 8000))) {
             lastSpeedingAudioMs = now;
             audioPlayOverspeedAlert();
-            audioQueueVoice("slowdown/voice.mp3");
+            queueAlertVoice("overspeed.mp3", "slowdown/voice.mp3");
         }
     }
     lastSpeeding = speeding;
@@ -1918,13 +1936,35 @@ void refreshDashboard() {
             // a matching voice asset in data/speedmap/sounds/vi/ — no fallback
             // fabricated for anything else; see AudioPlayer.h.
             switch (currentSignType) {
-                case 2: audioQueueVoice(road.residentAreaIsStart ? "batdaukhudancu.mp3" : "hetkhudongdancu.mp3"); break;
-                case 3: audioQueueVoice(road.noOvertakingIsStart ? "camvuot.mp3" : "hetcamvuot.mp3"); break;
-                case 5: audioQueueVoice("tramthuphi.mp3"); break;
-                case 6: audioQueueVoice("chuydentinhieugiaothong.mp3"); break;
-                case 10: audioQueueVoice("sapdenbienbao.mp3"); break; // generic "sắp đến biển báo" for a hazard zone
+                case 2:
+                    if (road.residentAreaIsStart) queueAlertVoice("resident_start.mp3", "batdaukhudancu.mp3");
+                    else queueAlertVoice("resident_end.mp3", "hetkhudongdancu.mp3");
+                    break;
+                case 3:
+                    if (road.noOvertakingIsStart) queueAlertVoice("no_overtake_start.mp3", "camvuot.mp3");
+                    else queueAlertVoice("no_overtake_end.mp3", "hetcamvuot.mp3");
+                    break;
+                case 5: queueAlertVoice("toll_ahead.mp3", "tramthuphi.mp3"); break;
+                case 6: queueAlertVoice("light_ahead.mp3", "chuydentinhieugiaothong.mp3"); break;
+                case 10: queueAlertVoice("danger_ahead.mp3", "sapdenbienbao.mp3"); break; // generic hazard zone
                 default: break;
             }
+        }
+    }
+
+    // Tunnel entrance ahead (2026-10-01) — from the route's SEGFLAG_TUNNEL, not
+    // a sign point, so it has its own edge detector. Uses the hazard toggle
+    // (cfg.audioDanger) rather than a new setting.
+    // 30 s cooldown: a route rebuild/fork flicker must not repeat the line.
+    static bool lastTunnelVisible = false;
+    static uint32_t lastTunnelAudioMs = 0;
+    if (road.tunnelAheadValid != lastTunnelVisible) {
+        lastTunnelVisible = road.tunnelAheadValid;
+        if (road.tunnelAheadValid && cfg.audioDanger &&
+            (lastTunnelAudioMs == 0 || millis() - lastTunnelAudioMs > 30000)) {
+            lastTunnelAudioMs = millis();
+            audioPlaySignNotice();
+            queueAlertVoice("tunnel_ahead.mp3", "sapdencuaham.mp3");
         }
     }
 
@@ -1939,7 +1979,7 @@ void refreshDashboard() {
         // because camera used to win by type. Ties keep the old order via
         // strict-less-than comparisons below (camera, then limit-change, then
         // resident/no-overtake/toll/light).
-        enum { W_NONE, W_CAMERA, W_AHEAD_LIMIT, W_RESIDENT, W_NO_OVERTAKE, W_TOLL, W_LIGHT, W_DANGER };
+        enum { W_NONE, W_CAMERA, W_AHEAD_LIMIT, W_RESIDENT, W_NO_OVERTAKE, W_TOLL, W_LIGHT, W_DANGER, W_TUNNEL };
         int winner = W_NONE;
         float winnerDist = 1e9f;
         if (road.cameraAheadValid && road.cameraAheadDistanceM < winnerDist) {
@@ -1962,6 +2002,9 @@ void refreshDashboard() {
         }
         if (road.dangerAheadValid && road.dangerAheadDistM < winnerDist) {
             winner = W_DANGER; winnerDist = road.dangerAheadDistM;
+        }
+        if (road.tunnelAheadValid && road.tunnelAheadDistM < winnerDist) {
+            winner = W_TUNNEL; winnerDist = road.tunnelAheadDistM; // same warning-icon card as W_DANGER
         }
 
         if (winner == W_CAMERA) {
@@ -2123,7 +2166,7 @@ void refreshDashboard() {
             lv_obj_set_style_bg_color(alertProgressBar, pColor, LV_PART_INDICATOR);
             lv_obj_set_style_border_color(trafficCard, pColor, 0);
 
-        } else if (winner == W_DANGER) {
+        } else if (winner == W_DANGER || winner == W_TUNNEL) {
             // Hazard / danger zone (đoạn đường nguy hiểm / hầm / trạm dừng) -> warning icon + distance
             lv_obj_clear_flag(trafficCard, LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(alertIconImg, LV_OBJ_FLAG_HIDDEN);
@@ -2132,16 +2175,16 @@ void refreshDashboard() {
             lv_obj_add_flag(alertMiniSpeedSign, LV_OBJ_FLAG_HIDDEN);
 
             char dBuf[16];
-            snprintf(dBuf, sizeof(dBuf), "%.0f m", (double)road.dangerAheadDistM);
+            snprintf(dBuf, sizeof(dBuf), "%.0f m", (double)winnerDist);
             lv_label_set_text(alertDistLabel, dBuf);
 
             float maxWarnM = computeDynamicWarnDistance(gnss.egoSpeedKmh);
-            int prog = (int)((maxWarnM - road.dangerAheadDistM) * 100.0f / maxWarnM);
+            int prog = (int)((maxWarnM - winnerDist) * 100.0f / maxWarnM);
             if (prog < 0) prog = 0;
             if (prog > 100) prog = 100;
             lv_bar_set_range(alertProgressBar, 0, 100);
             lv_bar_set_value(alertProgressBar, prog, LV_ANIM_OFF);
-            lv_color_t pColor = (road.dangerAheadDistM < 120.0f) ? lv_color_hex(0xFF3B30) : lv_color_hex(0xFFB300);
+            lv_color_t pColor = (winnerDist < 120.0f) ? lv_color_hex(0xFF3B30) : lv_color_hex(0xFFB300);
             lv_obj_set_style_bg_color(alertProgressBar, pColor, LV_PART_INDICATOR);
             lv_obj_set_style_border_color(trafficCard, pColor, 0);
 
