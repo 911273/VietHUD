@@ -1,4 +1,4 @@
-#include "NvsStore.h"
+﻿#include "NvsStore.h"
 #include <Preferences.h>
 #include <string.h> // strncpy() — see loadConfigFromNVS()'s wifiSsid/wifiPassword copy
 #include <stdio.h>  // snprintf() — per-slot NVS keys for the saved-network list
@@ -84,6 +84,13 @@ void loadConfigFromNVS(AppConfig &cfg) {
     cfg.showVehicleTrail = prefs.getBool("showTrail", cfg.showVehicleTrail);
     cfg.mapHeadingUp = prefs.getBool("mapHeadUp", cfg.mapHeadingUp);
     cfg.defaultLimitKmh = prefs.getFloat("defLimitKmh", cfg.defaultLimitKmh);
+    cfg.mapSourceIndex = prefs.getFloat("mapSrcIdx", cfg.mapSourceIndex);
+    String msrc = prefs.getString("mapSrc", cfg.mapSource);
+    strncpy(cfg.mapSource, msrc.c_str(), sizeof(cfg.mapSource) - 1);
+    cfg.mapSource[sizeof(cfg.mapSource) - 1] = 0;
+    cfg.voicePack = prefs.getFloat("voicePack", cfg.voicePack);
+    cfg.touchOffsetX = prefs.getFloat("touchOffX", cfg.touchOffsetX);
+    cfg.touchOffsetY = prefs.getFloat("touchOffY", cfg.touchOffsetY);
 
     // One-time config migration (2026-09-25). Older builds shipped a 90 km/h
     // fallback and persisted it, so devices carry a stale defLimitKmh=90 in NVS
@@ -91,7 +98,7 @@ void loadConfigFromNVS(AppConfig &cfg) {
     // when a road's limit is unknown (VN urban baseline). Reset it to the code
     // default exactly ONCE (guarded by a schema-version key) so a later manual
     // change the user makes is still respected and never re-clobbered.
-    const uint32_t kCfgSchemaVer = 4;
+    const uint32_t kCfgSchemaVer = 5;
     uint32_t cfgVer = prefs.getUInt("cfgVer", 0);
     if (cfgVer < 2) {
         cfg.defaultLimitKmh = 50.0f;
@@ -115,6 +122,30 @@ void loadConfigFromNVS(AppConfig &cfg) {
     if (cfgVer < 4 && cfg.wifiAutoOffMin < 1.0f) {
         cfg.wifiAutoOffMin = 10.0f;
         prefs.putFloat("wifiAutoOff", cfg.wifiAutoOffMin);
+    }
+    // Schema 5: Default STA network set to "iPhoen của Pham" / "12345678@".
+    // Also protect and restore audioVolume and audioEnabled if corrupted/muted.
+    if (cfgVer < 5) {
+        if (cfg.staSsid[0] == '\0' || strcmp(cfg.staSsid, "VietHUD") == 0) {
+            strncpy(cfg.staSsid, "iPhoen của Pham", sizeof(cfg.staSsid) - 1);
+            strncpy(cfg.staPassword, "12345678@", sizeof(cfg.staPassword) - 1);
+            prefs.putString("staSsid", cfg.staSsid);
+            prefs.putString("staPass", cfg.staPassword);
+        }
+        if (cfg.savedNetworkCount <= 0) {
+            strncpy(cfg.savedNetworks[0].ssid, "iPhoen của Pham", sizeof(cfg.savedNetworks[0].ssid) - 1);
+            strncpy(cfg.savedNetworks[0].password, "12345678@", sizeof(cfg.savedNetworks[0].password) - 1);
+            cfg.savedNetworkCount = 1;
+            prefs.putInt("netCount", 1);
+            prefs.putString("netS0", cfg.savedNetworks[0].ssid);
+            prefs.putString("netP0", cfg.savedNetworks[0].password);
+        }
+        if (cfg.audioVolume < 20.0f) {
+            cfg.audioVolume = 80.0f;
+            prefs.putFloat("audioVol", cfg.audioVolume);
+        }
+        cfg.audioEnabled = true;
+        prefs.putBool("audioEn", true);
     }
     if (cfgVer < kCfgSchemaVer) prefs.putUInt("cfgVer", kCfgSchemaVer);
     prefs.end();
@@ -164,5 +195,10 @@ void saveConfigToNVS(const AppConfig &cfg) {
     prefs.putBool("showTrail", cfg.showVehicleTrail);
     prefs.putBool("mapHeadUp", cfg.mapHeadingUp);
     prefs.putFloat("defLimitKmh", cfg.defaultLimitKmh);
+    prefs.putFloat("mapSrcIdx", cfg.mapSourceIndex);
+    prefs.putString("mapSrc", cfg.mapSource);
+    prefs.putFloat("voicePack", cfg.voicePack);
+    prefs.putFloat("touchOffX", cfg.touchOffsetX);
+    prefs.putFloat("touchOffY", cfg.touchOffsetY);
     prefs.end();
 }

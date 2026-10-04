@@ -9,6 +9,8 @@
 #include "net/DataUpdater.h"  // dataUpdateStart()/GetStatus() — WiFi tab "Update data" button
 #include "net/UpdateApi.h"    // updateApiBusy() — a phone is pushing data right now
 #include "update/DataInstaller.h" // installerProgress() — phone->device transfer progress
+#include "audio/AudioPlayer.h"
+#include "map/SdCardManager.h" 
 #include <string.h>
 
 // ---------------------------------------------------------------------
@@ -28,7 +30,7 @@ struct SliderBinding {
 // against (was 32 wide for that reason — see git history). Checked by
 // counting addSliderRow() call sites directly rather than trusting an old
 // comment.
-static SliderBinding sliderBindings[12]; // bumped from 8 (2026-09-24): 9 slider rows now (added Overspeed offset + Default limit)
+static SliderBinding sliderBindings[16]; // bumped from 8 (2026-09-24): 9 slider rows now (added Overspeed offset + Default limit)
 static int sliderCount = 0;
 
 struct SwitchBinding {
@@ -100,6 +102,7 @@ static void onSliderChanged(lv_event_t *e) {
     // active then) — say so immediately rather than let the slider silently
     // do nothing, which is what every OTHER slider here does instead.
     if (b->target == &cfg.brightnessMode) applyConfig(); // Auto/Manual backlight applies live
+    if (b->target == &cfg.touchOffsetX || b->target == &cfg.touchOffsetY) saveConfigToNVS(cfg);
     if (b->target == &cfg.screenRotation) {
         saveConfigToNVS(cfg);
         lv_label_set_text(settingsStatusLabel, "Rotation saved. Restart to apply.");
@@ -623,6 +626,58 @@ static void onChoiceBtnClicked(lv_event_t *e) {
     }
 }
 
+static void addDropdownRow(lv_obj_t *parent, int &y, const char *name, const char *options, uint32_t selected,
+                           lv_event_cb_t event_cb, void *user_data) {
+    lv_obj_t *nameLbl = lv_label_create(parent);
+    lv_label_set_text(nameLbl, name);
+    lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
+    lv_obj_set_pos(nameLbl, 4, y);
+    y += 18;
+
+    int parentW = lv_obj_get_content_width(parent) - 8;
+    lv_obj_t *dd = lv_dropdown_create(parent);
+    lv_dropdown_set_options(dd, options);
+    lv_dropdown_set_selected(dd, selected);
+    lv_obj_set_width(dd, parentW > 280 ? 280 : parentW);
+    lv_obj_set_pos(dd, 4, y);
+    lv_obj_set_style_bg_color(dd, lv_color_hex(0x1B222A), 0);
+    lv_obj_set_style_text_color(dd, lv_color_white(), 0);
+    lv_obj_set_style_border_color(dd, lv_color_hex(0x3A4A5C), 0);
+    lv_obj_add_event_cb(dd, event_cb, LV_EVENT_VALUE_CHANGED, user_data);
+    y += 38;
+}
+
+static void onMapSourceDropdownChanged(lv_event_t *e) {
+    lv_obj_t *dd = (lv_obj_t *)lv_event_get_target(e);
+    uint32_t sel = lv_dropdown_get_selected(dd);
+    cfg.mapSourceIndex = (float)sel;
+    if (sel == 0) {
+        strncpy(cfg.mapSource, "/speedmap_gofa", sizeof(cfg.mapSource) - 1);
+    } else if (sel == 1) {
+        strncpy(cfg.mapSource, "/speedmap_wyn", sizeof(cfg.mapSource) - 1);
+    } else {
+        strncpy(cfg.mapSource, "/speedmap", sizeof(cfg.mapSource) - 1);
+    }
+    cfg.mapSource[sizeof(cfg.mapSource) - 1] = 0;
+    saveConfigToNVS(cfg);
+    Serial.printf("[ui] Map source set to: %s (idx %u)\n", cfg.mapSource, (unsigned)sel);
+    lv_label_set_text(settingsStatusLabel, "Map source changed. Restart to apply.");
+    if (restartConfirmOverlay) {
+        lv_obj_clear_flag(restartConfirmOverlay, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void onVoicePackDropdownChanged(lv_event_t *e) {
+    lv_obj_t *dd = (lv_obj_t *)lv_event_get_target(e);
+    uint32_t sel = lv_dropdown_get_selected(dd);
+    cfg.voicePack = (float)sel;
+    saveConfigToNVS(cfg);
+    audioSetVoicePack(sel);
+    audioPreviewVoice(sel);
+    Serial.printf("[ui] Voice pack selected: %u\n", (unsigned)sel);
+    lv_label_set_text(settingsStatusLabel, "Voice pack changed.");
+}
+
 static void addChoiceRow(lv_obj_t *parent, int &y, const char *name, float *target, const char *const *labels,
                           int count) {
     lv_obj_t *nameLbl = lv_label_create(parent);
@@ -901,6 +956,185 @@ static void closeRestartConfirm(lv_event_t *) { lv_obj_add_flag(restartConfirmOv
 static void onConfirmRestartYes(lv_event_t *) { ESP.restart(); }
 static void onRestartBtnClicked(lv_event_t *) { lv_obj_clear_flag(restartConfirmOverlay, LV_OBJ_FLAG_HIDDEN); }
 
+// Refresh all sliders and labels when config values change (Defaults, Touch Calib, Reset)
+static void refreshAllSliders() {
+    for (int i = 0; i < sliderCount; i++) {
+        SliderBinding &b = sliderBindings[i];
+        lv_slider_set_value(b.slider, (int32_t)((*b.target) * b.divisor), LV_ANIM_OFF);
+        char buf[24];
+        fmtSettingVal(buf, sizeof(buf), *b.target, b.unit);
+        lv_label_set_text(b.valLabel, buf);
+    }
+}
+
+// Interactive 4-point Touch Calibration Overlay
+static lv_obj_t *touchCalibOverlay = nullptr;
+static lv_obj_t *calibTargetObj = nullptr;
+static lv_obj_t *calibPromptLbl = nullptr;
+static lv_obj_t *calibSubLbl = nullptr;
+static lv_obj_t *calibCancelBtn = nullptr;
+static int s_calibStep = -1;
+static lv_point_t s_calibTargets[4];
+static int16_t s_calibErrX[4];
+static int16_t s_calibErrY[4];
+
+static void updateCalibTargetDisplay() {
+    if (s_calibStep < 0 || s_calibStep >= 4) return;
+    int tx = s_calibTargets[s_calibStep].x;
+    int ty = s_calibTargets[s_calibStep].y;
+    lv_obj_set_pos(calibTargetObj, tx - 20, ty - 20);
+    lv_obj_clear_flag(calibTargetObj, LV_OBJ_FLAG_HIDDEN);
+
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Chạm chính xác vào tâm điểm %d/4", s_calibStep + 1);
+    lv_label_set_text(calibPromptLbl, buf);
+
+    char coordBuf[48];
+    snprintf(coordBuf, sizeof(coordBuf), "Tọa độ mục tiêu: (%d, %d)", tx, ty);
+    lv_label_set_text(calibSubLbl, coordBuf);
+}
+
+static void onCalibCloseTimer(lv_timer_t *t) {
+    if (touchCalibOverlay) lv_obj_add_flag(touchCalibOverlay, LV_OBJ_FLAG_HIDDEN);
+    s_calibStep = -1;
+    lv_timer_del(t);
+}
+
+static void onCalibCancelClicked(lv_event_t *) {
+    s_calibStep = -1;
+    if (touchCalibOverlay) lv_obj_add_flag(touchCalibOverlay, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(settingsStatusLabel, "Touch calib canceled");
+}
+
+static void onCalibOverlayClicked(lv_event_t *e) {
+    if (s_calibStep < 0 || s_calibStep >= 4) return;
+    lv_obj_t *target = lv_event_get_target_obj(e);
+    if (target == calibCancelBtn) return;
+
+    lv_indev_t *indev = lv_event_get_indev(e);
+    if (!indev) indev = lv_indev_get_act();
+    lv_point_t p = {0, 0};
+    if (indev) lv_indev_get_point(indev, &p);
+
+    s_calibErrX[s_calibStep] = (int16_t)(s_calibTargets[s_calibStep].x - p.x);
+    s_calibErrY[s_calibStep] = (int16_t)(s_calibTargets[s_calibStep].y - p.y);
+    Serial.printf("[touch] Calib pt %d: target=(%d,%d) tap=(%d,%d) err=(%d,%d)\n",
+                  s_calibStep + 1, (int)s_calibTargets[s_calibStep].x, (int)s_calibTargets[s_calibStep].y,
+                  (int)p.x, (int)p.y, (int)s_calibErrX[s_calibStep], (int)s_calibErrY[s_calibStep]);
+
+    s_calibStep++;
+    if (s_calibStep < 4) {
+        updateCalibTargetDisplay();
+    } else {
+        float avgDx = (float)(s_calibErrX[0] + s_calibErrX[1] + s_calibErrX[2] + s_calibErrX[3]) / 4.0f;
+        float avgDy = (float)(s_calibErrY[0] + s_calibErrY[1] + s_calibErrY[2] + s_calibErrY[3]) / 4.0f;
+        cfg.touchOffsetX += avgDx;
+        cfg.touchOffsetY += avgDy;
+        clampConfig(cfg);
+        saveConfigToNVS(cfg);
+        refreshAllSliders();
+
+        lv_obj_add_flag(calibTargetObj, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(calibCancelBtn, LV_OBJ_FLAG_HIDDEN);
+
+        lv_label_set_text(calibPromptLbl, "HIỆU CHUẨN THÀNH CÔNG!");
+        char resBuf[64];
+        snprintf(resBuf, sizeof(resBuf), "Độ lệch mới: X=%.0f px, Y=%.0f px", (double)cfg.touchOffsetX, (double)cfg.touchOffsetY);
+        lv_label_set_text(calibSubLbl, resBuf);
+
+        char stBuf[48];
+        snprintf(stBuf, sizeof(stBuf), "Touch: X=%.0f, Y=%.0f", (double)cfg.touchOffsetX, (double)cfg.touchOffsetY);
+        lv_label_set_text(settingsStatusLabel, stBuf);
+
+        lv_timer_create(onCalibCloseTimer, 1400, NULL);
+    }
+}
+
+static void onTouchCalibStartClicked(lv_event_t *) {
+    if (!touchCalibOverlay) return;
+    int scrW = gfx ? gfx->width() : 480;
+    int scrH = gfx ? gfx->height() : 320;
+    int mx = 45;
+    int my = 45;
+    s_calibTargets[0] = {(int32_t)mx, (int32_t)my};
+    s_calibTargets[1] = {(int32_t)(scrW - mx), (int32_t)my};
+    s_calibTargets[2] = {(int32_t)(scrW - mx), (int32_t)(scrH - my)};
+    s_calibTargets[3] = {(int32_t)mx, (int32_t)(scrH - my)};
+
+    s_calibStep = 0;
+    lv_obj_clear_flag(calibCancelBtn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(touchCalibOverlay, LV_OBJ_FLAG_HIDDEN);
+    updateCalibTargetDisplay();
+}
+
+static void onTouchResetClicked(lv_event_t *) {
+    cfg.touchOffsetX = 0.0f;
+    cfg.touchOffsetY = 0.0f;
+    clampConfig(cfg);
+    saveConfigToNVS(cfg);
+    refreshAllSliders();
+    lv_label_set_text(settingsStatusLabel, "Touch offset reset to 0");
+}
+
+static void buildTouchCalibOverlay(lv_obj_t *parent) {
+    int scrW = gfx ? gfx->width() : 480;
+    int scrH = gfx ? gfx->height() : 320;
+
+    touchCalibOverlay = lv_obj_create(parent);
+    lv_obj_set_pos(touchCalibOverlay, 0, 0);
+    lv_obj_set_size(touchCalibOverlay, scrW, scrH);
+    lv_obj_set_style_bg_color(touchCalibOverlay, lv_color_hex(0x0C1017), 0);
+    lv_obj_set_style_bg_opa(touchCalibOverlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(touchCalibOverlay, 0, 0);
+    lv_obj_set_style_radius(touchCalibOverlay, 0, 0);
+    lv_obj_clear_flag(touchCalibOverlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(touchCalibOverlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(touchCalibOverlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(touchCalibOverlay, onCalibOverlayClicked, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *title = lv_label_create(touchCalibOverlay);
+    lv_label_set_text(title, "HIỆU CHUẨN CẢM ỨNG (4 ĐIỂM)");
+    lv_obj_set_style_text_color(title, lv_color_hex(0x00D2FF), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
+
+    calibPromptLbl = lv_label_create(touchCalibOverlay);
+    lv_label_set_text(calibPromptLbl, "Chạm chính xác vào tâm điểm 1/4");
+    lv_obj_set_style_text_color(calibPromptLbl, lv_color_white(), 0);
+    lv_obj_align(calibPromptLbl, LV_ALIGN_CENTER, 0, -18);
+
+    calibSubLbl = lv_label_create(touchCalibOverlay);
+    lv_label_set_text(calibSubLbl, "Dùng bút cảm ứng hoặc đầu ngón tay chạm chuẩn tâm");
+    lv_obj_set_style_text_color(calibSubLbl, lv_color_hex(0x7C8A9A), 0);
+    lv_obj_align(calibSubLbl, LV_ALIGN_CENTER, 0, 14);
+
+    calibTargetObj = lv_obj_create(touchCalibOverlay);
+    lv_obj_set_size(calibTargetObj, 40, 40);
+    lv_obj_set_style_bg_color(calibTargetObj, lv_color_hex(0xFF3B30), 0);
+    lv_obj_set_style_bg_opa(calibTargetObj, LV_OPA_30, 0);
+    lv_obj_set_style_border_color(calibTargetObj, lv_color_hex(0xFF3B30), 0);
+    lv_obj_set_style_border_width(calibTargetObj, 2, 0);
+    lv_obj_set_style_radius(calibTargetObj, LV_RADIUS_CIRCLE, 0);
+    lv_obj_clear_flag(calibTargetObj, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dot = lv_obj_create(calibTargetObj);
+    lv_obj_set_size(dot, 6, 6);
+    lv_obj_center(dot);
+    lv_obj_set_style_bg_color(dot, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(dot, 0, 0);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+
+    calibCancelBtn = lv_button_create(touchCalibOverlay);
+    lv_obj_set_size(calibCancelBtn, 100, 32);
+    lv_obj_align(calibCancelBtn, LV_ALIGN_BOTTOM_MID, 0, -16);
+    lv_obj_set_style_bg_color(calibCancelBtn, lv_color_hex(0x3B4654), 0);
+    lv_obj_add_event_cb(calibCancelBtn, onCalibCancelClicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cbl = lv_label_create(calibCancelBtn);
+    lv_label_set_text(cbl, "Hủy");
+    lv_obj_center(cbl);
+}
+
 static void buildRestartConfirmOverlay(lv_obj_t *parent) {
     restartConfirmOverlay = lv_obj_create(parent);
     lv_obj_set_pos(restartConfirmOverlay, 0, 0);
@@ -1110,6 +1344,17 @@ void buildSettingsScreen() {
     lv_label_set_text(backLbl, "< Back");
     lv_obj_center(backLbl);
 
+    // Quick touch calibration button in header (always visible)
+    lv_obj_t *calibHeaderBtn = lv_button_create(header);
+    lv_obj_set_size(calibHeaderBtn, 95, 20);
+    lv_obj_align(calibHeaderBtn, LV_ALIGN_RIGHT_MID, -76, 0);
+    lv_obj_set_style_bg_color(calibHeaderBtn, lv_color_hex(0x1976D2), 0);
+    lv_obj_set_ext_click_area(calibHeaderBtn, 15);
+    lv_obj_add_event_cb(calibHeaderBtn, onTouchCalibStartClicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *calibHdrLbl = lv_label_create(calibHeaderBtn);
+    lv_label_set_text(calibHdrLbl, "Calib Touch");
+    lv_obj_center(calibHdrLbl);
+
     // Left nav rail
     lv_obj_t *navRail = lv_obj_create(settingsScreen);
     lv_obj_set_pos(navRail, 0, BODY_TOP);
@@ -1220,6 +1465,40 @@ void buildSettingsScreen() {
     static const char *kRotationLabels[4] = {"0", "90", "180", "270"};
     addChoiceRow(categoryPanels[0], y, "Rotation", &cfg.screenRotation, kRotationLabels, 4);
 
+    // Touch calibration section (2026-10-01)
+    {
+        lv_obj_t *th = lv_label_create(categoryPanels[0]);
+        lv_label_set_text(th, "Touch Calibration (Hieu chuan cam ung)");
+        lv_obj_set_style_text_color(th, lv_color_hex(0x00D2FF), 0);
+        lv_obj_set_pos(th, 4, y + 6);
+        y += 24;
+    }
+    {
+        lv_obj_t *calibBtn = lv_button_create(categoryPanels[0]);
+        lv_obj_set_size(calibBtn, 140, 28);
+        lv_obj_set_pos(calibBtn, 4, y + 2);
+        lv_obj_set_style_bg_color(calibBtn, lv_color_hex(0x1976D2), 0);
+        lv_obj_set_ext_click_area(calibBtn, 8);
+        lv_obj_add_event_cb(calibBtn, onTouchCalibStartClicked, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *calibLbl = lv_label_create(calibBtn);
+        lv_label_set_text(calibLbl, "Calibrate 4-pt");
+        lv_obj_center(calibLbl);
+
+        lv_obj_t *resetBtn = lv_button_create(categoryPanels[0]);
+        lv_obj_set_size(resetBtn, 110, 28);
+        lv_obj_set_pos(resetBtn, 150, y + 2);
+        lv_obj_set_style_bg_color(resetBtn, lv_color_hex(0x44505C), 0);
+        lv_obj_set_ext_click_area(resetBtn, 8);
+        lv_obj_add_event_cb(resetBtn, onTouchResetClicked, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *resetLbl = lv_label_create(resetBtn);
+        lv_label_set_text(resetLbl, "Reset Offset");
+        lv_obj_center(resetLbl);
+
+        y += 34;
+    }
+    addSliderRow(categoryPanels[0], y, "Touch X Offset", &cfg.touchOffsetX, -40, 40, 1.0f, " px");
+    addSliderRow(categoryPanels[0], y, "Touch Y Offset", &cfg.touchOffsetY, -40, 40, 1.0f, " px");
+
     // Audio tab (categoryPanels[4], 2026-09-26): master switch + volume, then
     // which alert types speak. Holding the Dashboard ~2.5 s flips the master.
     {
@@ -1227,6 +1506,13 @@ void buildSettingsScreen() {
         int ya = 4;
         addSwitchRow(ap, ya, "Alert sound", &cfg.audioEnabled);
         addSliderRow(ap, ya, "Volume", &cfg.audioVolume, 0, 100, 1.0f, " %");
+
+        static const char *kVoicePackOptions =
+            "Nam Bac (GOFA)\nNu Bac (GOFA)\nNam Nam (GOFA)\nNu Nam (GOFA)\nNam Trung (GOFA)\nNu Trung (GOFA)\nWYN / Mac dinh";
+        uint32_t vSel = (uint32_t)cfg.voicePack;
+        if (vSel > 6) vSel = 0;
+        addDropdownRow(ap, ya, "Voice Pack", kVoicePackOptions, vSel, onVoicePackDropdownChanged, nullptr);
+
         lv_obj_t *hint = lv_label_create(ap);
         lv_label_set_text(hint, "Hold the main screen 2.5 s to toggle sound.\nPlay sound for:");
         lv_obj_set_style_text_color(hint, lv_color_hex(0x7C8A9A), 0);
@@ -1247,6 +1533,13 @@ void buildSettingsScreen() {
     // Map tab (categoryPanels[1]) — vector map display options
     // -----------------------------------------------------------------
     y = 4;
+    static const char *kMapSourceOptions = "GOFA (/speedmap_gofa)\nWYN (/speedmap_wyn)\nMac dinh (/speedmap)";
+    uint32_t mapSel = 0;
+    if (strcmp(cfg.mapSource, "/speedmap_wyn") == 0 || (int)cfg.mapSourceIndex == 1) mapSel = 1;
+    else if (strcmp(cfg.mapSource, "/speedmap") == 0 || (int)cfg.mapSourceIndex == 2) mapSel = 2;
+    else mapSel = 0;
+    addDropdownRow(categoryPanels[1], y, "Map Data Source", kMapSourceOptions, mapSel, onMapSourceDropdownChanged, nullptr);
+
     // Vector map only (raster JPEG background removed 2026-09-26).
     addSwitchRow(categoryPanels[1], y, "Heading up (rotate map)", &cfg.mapHeadingUp);
     addSwitchRow(categoryPanels[1], y, "Vehicle trail", &cfg.showVehicleTrail);
@@ -1423,6 +1716,7 @@ void buildSettingsScreen() {
     buildWifiScanOverlay(settingsScreen); // full-screen "WiFi setup" (scan + password) — see its own comment
     lv_obj_move_foreground(wifiKeyboard); // keep the keyboard above the overlay when both show
 
-    buildConfirmOverlay(settingsScreen); // created last so it covers everything (and now the keyboard too)
+    buildConfirmOverlay(settingsScreen);
+    buildTouchCalibOverlay(settingsScreen); // created last so it covers everything (and now the keyboard too)
     buildRestartConfirmOverlay(settingsScreen);
 }

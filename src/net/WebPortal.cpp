@@ -435,19 +435,19 @@ static String jsonStr(const char *s) {
 }
 
 static void handleConfigGet() {
-    char b[420];
+    char b[512];
     snprintf(b, sizeof(b),
              "{\"audioEnabled\":%d,\"audioVolume\":%.0f,\"brightness\":%.0f,\"brightnessAuto\":%d,\"autoDimMin\":%.0f,"
              "\"overspeedOffsetKmh\":%.0f,\"defaultLimitKmh\":%.0f,\"gnssSpeedCalibrationPct\":%.1f,"
              "\"tripLoggingEnabled\":%d,\"gnssSpeedFilterAlpha\":%.2f,\"gnssFixTimeoutS\":%.1f,"
-             "\"wifiAutoOffMin\":%.0f,",
+             "\"wifiAutoOffMin\":%.0f,\"mapSourceIndex\":%.0f,\"voicePack\":%.0f,\"touchOffsetX\":%.0f,\"touchOffsetY\":%.0f,",
              cfg.audioEnabled ? 1 : 0, (double)cfg.audioVolume, (double)cfg.brightness,
              cfg.brightnessMode < 0.5f ? 1 : 0, (double)cfg.autoDimMin,
              (double)cfg.overspeedOffsetKmh, (double)cfg.defaultLimitKmh, (double)cfg.gnssSpeedCalibrationPct,
              cfg.tripLoggingEnabled ? 1 : 0, (double)cfg.gnssSpeedFilterAlpha, (double)cfg.gnssFixTimeoutS,
-             (double)cfg.wifiAutoOffMin);
+             (double)cfg.wifiAutoOffMin, (double)cfg.mapSourceIndex, (double)cfg.voicePack, (double)cfg.touchOffsetX, (double)cfg.touchOffsetY);
     String out = b;
-    out += "\"wifiSsid\":" + jsonStr(cfg.wifiSsid) + ",\"dataUpdateUrl\":" + jsonStr(cfg.dataUpdateUrl) + "}";
+    out += "\"mapSource\":" + jsonStr(cfg.mapSource) + ",\"wifiSsid\":" + jsonStr(cfg.wifiSsid) + ",\"dataUpdateUrl\":" + jsonStr(cfg.dataUpdateUrl) + "}";
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "application/json", out);
 }
@@ -481,6 +481,16 @@ static void handleConfigPost() {
     argFloat("gnssSpeedFilterAlpha", cfg.gnssSpeedFilterAlpha);
     argFloat("gnssFixTimeoutS", cfg.gnssFixTimeoutS);
     argFloat("wifiAutoOffMin", cfg.wifiAutoOffMin);
+    float oldVoice = cfg.voicePack;
+    argFloat("mapSourceIndex", cfg.mapSourceIndex);
+    argText("mapSource", cfg.mapSource, sizeof(cfg.mapSource), false);
+    argFloat("voicePack", cfg.voicePack);
+    argFloat("touchOffsetX", cfg.touchOffsetX);
+    argFloat("touchOffsetY", cfg.touchOffsetY);
+    if (cfg.voicePack != oldVoice) {
+        audioSetVoicePack((int)cfg.voicePack);
+        audioPreviewVoice((int)cfg.voicePack);
+    }
     argText("wifiSsid", cfg.wifiSsid, sizeof(cfg.wifiSsid), true);
     if (server.hasArg("wifiPassword") && server.arg("wifiPassword").length() > 0 &&
         server.arg("wifiPassword").length() < 8) {

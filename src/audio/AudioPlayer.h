@@ -44,3 +44,9 @@ void audioUpdate();
 // A no-op if cfg.audioEnabled is false or volume is 0 — callers don't need
 // to check either themselves.
 void audioQueueVoice(const char *filename);
+
+// Voice pack selection (2026-10-01)
+// 0: Nam Bắc, 1: Nữ Bắc, 2: Nam Nam, 3: Nữ Nam, 4: Nam Trung, 5: Nữ Trung, 6: WYN / Mặc định
+void audioSetVoicePack(int packId);
+int audioGetVoicePack();
+void audioPreviewVoice(int packId);

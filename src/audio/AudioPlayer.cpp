@@ -1,4 +1,4 @@
-#include "AudioPlayer.h"
+﻿#include "AudioPlayer.h"
 #include "map/SdCardManager.h" // sdMgrExists() — self-test picks the voice set on the card
 #include "core/AppConfig.h" // cfg.audioEnabled — master alert-audio toggle (Settings > Display)
 #include <Arduino.h>
@@ -47,6 +47,32 @@ static SemaphoreHandle_t s_i2sMutex = NULL;
 // pressure). Now the UI just enqueues a command and returns immediately.
 #define VOICE_DIR "/speedmap/sounds/vi/"
 #define VOICE_FILENAME_MAX 48
+
+static const char *const kVoicePackDirs[] = {
+    "male_north",     // 0: Nam Bac (GOFA)
+    "female_north",   // 1: Nu Bac (GOFA)
+    "male_south",     // 2: Nam Nam (GOFA)
+    "female_south",   // 3: Nu Nam (GOFA)
+    "male_central",   // 4: Nam Trung (GOFA)
+    "female_central", // 5: Nu Trung (GOFA)
+    "vi"              // 6: Goc WYN / Mac dinh
+};
+static int s_voicePack = 0;
+
+void audioSetVoicePack(int packId) {
+    if (packId < 0 || packId > 6) packId = 0;
+    s_voicePack = packId;
+    Serial.printf("[audio] voice pack set to %d (%s)\n", s_voicePack, kVoicePackDirs[s_voicePack]);
+}
+
+int audioGetVoicePack() {
+    return s_voicePack;
+}
+
+void audioPreviewVoice(int packId) {
+    audioSetVoicePack(packId);
+    audioQueueVoice("camera_ahead.mp3");
+}
 #define AUDIO_QUEUE_LEN 20 // 2026-09-24: 12 -> 20, headroom for the audio self-test burst (audioSelfTest)
 enum : uint8_t {
     CMD_VOICE = 0, CMD_TONE_CAMERA, CMD_TONE_OVERSPEED, CMD_TONE_SIGN, CMD_TONE_BEEP, CMD_TONE_STARTUP,
@@ -86,18 +112,24 @@ static bool installToneI2S() {
         .data_in_num = I2S_PIN_NO_CHANGE
     };
 
-    esp_err_t err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-    if (err != ESP_OK) {
-        Serial.printf("[audio] i2s_driver_install failed: 0x%x\n", err);
-        return false;
-    }
+    i2s_driver_uninstall(I2S_PORT);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
-    err = i2s_set_pin(I2S_PORT, &pin_config);
-    if (err != ESP_OK) {
-        Serial.printf("[audio] i2s_set_pin failed: 0x%x\n", err);
-        return false;
+    esp_err_t err = ESP_FAIL;
+    for (int retry = 0; retry < 3; retry++) {
+        err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+        if (err == ESP_OK) {
+            err = i2s_set_pin(I2S_PORT, &pin_config);
+            if (err == ESP_OK) {
+                i2s_zero_dma_buffer(I2S_PORT);
+                return true;
+            }
+            i2s_driver_uninstall(I2S_PORT);
+        }
+        vTaskDelay(pdMS_TO_TICKS(15));
     }
-    return true;
+    Serial.printf("[audio] installToneI2S failed after 3 tries: 0x%x\n", err);
+    return false;
 }
 
 void audioInit() {
@@ -128,14 +160,15 @@ uint8_t audioGetVolume() {
 }
 
 void audioPlayTone(uint16_t freqHz, uint16_t durationMs) {
-    if (!s_initialized || s_volume == 0 || freqHz == 0) return;
-    // Skip (don't block) if the voice task currently owns the I2S port — the
-    // voice line is the alert in that case. Also closes the race where the
-    // port gets uninstalled between the check above and i2s_write below.
+    if (s_volume == 0 || freqHz == 0) return;
     if (s_i2sMutex && xSemaphoreTake(s_i2sMutex, 0) != pdTRUE) return;
-    if (!s_initialized) { // re-check under the lock: voice may have just torn it down
-        if (s_i2sMutex) xSemaphoreGive(s_i2sMutex);
-        return;
+    if (!s_initialized) {
+        if (installToneI2S()) {
+            s_initialized = true;
+        } else {
+            if (s_i2sMutex) xSemaphoreGive(s_i2sMutex);
+            return;
+        }
     }
 
     int totalSamples = (I2S_SAMPLE_RATE * durationMs) / 1000;
@@ -285,13 +318,68 @@ static void audioTaskFn(void *) {
         if (c.kind == CMD_TONE_GPSLOST) { toneGpsLost(); continue; }
 
         // CMD_VOICE
-        char path[VOICE_FILENAME_MAX + sizeof(VOICE_DIR)];
-        snprintf(path, sizeof(path), VOICE_DIR "%s", c.file);
+        char path[128];
+        const char *baseDir = sdMgrGetBaseDir();
+        bool found = false;
+
+        // Requirement 2: All maps must use the startup welcome voice greeting
+        // "sounds/welcome/voice.mp3" (e.g. from speedmap_gofa/speedmap/sounds/welcome/voice.mp3).
+        // It must NOT be replaced by pack-specific greetings (like dan-duong-gofa).
+        if (strcmp(c.file, "welcome/voice.mp3") == 0) {
+            snprintf(path, sizeof(path), "%s/sounds/welcome/voice.mp3", baseDir);
+            if (SD_MMC.exists(path)) {
+                found = true;
+            } else {
+                snprintf(path, sizeof(path), "/speedmap_gofa/sounds/welcome/voice.mp3");
+                if (SD_MMC.exists(path)) {
+                    found = true;
+                } else {
+                    snprintf(path, sizeof(path), "/speedmap/sounds/welcome/voice.mp3");
+                    if (SD_MMC.exists(path)) {
+                        found = true;
+                    } else {
+                        snprintf(path, sizeof(path), "/speedmap_wyn/sounds/welcome/voice.mp3");
+                        if (SD_MMC.exists(path)) {
+                            found = true;
+                        } else {
+                            snprintf(path, sizeof(path), "/speedmap/sounds/vi/welcome/voice.mp3");
+                            if (SD_MMC.exists(path)) found = true;
+                        }
+                    }
+                }
+            }
+        }
+        else if (s_voicePack >= 0 && s_voicePack < 6) {
+            // Check 1: in current active baseDir
+            snprintf(path, sizeof(path), "%s/sounds/packs/%s/%s", baseDir, kVoicePackDirs[s_voicePack], c.file);
+            if (SD_MMC.exists(path)) {
+                found = true;
+            } else {
+                // Check 2: in /speedmap_gofa
+                snprintf(path, sizeof(path), "/speedmap_gofa/sounds/packs/%s/%s", kVoicePackDirs[s_voicePack], c.file);
+                if (SD_MMC.exists(path)) {
+                    found = true;
+                } else {
+                    // Check 3: in /speedmap
+                    snprintf(path, sizeof(path), "/speedmap/sounds/packs/%s/%s", kVoicePackDirs[s_voicePack], c.file);
+                    if (SD_MMC.exists(path)) {
+                        found = true;
+                    }
+                }
+            }
+        }
+        if (!found) {
+            snprintf(path, sizeof(path), "%s/sounds/vi/%s", baseDir, c.file);
+            if (!SD_MMC.exists(path)) {
+                snprintf(path, sizeof(path), "/speedmap/sounds/vi/%s", c.file);
+            }
+        }
         Serial.printf("[audio] playing voice: %s\n", path);
 
         if (s_i2sMutex) xSemaphoreTake(s_i2sMutex, portMAX_DELAY);
         i2s_driver_uninstall(I2S_PORT);
         s_initialized = false;
+        vTaskDelay(pdMS_TO_TICKS(10));
 
         AudioFileSourceFS source(SD_MMC, path);
         if (source.isOpen()) {
@@ -307,9 +395,11 @@ static void audioTaskFn(void *) {
             } else {
                 Serial.printf("[audio] voice: mp3.begin() failed for %s\n", path);
             }
+            out.stop();
         } else {
             Serial.printf("[audio] voice: file not found: %s\n", path);
         }
+        vTaskDelay(pdMS_TO_TICKS(10));
 
         if (installToneI2S()) s_initialized = true;
         if (s_i2sMutex) xSemaphoreGive(s_i2sMutex);

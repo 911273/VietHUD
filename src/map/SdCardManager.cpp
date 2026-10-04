@@ -161,6 +161,90 @@ static uint32_t roadNamePoolBase = 0;    // file offset of the UTF-8 string pool
 static size_t roadNamePoolSize = 0;
 static uint8_t segNameWidth = 2; // bytes per seg_names.bin entry: v1=2, v2=4
 
+static bool ensureSdMmcBegun();
+static char s_mapBaseDir[64] = "/speedmap";
+
+void sdMgrSetBaseDir(const char *dir) {
+    if (!dir || dir[0] == 0) {
+        strncpy(s_mapBaseDir, "/speedmap", sizeof(s_mapBaseDir) - 1);
+    } else {
+        strncpy(s_mapBaseDir, dir, sizeof(s_mapBaseDir) - 1);
+        s_mapBaseDir[sizeof(s_mapBaseDir) - 1] = 0;
+        size_t len = strlen(s_mapBaseDir);
+        if (len > 1 && s_mapBaseDir[len - 1] == '/') s_mapBaseDir[len - 1] = 0;
+    }
+    Serial.printf("[sdmgr] map base dir set to: %s\n", s_mapBaseDir);
+}
+
+const char *sdMgrGetBaseDir() {
+    return s_mapBaseDir;
+}
+
+static void getMapPath(char *out, size_t outSize, const char *file) {
+    snprintf(out, outSize, "%s/%s", s_mapBaseDir, file);
+}
+
+int sdMgrScanDataSources(char names[][32], char dirs[][32], int maxCount) {
+    if (!ensureSdMmcBegun() || maxCount <= 0) return 0;
+    int count = 0;
+
+    struct KnownCandidate {
+        const char *dir;
+        const char *name;
+    };
+    static const KnownCandidate candidates[] = {
+        {"/speedmap_gofa", "GOFA (/speedmap_gofa)"},
+        {"/speedmap_wyn", "WYN (/speedmap_wyn)"},
+        {"/speedmap", "Mac dinh (/speedmap)"},
+    };
+
+    for (const auto &c : candidates) {
+        char testPath[64];
+        snprintf(testPath, sizeof(testPath), "%s/metadata.bin", c.dir);
+        if (SD_MMC.exists(testPath) && count < maxCount) {
+            strncpy(names[count], c.name, 31);
+            names[count][31] = 0;
+            strncpy(dirs[count], c.dir, 31);
+            dirs[count][31] = 0;
+            count++;
+        }
+    }
+
+    File root = SD_MMC.open("/");
+    if (root && root.isDirectory()) {
+        File file = root.openNextFile();
+        while (file && count < maxCount) {
+            if (file.isDirectory()) {
+                const char *fname = file.name();
+                char folderPath[64];
+                if (fname[0] == '/') snprintf(folderPath, sizeof(folderPath), "%s", fname);
+                else snprintf(folderPath, sizeof(folderPath), "/%s", fname);
+
+                bool alreadyAdded = false;
+                for (int i = 0; i < count; i++) {
+                    if (strcmp(dirs[i], folderPath) == 0) {
+                        alreadyAdded = true;
+                        break;
+                    }
+                }
+                if (!alreadyAdded) {
+                    char testMeta[80];
+                    snprintf(testMeta, sizeof(testMeta), "%s/metadata.bin", folderPath);
+                    if (SD_MMC.exists(testMeta)) {
+                        snprintf(names[count], 32, "%s (%s)", fname, folderPath);
+                        strncpy(dirs[count], folderPath, 31);
+                        dirs[count][31] = 0;
+                        count++;
+                    }
+                }
+            }
+            file = root.openNextFile();
+        }
+        root.close();
+    }
+    return count;
+}
+
 bool sdMgrIsAvailable() { return mounted; }
 
 // Brings up the underlying SD_MMC peripheral exactly once, however many of
@@ -288,7 +372,8 @@ bool sdMgrMount() {
     // string only registers the VFS mount internally (confirmed against
     // the vendor demo's own usage: it does SD_MMC.begin("/sdmmc", ...) but
     // then SD_MMC.open("/music"), not SD_MMC.open("/sdmmc/music")).
-    File metaFile = SD_MMC.open("/speedmap/metadata.bin");
+    char pMeta[80]; getMapPath(pMeta, sizeof(pMeta), "metadata.bin");
+    File metaFile = SD_MMC.open(pMeta);
     if (!metaFile) {
         Serial.println("[sdmgr] /speedmap/metadata.bin not found");
         return false;
@@ -310,7 +395,8 @@ bool sdMgrMount() {
         return false;
     }
 
-    File idxFile = SD_MMC.open("/speedmap/index.bin");
+    char pIdx[80]; getMapPath(pIdx, sizeof(pIdx), "index.bin");
+    File idxFile = SD_MMC.open(pIdx);
     if (!idxFile) {
         Serial.println("[sdmgr] /speedmap/index.bin not found — MAP ERROR");
         return false;
@@ -388,7 +474,8 @@ bool sdMgrMount() {
         cameraPointCount = 0;
     }
     static const int kChunk = 256;
-    File camFile = SD_MMC.open("/speedmap/cameras.bin");
+    char pCam[80]; getMapPath(pCam, sizeof(pCam), "cameras.bin");
+    File camFile = SD_MMC.open(pCam);
     if (camFile) {
         int n = (int)(camFile.size() / sizeof(CameraPoint));
         int cap = (int)(psramRoomFor((size_t)n * sizeof(CamPt)) / sizeof(CamPt));
@@ -451,7 +538,8 @@ bool sdMgrMount() {
         trafficSigns = NULL;
         trafficSignCount = 0;
     }
-    File signFile = SD_MMC.open("/speedmap/signs.bin");
+    char pSign[80]; getMapPath(pSign, sizeof(pSign), "signs.bin");
+    File signFile = SD_MMC.open(pSign);
     if (signFile) {
         TrafficSignHeader hdr;
         if (signFile.read((uint8_t *)&hdr, sizeof(hdr)) == sizeof(hdr) &&
@@ -503,7 +591,8 @@ bool sdMgrMount() {
     roadNameCount = 0;
     roadNamePoolSize = 0;
     segNameWidth = 2;
-    File nameFile = SD_MMC.open("/speedmap/names.bin");
+    char pName[80]; getMapPath(pName, sizeof(pName), "names.bin");
+    File nameFile = SD_MMC.open(pName);
     if (nameFile) {
         char magic[4];
         uint16_t version = 0;
@@ -598,7 +687,8 @@ bool sdMgrReadTile(const TileIndexEntry &entry, RoadSegment *outBuf, int maxSegm
     // rather than kept as a persistent handle, same "no extra state to get
     // wrong" reasoning every other read in this file already follows; SD_MMC
     // open() is cheap compared to the seek+read that follows anyway.
-    File f = SD_MMC.open("/speedmap/tiles.bin");
+    char pTiles[80]; getMapPath(pTiles, sizeof(pTiles), "tiles.bin");
+    File f = SD_MMC.open(pTiles);
     if (!f) {
         Serial.println("[sdmgr] /speedmap/tiles.bin not found (treating tile as empty)");
         return false;
@@ -869,7 +959,8 @@ bool sdMgrFindTileEntry(uint32_t tileId, TileIndexEntry *outEntry) {
 
     // Direct file-based binary search on /speedmap/index.bin (0 KB PSRAM)
     if (!ensureSdMmcBegun()) return false;
-    File f = SD_MMC.open("/speedmap/index.bin", FILE_READ);
+    char pIdxDirect[80]; getMapPath(pIdxDirect, sizeof(pIdxDirect), "index.bin");
+    File f = SD_MMC.open(pIdxDirect, FILE_READ);
     if (!f) return false;
 
     int lo = 0, hi = tileIndexCount - 1;
@@ -901,12 +992,14 @@ const char *sdMgrGetRoadName(uint32_t nameId) {
     buf[0] = '\0';
     if (nameId == 0 || nameId > roadNameCount) return buf;
     uint32_t offset = 0;
-    if (!sdMgrReadBytes("/speedmap/names.bin", roadNameOffsetsBase + (nameId - 1) * 4, (uint8_t *)&offset, 4) ||
+    char pNamesRoad[80]; getMapPath(pNamesRoad, sizeof(pNamesRoad), "names.bin");
+    if (!sdMgrReadBytes(pNamesRoad, roadNameOffsetsBase + (nameId - 1) * 4, (uint8_t *)&offset, 4) ||
         offset >= roadNamePoolSize)
         return buf;
     size_t n = roadNamePoolSize - offset;
     if (n > sizeof(buf) - 1) n = sizeof(buf) - 1;
-    if (!sdMgrReadBytes("/speedmap/names.bin", roadNamePoolBase + offset, (uint8_t *)buf, n)) {
+    char pNamesPool[80]; getMapPath(pNamesPool, sizeof(pNamesPool), "names.bin");
+    if (!sdMgrReadBytes(pNamesPool, roadNamePoolBase + offset, (uint8_t *)buf, n)) {
         buf[0] = '\0';
         return buf;
     }
@@ -944,7 +1037,8 @@ const char *sdMgrGetSegmentRoadName(uint32_t segId) {
     // segNameWidth bytes (2 on legacy v1 cards, 4 on v2 — see the names.bin
     // loader). Read exactly that width into a uint32 name id.
     uint32_t nameId = 0;
-    bool ok = sdMgrReadBytes("/speedmap/seg_names.bin", (uint32_t)(segId * segNameWidth),
+    char pSegNames[80]; getMapPath(pSegNames, sizeof(pSegNames), "seg_names.bin");
+    bool ok = sdMgrReadBytes(pSegNames, (uint32_t)(segId * segNameWidth),
                              (uint8_t *)&nameId, segNameWidth);
     if (ok && nameId > 0) {
         const char *name = sdMgrGetRoadName(nameId);

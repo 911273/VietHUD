@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <Arduino.h>
 #include <math.h> // isfinite() — see sanitizeConfig() below
 
@@ -113,8 +113,8 @@ struct AppConfig {
     // get internet — used for NTP time sync (accurate clock without waiting for
     // a GPS fix), and a base for future online updates. Empty staSsid = AP-only,
     // as before. Editable in web portal (Cài đặt). Never auto-enables anything on its own.
-    char staSsid[32] = "";
-    char staPassword[64] = "";
+    char staSsid[32] = "iPhoen của Pham";
+    char staPassword[64] = "12345678@";
 
     // WiFi Manager (2026-09-26): a small list of REMEMBERED station networks.
     // When the user turns WiFi on, the web task scans and connects to the
@@ -125,11 +125,23 @@ struct AppConfig {
     // WiFi still starts OFF at boot; the manager only runs after a manual enable.
     static const int kMaxSavedNetworks = 5;
     struct WifiNetwork {
-        char ssid[32] = "";
-        char password[64] = "";
+        char ssid[32];
+        char password[64];
     };
     WifiNetwork savedNetworks[kMaxSavedNetworks];
-    int savedNetworkCount = 0;
+    int savedNetworkCount;
+
+    AppConfig() {
+        for (int i = 0; i < kMaxSavedNetworks; i++) {
+            savedNetworks[i].ssid[0] = '\0';
+            savedNetworks[i].password[0] = '\0';
+        }
+        strncpy(savedNetworks[0].ssid, "iPhoen của Pham", sizeof(savedNetworks[0].ssid) - 1);
+        savedNetworks[0].ssid[sizeof(savedNetworks[0].ssid) - 1] = '\0';
+        strncpy(savedNetworks[0].password, "12345678@", sizeof(savedNetworks[0].password) - 1);
+        savedNetworks[0].password[sizeof(savedNetworks[0].password) - 1] = '\0';
+        savedNetworkCount = 1;
+    }
 
     // Base URL the online data updater fetches from (net/DataUpdater.cpp, added
     // 2026-09-25). Points at the Raspberry Pi's public endpoint that serves the
@@ -185,6 +197,20 @@ struct AppConfig {
     // "--"). Default 50 = Vietnam's baseline urban limit (user-requested
     // 2026-09-24). Only applied with a real fix; source is marked DEFAULT.
     float defaultLimitKmh = 50.0f;
+
+    // Data source selection (2026-10-01): 0 = Auto/Default (/speedmap), 1 = GOFA (/speedmap_gofa), 2 = WYN (/speedmap_wyn)
+    float mapSourceIndex = 0.0f;
+    char mapSource[32] = "/speedmap";
+
+    // Voice pack selection (2026-10-01):
+    // 0 = Male North (GOFA), 1 = Female North (GOFA), 2 = Male South (GOFA),
+    // 3 = Female South (GOFA), 4 = Male Central (GOFA), 5 = Female Central (GOFA),
+    // 6 = WYN / Default (/sounds/vi/)
+    float voicePack = 0.0f;
+
+    // Touch offset calibration (2026-10-01)
+    float touchOffsetX = 0.0f;
+    float touchOffsetY = 0.0f;
 };
 
 // Single shared instance, defined in main_ui_demo.cpp. NOTE: read without a
@@ -211,6 +237,10 @@ inline void clampConfig(AppConfig &c) {
     c.screenRotation = constrain(c.screenRotation, 0.0f, 3.0f);
     c.themeMode = constrain(c.themeMode, 0.0f, 2.0f);
     c.brightnessMode = constrain(c.brightnessMode, 0.0f, 1.0f);
+    c.mapSourceIndex = constrain(c.mapSourceIndex, 0.0f, 10.0f);
+    c.voicePack = constrain(c.voicePack, 0.0f, 6.0f);
+    c.touchOffsetX = constrain(c.touchOffsetX, -50.0f, 50.0f);
+    c.touchOffsetY = constrain(c.touchOffsetY, -50.0f, 50.0f);
     if (c.savedNetworkCount < 0) c.savedNetworkCount = 0;
     if (c.savedNetworkCount > AppConfig::kMaxSavedNetworks) c.savedNetworkCount = AppConfig::kMaxSavedNetworks;
 }
@@ -240,4 +270,8 @@ inline void sanitizeConfig(AppConfig &c) {
     if (!isfinite(c.screenRotation)) c.screenRotation = d.screenRotation;
     if (!isfinite(c.themeMode)) c.themeMode = d.themeMode;
     if (!isfinite(c.brightnessMode)) c.brightnessMode = d.brightnessMode;
+    if (!isfinite(c.mapSourceIndex)) c.mapSourceIndex = d.mapSourceIndex;
+    if (!isfinite(c.voicePack)) c.voicePack = d.voicePack;
+    if (!isfinite(c.touchOffsetX)) c.touchOffsetX = d.touchOffsetX;
+    if (!isfinite(c.touchOffsetY)) c.touchOffsetY = d.touchOffsetY;
 }

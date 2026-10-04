@@ -184,3 +184,8 @@ uint64_t sdMgrFreeBytes();
 bool sdMgrWriteSmallFile(const char *path, const void *data, size_t len); // truncate + write
 bool sdMgrSha256File(const char *path, uint8_t out[32], void (*tick)());  // readback hash
 int sdMgrClearDir(const char *dir);             // remove all files in dir (non-recursive)
+
+// Dynamic map data source support (2026-10-01)
+void sdMgrSetBaseDir(const char *dir);
+const char *sdMgrGetBaseDir();
+int sdMgrScanDataSources(char names[][32], char dirs[][32], int maxCount);
