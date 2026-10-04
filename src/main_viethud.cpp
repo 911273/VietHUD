@@ -1,4 +1,4 @@
-// VietHUD — GPS-only offline speed-limit/camera/traffic-sign warning device.
+﻿// VietHUD — GPS-only offline speed-limit/camera/traffic-sign warning device.
 // Radar (HLK-LD2451) and everything built around it were removed entirely
 // 2026-09-21 — this is a full product replacement, not a side-by-side demo
 // (see docs/VietHUD_offline_speed_alert_plan.md and README.md). Renamed
@@ -55,6 +55,7 @@
 #include "touch/TouchTask.h"
 #include "ui/Dashboard.h"
 #include "ui/Settings.h"
+#include "ui/UpdateScreen.h"
 #include "audio/AudioPlayer.h"
 
 AppConfig cfg; // extern-declared in core/AppConfig.h — see the comment there
@@ -180,6 +181,7 @@ static void showBootSplash() {
         lv_obj_set_style_opa(logo, opa, 0);
         lv_tick_inc(now - lastTick); lastTick = now;
         lv_timer_handler();
+    updateScreenPoll();
         esp_task_wdt_reset();
         delay(8);
     }
@@ -191,6 +193,7 @@ static void showBootSplash() {
         uint32_t now = millis();
         lv_tick_inc(now - lt); lt = now;
         lv_timer_handler();
+    updateScreenPoll();
         esp_task_wdt_reset();
         delay(8);
     }
@@ -206,6 +209,7 @@ static void setupPump() {
     lv_tick_inc(n - sPumpLastMs);
     sPumpLastMs = n;
     lv_timer_handler();
+    updateScreenPoll();
     esp_task_wdt_reset();
     delay(10);
 }
@@ -408,6 +412,7 @@ void setup() {
     displayBegin();
     touchTaskStart();
     audioInit();
+    audioSetVoicePack((int)cfg.voicePack);
     // Startup music: the power-on jingle (pure tones, always works) plays now,
     // over the ~2s boot splash. The spoken welcome greeting is deferred until
     // AFTER the splash finishes (queued below, right after showBootSplash()).
@@ -450,6 +455,9 @@ void setup() {
     // verified files in BEFORE the map data is loaded into PSRAM, then let the
     // installer roll back if the new set doesn't mount. See update/DataInstaller.h.
     bool dataApplied = installerBootApply();
+    if (cfg.mapSource[0] != 0) {
+        sdMgrSetBaseDir(cfg.mapSource);
+    }
     bool mountOk = sdMgrMount();
     installerAfterMount(mountOk); // rolls back + reboots if the NEW data can't mount
     if (dataApplied || installerRolledBackThisBoot()) showInstallResult(!dataApplied);
@@ -464,6 +472,7 @@ void setup() {
 
     buildDashboard();
     buildSettingsScreen();
+    buildUpdateScreen();
     showBootSplash(); // ~2s animated VRE logo, then cross-fades to the Dashboard (blocking)
     // Welcome greeting AFTER the splash has finished (user-requested 2026-09-25):
     // the spoken "chào mừng" now plays once the dashboard is on screen, not over
@@ -593,6 +602,9 @@ void loop() {
             } else {
                 Serial.println("[snap] failed (out of memory)");
             }
+        } else if (c == 'U') {
+            openUpdateScreen();
+            Serial.println("[debug] opened update screen via serial");
         } else if (c == 'u') {
             // Bench trigger for the OTA data update. Uses the SAME reliable path
             // as the web + on-screen buttons: set the NVS flag and reboot into
@@ -608,6 +620,7 @@ void loop() {
     lv_tick_inc(now - lastTick);
     lastTick = now;
     lv_timer_handler();
+    updateScreenPoll();
 
     // Report where the frame time actually goes, so tuning stops being guesswork.
     if (now - lastStatsMs > 5000) {

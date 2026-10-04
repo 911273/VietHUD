@@ -1,9 +1,11 @@
-#include "map/SpeedLimitManager.h"
+﻿#include "map/SpeedLimitManager.h"
 #include <esp_task_wdt.h>
 #include "Dashboard.h"
 #include "map/MapRenderer.h"
 #include "map/SdCardManager.h" // sdMgrExists() — full-sentence voice prompts present on the card?
-#include "Settings.h" // settingsScreen, for the hold-to-open-Settings gesture
+#include "Settings.h"
+#include "UpdateScreen.h"
+#include <WiFi.h> // settingsScreen, for the hold-to-open-Settings gesture
 #include "core/AppConfig.h"
 #include "core/NvsStore.h" // saveConfigToNVS()
 #include "core/SharedState.h"
@@ -424,6 +426,7 @@ static void updateAudioTopIcon() {
 static bool releaseHandledThisPress = false;
 
 static void onDashPressed(lv_event_t *e) {
+    if (millis() < 4000) return; // Boot grace period: ignore touch noise during startup / boot splash
     lv_indev_t *indev = lv_event_get_indev(e);
     if (!indev) return;
     lv_point_t p;
@@ -461,6 +464,7 @@ static void onDashLongPressed(lv_event_t *) {
 }
 
 static void onDashLongPressedRepeat(lv_event_t *) {
+    if (pressStartMs == 0 || millis() < 4000) return;
     if (audioToggledThisPress || millis() - pressStartMs < kAudioHoldMs) return;
     audioToggledThisPress = true;
     hideHoldRing();
@@ -479,6 +483,7 @@ static void onDashLongPressedRepeat(lv_event_t *) {
 }
 
 static void onDashReleasedOrLost(lv_event_t *) {
+    pressStartMs = 0;
     hideHoldRing();
     if (releaseHandledThisPress) return;
     releaseHandledThisPress = true;
@@ -1477,6 +1482,17 @@ void refreshDashboard() {
         lv_obj_add_flag(wifiToastLabel, LV_OBJ_FLAG_HIDDEN);
     }
     updateAudioTopIcon(); // no-op unless cfg.audioEnabled changed (Settings / portal / hold gesture)
+
+    // Check if WiFi just connected to auto-open Update screen (Requirement 3:
+    // "Sau khi kết nối wifi thì vào màn hình check update dữ liệu và fw")
+    {
+        static bool s_lastStaConnected = false;
+        bool staNow = (WiFi.status() == WL_CONNECTED);
+        if (staNow && !s_lastStaConnected) {
+            openUpdateScreen();
+        }
+        s_lastStaConnected = staNow;
+    }
 
     // Single mutex-protected read per refresh — everything below uses these
     // local copies, never the live shared state (see core/SharedState.h).

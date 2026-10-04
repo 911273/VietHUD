@@ -40,8 +40,16 @@ static void touchTaskFn(void *) {
         xSemaphoreTake(touchMutex, portMAX_DELAY);
         sharedPoint.pressed = touched;
         if (touched) {
-            sharedPoint.x = x;
-            sharedPoint.y = y;
+            int32_t cx = (int32_t)x + (int32_t)lroundf(cfg.touchOffsetX);
+            int32_t cy = (int32_t)y + (int32_t)lroundf(cfg.touchOffsetY);
+            uint16_t maxW = (cfg.screenRotation == 0 || cfg.screenRotation == 2) ? TFT_RES_W : TFT_RES_H;
+            uint16_t maxH = (cfg.screenRotation == 0 || cfg.screenRotation == 2) ? TFT_RES_H : TFT_RES_W;
+            if (cx < 0) cx = 0;
+            if (cy < 0) cy = 0;
+            if (cx >= maxW) cx = maxW - 1;
+            if (cy >= maxH) cy = maxH - 1;
+            sharedPoint.x = (uint16_t)cx;
+            sharedPoint.y = (uint16_t)cy;
         }
         xSemaphoreGive(touchMutex);
 

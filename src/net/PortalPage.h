@@ -32,7 +32,7 @@ button:disabled{opacity:.45}button.g{background:#232A34;color:#D5DDE6}button.r{b
 .grid small{display:block;color:var(--m);font-size:11px}.grid b{font-size:16px}
 .f{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 0;border-top:1px solid var(--l)}.f:first-child{border-top:0}
 .f span{flex:1}.f input[type=number]{width:84px}.f input[type=range]{width:44%}
-input{background:#0E1116;color:var(--t);border:1px solid var(--l);border-radius:9px;padding:9px;font-size:16px}
+input,select{background:#0E1116;color:var(--t);border:1px solid var(--l);border-radius:9px;padding:9px;font-size:16px}select{width:100%;margin-top:6px}
 input[type=text],input[type=password],input[type=url]{width:100%;margin-top:6px}input[type=checkbox]{width:22px;height:22px;accent-color:var(--a)}
 input[type=file]{width:100%;margin-top:8px;font-size:14px}
 .li{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-top:1px solid var(--l);gap:10px}.li:first-child{border-top:0}
@@ -165,13 +165,17 @@ async function status(){if(BUSY||document.hidden)return;try{const d=await jget('
   +(d.speedMap.road?'<div style="grid-column:1/-1"><small>Đường</small><b>'+E(d.speedMap.road)+'</b></div>':'');
  $('cn').className='on';$('cn').textContent='Đã kết nối'}catch(e){$('cn').className='';$('cn').textContent='Mất kết nối'}}
 // ---------- settings ----------
-const CF=[['audioEnabled','Âm thanh cảnh báo','b'],['audioVolume','Âm lượng (%)','r',0,100],['brightness','Độ sáng (%)','r',5,100],['brightnessAuto','Tự giảm độ sáng buổi tối (50%)','b'],
+const CF=[['mapSource','Nguồn dữ liệu bản đồ','s',['GOFA (/speedmap_gofa)','WYN (/speedmap_wyn)','Mặc định (/speedmap)'],['/speedmap_gofa','/speedmap_wyn','/speedmap']],
+ ['voicePack','Giọng đọc cảnh báo','s',['1. Nam Bắc (GOFA)','2. Nữ Bắc (GOFA)','3. Nam Nam (GOFA)','4. Nữ Nam (GOFA)','5. Nam Trung (GOFA)','6. Nữ Trung (GOFA)','7. WYN / Mặc định']],
+ ['touchOffsetX','Hiệu chuẩn cảm ứng X (px)','n',-50,50],['touchOffsetY','Hiệu chuẩn cảm ứng Y (px)','n',-50,50],
+ ['audioEnabled','Âm thanh cảnh báo','b'],['audioVolume','Âm lượng (%)','r',0,100],['brightness','Độ sáng (%)','r',5,100],['brightnessAuto','Tự giảm độ sáng buổi tối (50%)','b'],
  ['overspeedOffsetKmh','Cảnh báo khi vượt quá (km/h)','n',0,10],['defaultLimitKmh','Giới hạn khi không rõ (km/h, 0 = tắt)','n',0,90],
  ['autoDimMin','Giảm sáng khi dừng sau (phút, 0 = tắt)','n',0,30],['gnssSpeedCalibrationPct','Hiệu chỉnh tốc độ GPS (%)','n',-15,15],['tripLoggingEnabled','Ghi nhật ký chuyến đi','b'],
  ['-','Nâng cao'],['gnssSpeedFilterAlpha','Làm mượt tốc độ (0,05–0,9)','n',0.05,0.9],['gnssFixTimeoutS','Báo mất GPS sau (giây)','n',1,10],
  ['wifiAutoOffMin','Tự tắt Wi-Fi khi không có kết nối (phút)','n',1,120],['wifiSsid','Tên Wi-Fi của VietHUD','t'],['wifiPassword','Mật khẩu Wi-Fi mới (để trống = giữ nguyên)','p'],['dataUpdateUrl','Địa chỉ dữ liệu','t']];
 async function cfgLoad(){const v=await jget('/api/v1/config');$('cfg').innerHTML=CF.map(([k,l,t,a,b])=>{
  if(k==='-')return '<h3>'+l+'</h3>';if(t==='t'||t==='p')return '<div class="f" style="display:block"><span class="s">'+l+'</span><input type="'+(t==='p'?'password':'text')+'" id="c_'+k+'" value="'+E(t==='p'?'':v[k])+'" autocapitalize="off"></div>';
+ if(t==='s')return '<div class="f" style="display:block"><span class="s">'+l+'</span><select id="c_'+k+'">'+a.map((o,i)=>'<option value="'+(b?b[i]:i)+'"'+((b?b[i]==v[k]:i==v[k])?' selected':'')+'>'+o+'</option>').join('')+'</select></div>';
  if(t==='b')return '<label class="f"><span>'+l+'</span><input type="checkbox" id="c_'+k+'"'+(v[k]?' checked':'')+'></label>';
  if(t==='r')return '<div class="f"><span>'+l+' <b id="o_'+k+'">'+v[k]+'</b></span><input type="range" id="c_'+k+'" min="'+a+'" max="'+b+'" value="'+v[k]+'" oninput="$(\'o_'+k+'\').textContent=this.value"></div>';
  return '<div class="f"><span>'+l+'</span><input type="number" step="any" id="c_'+k+'" min="'+a+'" max="'+b+'" value="'+v[k]+'"></div>'}).join('')+'<button onclick="cfgSave()">Lưu cài đặt</button><div class="s" id="cM"></div>'}

@@ -1,0 +1,8 @@
+﻿{
+  "version": "3.1.0",
+  "build": "20261004",
+  "url_pi4": "http://192.168.1.65/viethud/firmware/3.1.0/firmware.bin",
+  "url_pi4_mdns": "http://homebridge.local/viethud/firmware/3.1.0/firmware.bin",
+  "url_github": "https://raw.githubusercontent.com/911273/VietHUD/main/firmware/3.1.0/firmware.bin",
+  "notes": "VietHUD 3.1.0: Audio fix, welcome voice update, WiFi & OTA screen"
+}
