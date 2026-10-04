@@ -113,7 +113,7 @@ struct AppConfig {
     // get internet — used for NTP time sync (accurate clock without waiting for
     // a GPS fix), and a base for future online updates. Empty staSsid = AP-only,
     // as before. Editable in web portal (Cài đặt). Never auto-enables anything on its own.
-    char staSsid[32] = "iPhoen của Pham";
+    char staSsid[32] = "iPhone của Pham";
     char staPassword[64] = "12345678@";
 
     // WiFi Manager (2026-09-26): a small list of REMEMBERED station networks.
@@ -136,7 +136,7 @@ struct AppConfig {
             savedNetworks[i].ssid[0] = '\0';
             savedNetworks[i].password[0] = '\0';
         }
-        strncpy(savedNetworks[0].ssid, "iPhoen của Pham", sizeof(savedNetworks[0].ssid) - 1);
+        strncpy(savedNetworks[0].ssid, "iPhone của Pham", sizeof(savedNetworks[0].ssid) - 1);
         savedNetworks[0].ssid[sizeof(savedNetworks[0].ssid) - 1] = '\0';
         strncpy(savedNetworks[0].password, "12345678@", sizeof(savedNetworks[0].password) - 1);
         savedNetworks[0].password[sizeof(savedNetworks[0].password) - 1] = '\0';
