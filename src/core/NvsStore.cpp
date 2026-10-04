@@ -98,7 +98,7 @@ void loadConfigFromNVS(AppConfig &cfg) {
     // when a road's limit is unknown (VN urban baseline). Reset it to the code
     // default exactly ONCE (guarded by a schema-version key) so a later manual
     // change the user makes is still respected and never re-clobbered.
-    const uint32_t kCfgSchemaVer = 5;
+    const uint32_t kCfgSchemaVer = 6;
     uint32_t cfgVer = prefs.getUInt("cfgVer", 0);
     if (cfgVer < 2) {
         cfg.defaultLimitKmh = 50.0f;
@@ -123,17 +123,17 @@ void loadConfigFromNVS(AppConfig &cfg) {
         cfg.wifiAutoOffMin = 10.0f;
         prefs.putFloat("wifiAutoOff", cfg.wifiAutoOffMin);
     }
-    // Schema 5: Default STA network set to "iPhoen của Pham" / "12345678@".
+    // Schema 5: Default STA network set to "iPhone của Pham" / "12345678@".
     // Also protect and restore audioVolume and audioEnabled if corrupted/muted.
     if (cfgVer < 5) {
         if (cfg.staSsid[0] == '\0' || strcmp(cfg.staSsid, "VietHUD") == 0) {
-            strncpy(cfg.staSsid, "iPhoen của Pham", sizeof(cfg.staSsid) - 1);
+            strncpy(cfg.staSsid, "iPhone của Pham", sizeof(cfg.staSsid) - 1);
             strncpy(cfg.staPassword, "12345678@", sizeof(cfg.staPassword) - 1);
             prefs.putString("staSsid", cfg.staSsid);
             prefs.putString("staPass", cfg.staPassword);
         }
         if (cfg.savedNetworkCount <= 0) {
-            strncpy(cfg.savedNetworks[0].ssid, "iPhoen của Pham", sizeof(cfg.savedNetworks[0].ssid) - 1);
+            strncpy(cfg.savedNetworks[0].ssid, "iPhone của Pham", sizeof(cfg.savedNetworks[0].ssid) - 1);
             strncpy(cfg.savedNetworks[0].password, "12345678@", sizeof(cfg.savedNetworks[0].password) - 1);
             cfg.savedNetworkCount = 1;
             prefs.putInt("netCount", 1);
@@ -146,6 +146,21 @@ void loadConfigFromNVS(AppConfig &cfg) {
         }
         cfg.audioEnabled = true;
         prefs.putBool("audioEn", true);
+    }
+    // Schema 6: Correct default STA network SSID to "iPhone của Pham".
+    if (cfgVer < 6) {
+        if (strcmp(cfg.staSsid, "iPhoen của Pham") == 0 || cfg.staSsid[0] == '\0') {
+            strncpy(cfg.staSsid, "iPhone của Pham", sizeof(cfg.staSsid) - 1);
+            prefs.putString("staSsid", cfg.staSsid);
+        }
+        for (int i = 0; i < cfg.savedNetworkCount; i++) {
+            if (strcmp(cfg.savedNetworks[i].ssid, "iPhoen của Pham") == 0) {
+                strncpy(cfg.savedNetworks[i].ssid, "iPhone của Pham", sizeof(cfg.savedNetworks[i].ssid) - 1);
+                char keyS[8];
+                snprintf(keyS, sizeof(keyS), "netS%d", i);
+                prefs.putString(keyS, cfg.savedNetworks[i].ssid);
+            }
+        }
     }
     if (cfgVer < kCfgSchemaVer) prefs.putUInt("cfgVer", kCfgSchemaVer);
     prefs.end();
