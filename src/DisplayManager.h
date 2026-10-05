@@ -48,14 +48,16 @@ public:
     // Set road name
     void setRoadName(const char* name);
 
-    // Brightness and screen rotation controls
+    // Brightness controls
     void cycleBrightness();
-    void toggleRotation();
+    void setBrightness(uint8_t pct);
     uint8_t getBrightness() const { return m_brightness; }
-    uint8_t getRotation() const { return m_rotation; }
 
     // Popup toast notification for user feedback
     void showToast(const char* text, uint16_t color = 0xFFFF);
+
+    // Dedicated Full-Screen Settings Page
+    void renderSettings(uint8_t selectedIdx, bool isEditing);
 
     // Dedicated Full-Screen OTA Progress and Result Visualizers
     void showOtaProgress(const char* title, int progress, const char* detail = nullptr);

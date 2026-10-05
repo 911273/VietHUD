@@ -1,5 +1,6 @@
 #include "DisplayManager.h"
 #include "WiFiOTAManager.h"
+#include "SettingsManager.h"
 #include <math.h>
 
 // Curated Automotive Palette (RGB565)
@@ -96,14 +97,11 @@ void DisplayManager::cycleBrightness() {
     analogWrite(PIN_LCD_BL, m_brightness);
 }
 
-void DisplayManager::toggleRotation() {
-    m_rotation = (m_rotation == 0) ? 2 : 0;
-    m_tft->setRotation(m_rotation);
-    if (m_rotation == 0) {
-        showToast("XOAY: 0*", COLOR_SAFE);
-    } else {
-        showToast("XOAY: 180*", COLOR_WARN);
-    }
+void DisplayManager::setBrightness(uint8_t pct) {
+    if (pct < 10) pct = 10;
+    if (pct > 100) pct = 100;
+    m_brightness = (uint8_t)((pct * 255) / 100);
+    analogWrite(PIN_LCD_BL, m_brightness);
 }
 
 void DisplayManager::showToast(const char* text, uint16_t color) {
@@ -922,6 +920,142 @@ void DisplayManager::render() {
     drawToast();
 
     // Flush entire frame buffer to ST7789 via high-speed SPI
+    m_canvas->flush();
+}
+
+void DisplayManager::renderSettings(uint8_t selectedIdx, bool isEditing) {
+    if (!m_canvas) return;
+
+    m_canvas->fillScreen(COLOR_BG);
+
+    // 1. Header Bar (y: 0 to 28)
+    m_canvas->fillRect(0, 0, LCD_WIDTH, 28, 0x0842);
+    m_canvas->setFont(NULL);
+    m_canvas->setTextSize(1);
+    m_canvas->setTextColor(COLOR_CYAN);
+    m_canvas->setCursor(12, 10);
+    m_canvas->print("CAI DAT HE THONG");
+
+    // Page indicator [selectedIdx + 1 / SETTING_COUNT]
+    char idxBuf[16];
+    snprintf(idxBuf, sizeof(idxBuf), "[%d/%d]", selectedIdx + 1, SETTING_COUNT);
+    m_canvas->setTextColor(COLOR_WHITE);
+    int idxW = strlen(idxBuf) * 6;
+    m_canvas->setCursor(228 - idxW, 10);
+    m_canvas->print(idxBuf);
+
+    m_canvas->drawFastHLine(0, 28, 240, COLOR_CARD_BORDER);
+
+    // 2. Scrollable List calculation (4 items visible at a time)
+    const int VISIBLE_ITEMS = 4;
+    int topIdx = 0;
+    if (selectedIdx >= VISIBLE_ITEMS) {
+        topIdx = selectedIdx - (VISIBLE_ITEMS - 1);
+    }
+    if (topIdx + VISIBLE_ITEMS > SETTING_COUNT) {
+        topIdx = SETTING_COUNT - VISIBLE_ITEMS;
+    }
+    if (topIdx < 0) topIdx = 0;
+
+    int rowY = 32;
+    const int rowH = 41;
+    const int rowW = 218;
+    const int rowX = 8;
+
+    for (int i = 0; i < VISIBLE_ITEMS; i++) {
+        int itemIdx = topIdx + i;
+        if (itemIdx >= SETTING_COUNT) break;
+
+        bool isSel = (itemIdx == selectedIdx);
+        int curY = rowY + i * (rowH + 2);
+
+        uint16_t cardBg = isSel ? 0x10A2 : COLOR_CARD_BG;
+        uint16_t cardBorder = isSel ? (isEditing ? COLOR_WARN : COLOR_CYAN) : COLOR_CARD_BORDER;
+
+        m_canvas->fillRoundRect(rowX, curY, rowW, rowH, 6, cardBg);
+        m_canvas->drawRoundRect(rowX, curY, rowW, rowH, 6, cardBorder);
+        if (isSel) {
+            m_canvas->drawRoundRect(rowX + 1, curY + 1, rowW - 2, rowH - 2, 5, cardBorder);
+        }
+
+        // Selection pointer arrow or Edit marker
+        m_canvas->setFont(NULL);
+        m_canvas->setTextSize(1);
+        if (isSel) {
+            m_canvas->setTextColor(isEditing ? COLOR_WARN : COLOR_CYAN);
+            m_canvas->setCursor(rowX + 6, curY + 8);
+            m_canvas->print(isEditing ? "*" : ">");
+        }
+
+        // Setting Name
+        const char* name = settings.getItemName(itemIdx);
+        m_canvas->setTextColor(isSel ? COLOR_WHITE : COLOR_SILVER);
+        m_canvas->setCursor(rowX + 16, curY + 8);
+        m_canvas->print(name);
+
+        // Setting Value Badge (Bottom right of card)
+        char valBuf[32];
+        settings.getItemValueStr(itemIdx, valBuf, sizeof(valBuf));
+
+        char displayVal[40];
+        if (isSel && isEditing && !settings.isActionItem(itemIdx)) {
+            snprintf(displayVal, sizeof(displayVal), "< %s >", valBuf);
+        } else {
+            snprintf(displayVal, sizeof(displayVal), "%s", valBuf);
+        }
+
+        int valW = strlen(displayVal) * 6;
+        int badgeW = valW + 12;
+        int badgeH = 18;
+        int badgeX = rowX + rowW - badgeW - 8;
+        int badgeY = curY + 18;
+
+        uint16_t badgeBg = isSel ? (isEditing ? 0x4200 : 0x027B) : 0x18C3;
+        uint16_t badgeTextColor = isSel ? (isEditing ? COLOR_WARN : COLOR_WHITE) : COLOR_CYAN;
+
+        m_canvas->fillRoundRect(badgeX, badgeY, badgeW, badgeH, 4, badgeBg);
+        m_canvas->drawRoundRect(badgeX, badgeY, badgeW, badgeH, 4, isSel ? cardBorder : COLOR_CARD_BORDER);
+
+        m_canvas->setTextColor(badgeTextColor);
+        m_canvas->setCursor(badgeX + 6, badgeY + 5);
+        m_canvas->print(displayVal);
+    }
+
+    // Scrollbar track & thumb on far right (x = 232)
+    int trackX = 232;
+    int trackY = 32;
+    int trackH = 170;
+    m_canvas->drawFastVLine(trackX, trackY, trackH, COLOR_TRACK);
+
+    int thumbH = 34;
+    int thumbY = trackY + (selectedIdx * (trackH - thumbH)) / (SETTING_COUNT - 1);
+    m_canvas->fillRect(trackX - 1, thumbY, 3, thumbH, isEditing ? COLOR_WARN : COLOR_CYAN);
+
+    // 3. Footer Bar (y: 206 to 240)
+    m_canvas->fillRect(0, 206, LCD_WIDTH, 34, 0x0842);
+    m_canvas->drawFastHLine(0, 206, 240, COLOR_CARD_BORDER);
+
+    m_canvas->setFont(NULL);
+    m_canvas->setTextSize(1);
+
+    if (isEditing) {
+        m_canvas->setTextColor(COLOR_WARN);
+        m_canvas->setCursor(20, 212);
+        m_canvas->print("TRAI/PHAI: CHINH GIA TRI");
+
+        m_canvas->setTextColor(COLOR_SAFE);
+        m_canvas->setCursor(20, 226);
+        m_canvas->print("NUT GIUA: XAC NHAN");
+    } else {
+        m_canvas->setTextColor(COLOR_CYAN);
+        m_canvas->setCursor(18, 212);
+        m_canvas->print("TRAI/PHAI: CHON MUC");
+
+        m_canvas->setTextColor(COLOR_SILVER);
+        m_canvas->setCursor(18, 226);
+        m_canvas->print("GIUA: CHON | GIU: LUU & THOAT");
+    }
+
     m_canvas->flush();
 }
 

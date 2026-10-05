@@ -6,6 +6,7 @@
 #include "AudioManager.h"
 #include "WiFiOTAManager.h"
 #include "TrafficAlertManager.h"
+#include "SettingsManager.h"
 
 DisplayManager display;
 GPSManager gps;
@@ -16,6 +17,11 @@ int currentSpeed = 0;
 int speedLimit = 60;
 bool isDemoMode = true;
 bool isMuted = false;
+
+// Settings state
+bool inSettingsPage = false;
+bool isEditingSetting = false;
+uint8_t settingSelectedIndex = 0;
 
 // Demo scenarios: realistic Hanoi & 200km routes with real alerts
 struct DemoRoute {
@@ -176,11 +182,19 @@ void setup() {
     Serial.println("   VIETHUD LITE v3.3.0 - HANOI 200KM     ");
     Serial.println("=========================================");
 
+    // 0. Initialize Settings from NVS flash
+    settings.begin();
+    audio.setVolume(settings.data.volume);
+    display.setBrightness(settings.data.brightness);
+    isDemoMode = settings.data.demoMode;
+    speedLimit = settings.data.defaultSpeedLimit;
+
     // 1. Initialize display & hardware
     if (!display.begin()) {
         Serial.println("[ERROR] Display initialization failed!");
     } else {
         Serial.println("[OK] Display initialized successfully.");
+        display.setBrightness(settings.data.brightness);
     }
 
     // Set initial Hanoi route and limit
@@ -190,6 +204,7 @@ void setup() {
     // 2. Initialize Audio I2S
     if (audio.begin()) {
         Serial.println("[OK] Audio I2S initialized on DOUT=7, BCLK=15, LRCK=16.");
+        audio.setVolume(settings.data.volume);
         audio.playStartup();
     } else {
         Serial.println("[ERROR] Audio I2S initialization failed!");
@@ -230,95 +245,180 @@ void loop() {
     // 4. Process Button Inputs
     buttons.update();
 
-    // --- BUTTON VOL- (GPIO 39, Nút bên trái) ---
-    // MẶC ĐỊNH 1 CHẠM: GIẢM ÂM LƯỢNG
     ButtonEvent evLeft = buttons.getLeftEvent();
-    if (evLeft == BTN_SHORT_CLICK) {
-        uint8_t curVol = audio.volumeDown(15);
-        if (curVol == 0) {
-            isMuted = true;
-            display.showToast("MUTE", 0xF800);
-        } else {
+    ButtonEvent evRight = buttons.getRightEvent();
+    ButtonEvent evCenter = buttons.getCenterEvent();
+
+    if (inSettingsPage) {
+        // ==========================================
+        // CHE DO CAI DAT (SETTINGS MODE)
+        // ==========================================
+        if (evCenter == BTN_LONG_PRESS) {
+            // Nhan giu nut giua: Luu va Thoat ve man hinh HUD
+            inSettingsPage = false;
+            isEditingSetting = false;
+            settings.save();
+            audio.setVolume(settings.data.volume);
+            display.setBrightness(settings.data.brightness);
+            audio.playModeSwitch();
+            display.showToast("DA LUU CAI DAT!", 0x07E0);
+            Serial.println("[SETTINGS] Da luu va thoat ve man hinh HUD.");
+        } else if (evCenter == BTN_SHORT_CLICK) {
+            // Nut giua: Xac nhan / Chon
+            if (settingSelectedIndex == SETTING_CHECK_OTA_NOW) {
+                inSettingsPage = false;
+                isEditingSetting = false;
+                settings.save();
+                wifiOta.toggleWiFi();
+                audio.playClick();
+                Serial.println("[SETTINGS] Chuyen nhanh sang man hinh kiem tra OTA.");
+            } else if (settingSelectedIndex == SETTING_RESET_DEFAULTS) {
+                settings.resetDefaults();
+                settings.save();
+                audio.setVolume(settings.data.volume);
+                display.setBrightness(settings.data.brightness);
+                audio.playClick();
+                display.showToast("DA KHOI PHUC!", 0x07E0);
+                Serial.println("[SETTINGS] Da khoi phuc cai dat goc.");
+            } else if (settingSelectedIndex == SETTING_SYSTEM_INFO) {
+                audio.playClick();
+            } else {
+                // Chuyen doi giua che do Chon muc va Chinh sua gia tri
+                isEditingSetting = !isEditingSetting;
+                audio.playClick();
+            }
+        } else if (evLeft == BTN_SHORT_CLICK) {
+            if (isEditingSetting) {
+                settings.adjustValue(settingSelectedIndex, false);
+                if (settingSelectedIndex == SETTING_VOLUME) {
+                    audio.setVolume(settings.data.volume);
+                } else if (settingSelectedIndex == SETTING_BRIGHTNESS) {
+                    display.setBrightness(settings.data.brightness);
+                }
+                audio.playClick();
+            } else {
+                if (settingSelectedIndex == 0) {
+                    settingSelectedIndex = SETTING_COUNT - 1;
+                } else {
+                    settingSelectedIndex--;
+                }
+                audio.playClick();
+            }
+        } else if (evRight == BTN_SHORT_CLICK) {
+            if (isEditingSetting) {
+                settings.adjustValue(settingSelectedIndex, true);
+                if (settingSelectedIndex == SETTING_VOLUME) {
+                    audio.setVolume(settings.data.volume);
+                } else if (settingSelectedIndex == SETTING_BRIGHTNESS) {
+                    display.setBrightness(settings.data.brightness);
+                }
+                audio.playClick();
+            } else {
+                settingSelectedIndex = (settingSelectedIndex + 1) % SETTING_COUNT;
+                audio.playClick();
+            }
+        }
+    } else {
+        // ==========================================
+        // CHE DO LAI XE BINH THUONG (HUD MODE)
+        // ==========================================
+
+        // --- BUTTON BOOT (GPIO 0, Nut o giua) ---
+        if (evCenter == BTN_LONG_PRESS) {
+            // BAM GIU NUT GIUA: VAO TRANG CAI DAT (SETTINGS)
+            inSettingsPage = true;
+            isEditingSetting = false;
+            audio.playModeSwitch();
+            Serial.println("[BUTTON CENTER LONG] Mo trang Cai dat he thong.");
+        } else if (evCenter == BTN_DOUBLE_CLICK) {
+            bool wifiState = wifiOta.toggleWiFi();
+            audio.playModeSwitch();
+            Serial.printf("[BUTTON CENTER DOUBLE] WiFi toggled: %s\n", wifiState ? "ON (OTA)" : "OFF (HUD)");
+        } else if (evCenter == BTN_SHORT_CLICK) {
+            if (wifiOta.isEnabled()) {
+                wifiOta.toggleWiFi();
+                audio.playClick();
+                Serial.println("[BUTTON] Thoat trang WiFi & OTA -> Quay lai HUD.");
+            } else {
+                isDemoMode = !isDemoMode;
+                audio.playModeSwitch();
+                if (isDemoMode) {
+                    display.showToast("DEMO", 0xFD20);
+                } else {
+                    display.showToast("GPS", 0x07FF);
+                    display.setRoadName("GPS LIVE");
+                }
+                Serial.printf("[BUTTON] Mode switched: %s\n", isDemoMode ? "DEMO" : "LIVE GPS");
+            }
+        }
+
+        // --- BUTTON VOL- (GPIO 39, Nut ben trai) ---
+        // MAC DINH 1 CHAM: GIAM AM LUONG
+        if (evLeft == BTN_SHORT_CLICK) {
+            uint8_t curVol = audio.volumeDown(15);
+            settings.data.volume = curVol;
+            settings.save();
+            if (curVol == 0) {
+                isMuted = true;
+                display.showToast("MUTE", 0xF800);
+            } else {
+                isMuted = false;
+                audio.playClick();
+                char toast[32];
+                snprintf(toast, sizeof(toast), "AM LUONG: %d%%", curVol);
+                display.showToast(toast, 0x07E0);
+            }
+            Serial.printf("[BUTTON LEFT] Giam am luong: %d%%\n", curVol);
+        } else if (evLeft == BTN_LONG_PRESS) {
+            isMuted = !isMuted;
+            if (isMuted) {
+                audio.setVolume(0);
+                display.showToast("MUTE", 0xF800);
+            } else {
+                audio.setVolume(settings.data.volume);
+                audio.playClick();
+                char toast[32];
+                snprintf(toast, sizeof(toast), "AM LUONG: %d%%", settings.data.volume);
+                display.showToast(toast, 0x07E0);
+            }
+            Serial.printf("[BUTTON LEFT LONG] Mute: %s\n", isMuted ? "MUTED" : "UNMUTED");
+        } else if (evLeft == BTN_DOUBLE_CLICK) {
+            speedLimit -= 10;
+            if (speedLimit < 30) speedLimit = 30;
+            audio.playClick();
+            char toast[32];
+            snprintf(toast, sizeof(toast), "%d km/h", speedLimit);
+            display.showToast(toast, 0x07FF);
+            Serial.printf("[BUTTON LEFT DOUBLE] Speed limit: %d km/h\n", speedLimit);
+        }
+
+        // --- BUTTON VOL+ (GPIO 40, Nut ben phai) ---
+        // MAC DINH 1 CHAM: TANG AM LUONG
+        if (evRight == BTN_SHORT_CLICK) {
+            uint8_t curVol = audio.volumeUp(15);
+            settings.data.volume = curVol;
+            settings.save();
             isMuted = false;
             audio.playClick();
             char toast[32];
-            snprintf(toast, sizeof(toast), "ÂM LƯỢNG: %d%%", curVol);
+            snprintf(toast, sizeof(toast), "AM LUONG: %d%%", curVol);
             display.showToast(toast, 0x07E0);
-        }
-        Serial.printf("[BUTTON LEFT] Giam am luong: %d%%\n", curVol);
-    } else if (evLeft == BTN_LONG_PRESS) {
-        isMuted = !isMuted;
-        if (isMuted) {
-            audio.setVolume(0);
-            display.showToast("MUTE", 0xF800);
-        } else {
-            audio.setVolume(85);
+            Serial.printf("[BUTTON RIGHT] Tang am luong: %d%%\n", curVol);
+        } else if (evRight == BTN_LONG_PRESS) {
+            display.cycleBrightness();
+            settings.data.brightness = (display.getBrightness() * 100) / 255;
+            settings.save();
             audio.playClick();
-            display.showToast("ÂM LƯỢNG: 85%", 0x07E0);
-        }
-        Serial.printf("[BUTTON LEFT] Mute toggled: %s\n", isMuted ? "MUTED" : "UNMUTED");
-    } else if (evLeft == BTN_DOUBLE_CLICK) {
-        speedLimit -= 10;
-        if (speedLimit < 30) speedLimit = 30;
-        audio.playClick();
-        char toast[32];
-        snprintf(toast, sizeof(toast), "%d km/h", speedLimit);
-        display.showToast(toast, 0x07FF);
-        Serial.printf("[BUTTON LEFT DOUBLE] Speed limit: %d km/h\n", speedLimit);
-    }
-
-    // --- BUTTON VOL+ (GPIO 40, Nút bên phải) ---
-    // MẶC ĐỊNH 1 CHẠM: TĂNG ÂM LƯỢNG
-    ButtonEvent evRight = buttons.getRightEvent();
-    if (evRight == BTN_SHORT_CLICK) {
-        uint8_t curVol = audio.volumeUp(15);
-        isMuted = false;
-        audio.playClick();
-        char toast[32];
-        snprintf(toast, sizeof(toast), "ÂM LƯỢNG: %d%%", curVol);
-        display.showToast(toast, 0x07E0);
-        Serial.printf("[BUTTON RIGHT] Tang am luong: %d%%\n", curVol);
-    } else if (evRight == BTN_LONG_PRESS) {
-        display.cycleBrightness();
-        audio.playClick();
-        Serial.println("[BUTTON RIGHT] Screen brightness cycled.");
-    } else if (evRight == BTN_DOUBLE_CLICK) {
-        speedLimit += 10;
-        if (speedLimit > 120) speedLimit = 120;
-        audio.playClick();
-        char toast[32];
-        snprintf(toast, sizeof(toast), "%d km/h", speedLimit);
-        display.showToast(toast, 0x07FF);
-        Serial.printf("[BUTTON RIGHT DOUBLE] Speed limit: %d km/h\n", speedLimit);
-    }
-
-    // --- BUTTON BOOT (GPIO 0, Middle button) ---
-    ButtonEvent evCenter = buttons.getCenterEvent();
-    if (evCenter == BTN_SHORT_CLICK) {
-        if (wifiOta.isEnabled()) {
-            // While on WiFi & OTA page, single click immediately exits and returns to HUD!
-            wifiOta.toggleWiFi();
+            Serial.println("[BUTTON RIGHT LONG] Screen brightness cycled.");
+        } else if (evRight == BTN_DOUBLE_CLICK) {
+            speedLimit += 10;
+            if (speedLimit > 120) speedLimit = 120;
             audio.playClick();
-            Serial.println("[BUTTON] Thoat trang WiFi & OTA -> Quay lai HUD.");
-        } else {
-            isDemoMode = !isDemoMode;
-            audio.playModeSwitch();
-            if (isDemoMode) {
-                display.showToast("DEMO", 0xFD20);
-            } else {
-                display.showToast("GPS", 0x07FF);
-                display.setRoadName("GPS LIVE");
-            }
-            Serial.printf("[BUTTON] Mode switched: %s\n", isDemoMode ? "DEMO" : "LIVE GPS");
+            char toast[32];
+            snprintf(toast, sizeof(toast), "%d km/h", speedLimit);
+            display.showToast(toast, 0x07FF);
+            Serial.printf("[BUTTON RIGHT DOUBLE] Speed limit: %d km/h\n", speedLimit);
         }
-    } else if (evCenter == BTN_DOUBLE_CLICK) {
-        bool wifiState = wifiOta.toggleWiFi();
-        audio.playModeSwitch();
-        Serial.printf("[BUTTON] WiFi toggled: %s\n", wifiState ? "ON (CHUYEN TRANG KET NOI & OTA)" : "OFF (QUAY VE HUD)");
-    } else if (evCenter == BTN_LONG_PRESS) {
-        display.toggleRotation();
-        audio.playModeSwitch();
-        Serial.println("[BUTTON] Screen rotation toggled 180 degrees.");
     }
 
     // 5. Update Speed, Route & Traffic Alerts Data (runs in background even during WiFi)
@@ -396,7 +496,7 @@ void loop() {
                 currentAlertType = alert.type;
                 currentAlertDist = alert.distanceM;
 
-                if (!isMuted && !wifiOta.isEnabled() && alert.distanceM <= 350 && (now - lastSoundAlertTime >= 12000)) {
+                if (!isMuted && !wifiOta.isEnabled() && !inSettingsPage && settings.data.signSound && alert.distanceM <= settings.data.alertDistance && (now - lastSoundAlertTime >= 12000)) {
                     lastSoundAlertTime = now;
                     if (alert.type == ALERT_SPEED_CAMERA || alert.type == ALERT_CAMERA) {
                         audio.playAlertCamera();
@@ -414,8 +514,9 @@ void loop() {
         }
     }
 
-    // 6. Overspeed Audio Alert (only when not on WiFi page and unmuted)
-    if (!isMuted && !wifiOta.isEnabled() && speedLimit > 0 && currentSpeed > speedLimit) {
+    // 6. Overspeed Audio Alert (only when not on WiFi or Settings page, and unmuted)
+    int overspeedThresh = speedLimit + settings.data.overspeedTolerance;
+    if (!isMuted && !wifiOta.isEnabled() && !inSettingsPage && settings.data.overspeedAlert && speedLimit > 0 && currentSpeed > overspeedThresh) {
         if (now - lastOverspeedAlertTime >= 1400) {
             lastOverspeedAlertTime = now;
             audio.playOverspeed();
@@ -426,35 +527,39 @@ void loop() {
     if (now - lastRenderTime >= 25) {
         lastRenderTime = now;
 
-        // Keep DisplayManager synchronized on WiFi & OTA state
-        display.updateWiFiState(
-            wifiOta.isEnabled(),
-            wifiOta.getWorkflowState(),
-            wifiOta.getWorkflowMessage(),
-            wifiOta.getSSID().c_str(),
-            wifiOta.getIPString(),
-            wifiOta.getRSSI(),
-            wifiOta.getProgress(),
-            wifiOta.getCountdownSec()
-        );
+        if (inSettingsPage) {
+            display.renderSettings(settingSelectedIndex, isEditingSetting);
+        } else {
+            // Keep DisplayManager synchronized on WiFi & OTA state
+            display.updateWiFiState(
+                wifiOta.isEnabled(),
+                wifiOta.getWorkflowState(),
+                wifiOta.getWorkflowMessage(),
+                wifiOta.getSSID().c_str(),
+                wifiOta.getIPString(),
+                wifiOta.getRSSI(),
+                wifiOta.getProgress(),
+                wifiOta.getCountdownSec()
+            );
 
-        display.updateData(
-            currentSpeed,
-            speedLimit,
-            gps.getSatellites(),
-            gps.hasFix(),
-            isDemoMode,
-            isMuted,
-            nullptr,
-            wifiOta.isEnabled(),
-            wifiOta.isConnected(),
-            wifiOta.getIPString(),
-            wifiOta.isUpdating(),
-            wifiOta.getProgress(),
-            currentAlertActive,
-            currentAlertType,
-            currentAlertDist
-        );
-        display.render();
+            display.updateData(
+                currentSpeed,
+                speedLimit,
+                gps.getSatellites(),
+                gps.hasFix(),
+                isDemoMode,
+                isMuted,
+                nullptr,
+                wifiOta.isEnabled(),
+                wifiOta.isConnected(),
+                wifiOta.getIPString(),
+                wifiOta.isUpdating(),
+                wifiOta.getProgress(),
+                currentAlertActive,
+                currentAlertType,
+                currentAlertDist
+            );
+            display.render();
+        }
     }
 }
