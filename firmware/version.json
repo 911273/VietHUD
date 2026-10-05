@@ -2,8 +2,10 @@
   "version": "3.4.0",
   "build": "20261005_v3",
   "url_pi4": "http://192.168.1.65/viethud/firmware/3.4.0/firmware.bin",
+  "url_pi4_tailscale": "http://100.107.34.92/viethud/firmware/3.4.0/firmware.bin",
   "url_pi4_mdns": "http://homebridge.local/viethud/firmware/3.4.0/firmware.bin",
   "url_github": "https://raw.githubusercontent.com/911273/VietHUD/main/firmware/3.4.0/firmware.bin",
   "alerts_db": "http://192.168.1.65/viethud/hanoi_alerts.bin",
-  "notes": "VietHUD 3.4.0: Bien bao toc do sieu to (132px/108px), mac dinh 1-cham nut trai/phai tang giam am luong"
+  "alerts_db_tailscale": "http://100.107.34.92/viethud/hanoi_alerts.bin",
+  "notes": "VietHUD 3.4.0: Bien bao toc do sieu to (132px/108px), mac dinh 1-cham nut trai/phai tang giam am luong, ho tro cap nhat qua ca LAN (192.168.1.65) va Tailscale (100.107.34.92)"
 }
