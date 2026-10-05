@@ -1,9 +1,9 @@
 {
   "version": "3.3.0",
-  "build": "20261005",
+  "build": "20261005_v2",
   "url_pi4": "http://192.168.1.65/viethud/firmware/3.3.0/firmware.bin",
   "url_pi4_mdns": "http://homebridge.local/viethud/firmware/3.3.0/firmware.bin",
   "url_github": "https://raw.githubusercontent.com/911273/VietHUD/main/firmware/3.3.0/firmware.bin",
   "alerts_db": "http://192.168.1.65/viethud/hanoi_alerts.bin",
-  "notes": "VietHUD 3.3.0: Top bar marquee road name, Hanoi 200km offline traffic alerts (40,386 alerts: cameras, red lights, resident areas, toll booths), cockpit speed gauge, WiFi multi-AP and OTA"
+  "notes": "VietHUD 3.3.0: Visual traffic signs/icons (R.420 resident, P.125 no overtaking, speed cam, traffic light, toll BOT), crisp top bar road name font with glitch-free marquee, 40,386 offline alerts in Hanoi and 200km radius"
 }
