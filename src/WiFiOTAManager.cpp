@@ -1,4 +1,9 @@
 #include "WiFiOTAManager.h"
+#include "DisplayManager.h"
+#include "AudioManager.h"
+
+extern DisplayManager display;
+extern AudioManager audio;
 
 WiFiOTAManager wifiOta;
 
@@ -93,6 +98,7 @@ void WiFiOTAManager::startArduinoOTA() {
         m_isUpdating = true;
         m_progress = 0;
         snprintf(m_workflowMsg, sizeof(m_workflowMsg), "DANG NAP ARDUINO OTA...");
+        display.showOtaProgress("Arduino OTA", 0, "Dang khoi tao ket noi...");
         Serial.println("[OTA] Bat dau qua trinh cap nhat ArduinoOTA...");
     });
 
@@ -100,12 +106,25 @@ void WiFiOTAManager::startArduinoOTA() {
         m_workflowState = OTA_STEP_REBOOTING;
         m_isUpdating = false;
         m_progress = 100;
-        snprintf(m_workflowMsg, sizeof(m_workflowMsg), "CAP NHAT XONG! REBOOT...");
         Serial.println("[OTA] Cap nhat thanh cong! Khoi dong lai...");
+        audio.playClick();
+        for (int s = 3; s >= 1; s--) {
+            display.showOtaSuccess(FW_VERSION, s);
+            audio.playClick();
+            delay(1000);
+        }
+        display.showOtaSuccess(FW_VERSION, 0);
     });
 
     ArduinoOTA.onProgress([this](unsigned int progress, unsigned int total) {
-        m_progress = (progress * 100) / total;
+        if (total > 0) {
+            m_progress = (progress * 100) / total;
+        }
+        static uint32_t lastOtaDisp = 0;
+        if (millis() - lastOtaDisp >= 100) {
+            lastOtaDisp = millis();
+            display.showOtaProgress("Arduino OTA", m_progress, "Dang nap qua LAN IDE...");
+        }
     });
 
     ArduinoOTA.onError([this](ota_error_t error) {
@@ -113,6 +132,9 @@ void WiFiOTAManager::startArduinoOTA() {
         m_stateChangeTime = millis();
         m_autoReturnDurationMs = 8000;
         snprintf(m_workflowMsg, sizeof(m_workflowMsg), "LOI ARDUINO OTA (%u)", error);
+        char errBuf[32];
+        snprintf(errBuf, sizeof(errBuf), "Loi ArduinoOTA: %u", error);
+        display.showOtaFailure(errBuf);
         Serial.printf("[OTA ERROR] Loi ma: %u\n", error);
     });
 
@@ -136,7 +158,7 @@ void WiFiOTAManager::setupWebServer() {
             m_workflowState = OTA_STEP_DOWNLOADING;
             m_isUpdating = true;
             m_progress = 0;
-            snprintf(m_workflowMsg, sizeof(m_workflowMsg), "DANG NAP WEB OTA...");
+            display.showOtaProgress("Web OTA", 0, upload.filename.c_str());
             Serial.printf("[WEB OTA] Bat dau nap file: %s\n", upload.filename.c_str());
             if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
                 Update.printError(Serial);
@@ -147,19 +169,30 @@ void WiFiOTAManager::setupWebServer() {
             }
             if (upload.totalSize > 0) {
                 m_progress = (upload.currentSize * 100) / upload.totalSize;
+                static uint32_t lastWebDisp = 0;
+                if (millis() - lastWebDisp >= 100) {
+                    lastWebDisp = millis();
+                    display.showOtaProgress("Web OTA", m_progress, upload.filename.c_str());
+                }
             }
         } else if (upload.status == UPLOAD_FILE_END) {
             if (Update.end(true)) {
                 m_progress = 100;
                 m_workflowState = OTA_STEP_REBOOTING;
-                snprintf(m_workflowMsg, sizeof(m_workflowMsg), "NAP XONG! REBOOT...");
                 Serial.printf("[WEB OTA] Hoan tat! Kich thuoc: %u bytes\n", upload.totalSize);
+                audio.playClick();
+                for (int s = 3; s >= 1; s--) {
+                    display.showOtaSuccess(FW_VERSION, s);
+                    audio.playClick();
+                    delay(1000);
+                }
+                display.showOtaSuccess(FW_VERSION, 0);
             } else {
                 Update.printError(Serial);
                 m_workflowState = OTA_STEP_FAILED;
                 m_stateChangeTime = millis();
                 m_autoReturnDurationMs = 8000;
-                snprintf(m_workflowMsg, sizeof(m_workflowMsg), "LOI GHI FLASH WEB OTA");
+                display.showOtaFailure("Loi ghi Flash Web OTA");
             }
             m_isUpdating = false;
         }
@@ -258,14 +291,32 @@ void WiFiOTAManager::executeHttpCheck() {
         m_workflowState = OTA_STEP_DOWNLOADING;
         m_stateChangeTime = millis();
         m_isUpdating = true;
-        m_progress = 5;
-        snprintf(m_workflowMsg, sizeof(m_workflowMsg), "DANG TAI FIRMWARE %s...", remoteVer.c_str());
-        Serial.printf("[OTA] Tim thay firmware moi: %s tai %s\n", remoteVer.c_str(), targetUrl.c_str());
+        m_progress = 0;
+
+        char title[48];
+        snprintf(title, sizeof(title), "Firmware VietHUD v%s", remoteVer.c_str());
+
+        display.showOtaProgress(
+            title,
+            0,
+            connectedViaTailscale ? "Nguon: Pi 4 Tailscale" : "Nguon: Pi 4 LAN"
+        );
 
         httpUpdate.setLedPin(-1);
-        httpUpdate.onProgress([this](int current, int total) {
+
+        uint32_t lastDispMs = 0;
+        httpUpdate.onProgress([this, &title, connectedViaTailscale, &lastDispMs](int current, int total) {
             if (total > 0) {
                 m_progress = (current * 100) / total;
+            }
+            uint32_t now = millis();
+            if (now - lastDispMs >= 80) {
+                lastDispMs = now;
+                display.showOtaProgress(
+                    title,
+                    m_progress,
+                    connectedViaTailscale ? "Nguon: Pi 4 Tailscale (100.107.34.92)" : "Nguon: Pi 4 LAN (192.168.1.65)"
+                );
             }
         });
 
@@ -274,6 +325,7 @@ void WiFiOTAManager::executeHttpCheck() {
 
         if (ret != HTTP_UPDATE_OK && backupUrl.length() > 0) {
             Serial.printf("[OTA] Thu lai voi backup URL: %s\n", backupUrl.c_str());
+            display.showOtaProgress(title, m_progress, "Dang thu lai qua URL du phong...");
             ret = httpUpdate.update(client, backupUrl);
         }
 
@@ -281,14 +333,26 @@ void WiFiOTAManager::executeHttpCheck() {
 
         if (ret == HTTP_UPDATE_OK) {
             m_workflowState = OTA_STEP_REBOOTING;
-            snprintf(m_workflowMsg, sizeof(m_workflowMsg), "CAP NHAT XONG! REBOOT...");
-            delay(1200);
+            Serial.println("[OTA] Cap nhat thanh cong!");
+
+            // BEEP AND COUNTDOWN 3..2..1 WITH BEAUTIFUL SUCCESS SCREEN
+            audio.playClick();
+            for (int s = 3; s >= 1; s--) {
+                display.showOtaSuccess(remoteVer.c_str(), s);
+                audio.playClick();
+                delay(1000);
+            }
+            display.showOtaSuccess(remoteVer.c_str(), 0);
+            delay(400);
             ESP.restart();
         } else {
             m_workflowState = OTA_STEP_FAILED;
             m_stateChangeTime = millis();
             m_autoReturnDurationMs = 8000;
-            snprintf(m_workflowMsg, sizeof(m_workflowMsg), "LOI HTTP UPDATE (%d)", httpUpdate.getLastError());
+            char errBuf[48];
+            snprintf(errBuf, sizeof(errBuf), "Loi HTTP: %d", httpUpdate.getLastError());
+            display.showOtaFailure(errBuf);
+            delay(2500);
         }
     } else if (remoteVer.length() > 0) {
         // Up to date!

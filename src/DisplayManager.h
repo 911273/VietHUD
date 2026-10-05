@@ -57,6 +57,11 @@ public:
     // Popup toast notification for user feedback
     void showToast(const char* text, uint16_t color = 0xFFFF);
 
+    // Dedicated Full-Screen OTA Progress and Result Visualizers
+    void showOtaProgress(const char* title, int progress, const char* detail = nullptr);
+    void showOtaSuccess(const char* version, int countdownSec = 3);
+    void showOtaFailure(const char* reason);
+
 private:
     Arduino_DataBus *m_bus;
     Arduino_GFX *m_tft;

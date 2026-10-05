@@ -924,3 +924,216 @@ void DisplayManager::render() {
     // Flush entire frame buffer to ST7789 via high-speed SPI
     m_canvas->flush();
 }
+
+void DisplayManager::showOtaProgress(const char* title, int progress, const char* detail) {
+    if (!m_canvas) return;
+
+    if (progress < 0) progress = 0;
+    if (progress > 100) progress = 100;
+
+    m_canvas->fillScreen(COLOR_BG);
+
+    // Header bar (y: 0 to 32)
+    m_canvas->fillRect(0, 0, LCD_WIDTH, 32, 0x0842);
+    m_canvas->setFont(NULL);
+    m_canvas->setTextSize(2);
+    m_canvas->setTextColor(COLOR_CYAN);
+    m_canvas->setCursor(34, 8);
+    m_canvas->print("DANG CAP NHAT");
+    m_canvas->drawFastHLine(0, 32, 240, COLOR_CARD_BORDER);
+
+    // Main Card (y: 42 to 226)
+    int boxX = 10;
+    int boxY = 42;
+    int boxW = 220;
+    int boxH = 186;
+    m_canvas->fillRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_CARD_BG);
+    m_canvas->drawRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_CYAN);
+
+    // Title / Firmware name
+    m_canvas->setFont(NULL);
+    m_canvas->setTextSize(1);
+    m_canvas->setTextColor(COLOR_WHITE);
+    int titleW = (title ? strlen(title) : 0) * 6;
+    m_canvas->setCursor(120 - titleW / 2, boxY + 14);
+    if (title) m_canvas->print(title);
+
+    // Large Percentage Digits (FreeSansBold24pt7b)
+    char pctStr[12];
+    snprintf(pctStr, sizeof(pctStr), "%d%%", progress);
+    m_canvas->setFont(&FreeSansBold24pt7b);
+    m_canvas->setTextColor(COLOR_SAFE);
+
+    int16_t x1, y1;
+    uint16_t w, h;
+    m_canvas->getTextBounds(pctStr, 0, 0, &x1, &y1, &w, &h);
+    m_canvas->setCursor(120 - (w / 2) - x1, boxY + 70);
+    m_canvas->print(pctStr);
+
+    // Progress Bar (Sleek, glowing, with track)
+    int barX = boxX + 16;
+    int barY = boxY + 92;
+    int barW = boxW - 32;
+    int barH = 14;
+
+    m_canvas->fillRoundRect(barX, barY, barW, barH, 4, COLOR_TRACK);
+    m_canvas->drawRoundRect(barX, barY, barW, barH, 4, COLOR_CARD_BORDER);
+
+    int innerW = barW - 4;
+    int fillW = (progress * innerW) / 100;
+    if (fillW > 0) {
+        m_canvas->fillRoundRect(barX + 2, barY + 2, fillW, barH - 4, 3, COLOR_SAFE);
+    }
+
+    // Detail text / Source
+    m_canvas->setFont(NULL);
+    m_canvas->setTextSize(1);
+    if (detail && detail[0] != '\0') {
+        m_canvas->setTextColor(COLOR_ROAD_TEXT);
+        int detW = strlen(detail) * 6;
+        m_canvas->setCursor(120 - detW / 2, barY + 22);
+        m_canvas->print(detail);
+    }
+
+    // Warning
+    m_canvas->setTextColor(COLOR_ALERT);
+    m_canvas->setCursor(34, boxY + 142);
+    m_canvas->print("! KHONG DUOC TAT NGUON !");
+
+    m_canvas->setTextColor(COLOR_SILVER);
+    m_canvas->setCursor(44, boxY + 160);
+    m_canvas->print("Dang ghi bo nho Flash...");
+
+    m_canvas->flush();
+}
+
+void DisplayManager::showOtaSuccess(const char* version, int countdownSec) {
+    if (!m_canvas) return;
+
+    m_canvas->fillScreen(COLOR_BG);
+
+    // Header bar (y: 0 to 32)
+    m_canvas->fillRect(0, 0, LCD_WIDTH, 32, 0x0320); // Dark emerald green header
+    m_canvas->setFont(NULL);
+    m_canvas->setTextSize(2);
+    m_canvas->setTextColor(COLOR_SAFE);
+    m_canvas->setCursor(28, 8);
+    m_canvas->print("CAP NHAT XONG !");
+    m_canvas->drawFastHLine(0, 32, 240, COLOR_SAFE);
+
+    // Main Card
+    int boxX = 10;
+    int boxY = 42;
+    int boxW = 220;
+    int boxH = 186;
+    m_canvas->fillRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_CARD_BG);
+    m_canvas->drawRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_SAFE);
+    m_canvas->drawRoundRect(boxX + 1, boxY + 1, boxW - 2, boxH - 2, 7, COLOR_SAFE);
+
+    // Glowing Green Circle with Checkmark Icon
+    int iconX = 120;
+    int iconY = boxY + 42;
+    m_canvas->fillCircle(iconX, iconY, 26, COLOR_SAFE);
+    m_canvas->fillCircle(iconX, iconY, 22, COLOR_CARD_BG);
+
+    // Bold Checkmark lines
+    for (int t = -1; t <= 1; t++) {
+        m_canvas->drawLine(iconX - 11, iconY + t, iconX - 3, iconY + 8 + t, COLOR_SAFE);
+        m_canvas->drawLine(iconX - 3, iconY + 8 + t, iconX + 12, iconY - 8 + t, COLOR_SAFE);
+    }
+
+    // Success Title
+    m_canvas->setFont(NULL);
+    m_canvas->setTextSize(2);
+    m_canvas->setTextColor(COLOR_SAFE);
+    int titleW = 11 * 12;
+    m_canvas->setCursor(120 - titleW / 2, boxY + 80);
+    m_canvas->print("THANH CONG!");
+
+    // New version string
+    m_canvas->setTextSize(1);
+    m_canvas->setTextColor(COLOR_WHITE);
+    char verBuf[48];
+    snprintf(verBuf, sizeof(verBuf), "Phien ban moi: v%s", (version ? version : FW_VERSION));
+    int verW = strlen(verBuf) * 6;
+    m_canvas->setCursor(120 - verW / 2, boxY + 110);
+    m_canvas->print(verBuf);
+
+    // Subtext
+    m_canvas->setTextColor(COLOR_CYAN);
+    m_canvas->setCursor(34, boxY + 128);
+    m_canvas->print("Da cap nhat tinh nang moi");
+
+    // Countdown before reboot
+    char countBuf[48];
+    if (countdownSec > 0) {
+        snprintf(countBuf, sizeof(countBuf), "Khoi dong lai sau: %ds...", countdownSec);
+    } else {
+        snprintf(countBuf, sizeof(countBuf), "Dang khoi dong lai...");
+    }
+    m_canvas->setTextColor(COLOR_WARN);
+    int cW = strlen(countBuf) * 6;
+    m_canvas->setCursor(120 - cW / 2, boxY + 154);
+    m_canvas->print(countBuf);
+
+    m_canvas->flush();
+}
+
+void DisplayManager::showOtaFailure(const char* reason) {
+    if (!m_canvas) return;
+
+    m_canvas->fillScreen(COLOR_BG);
+
+    // Header bar
+    m_canvas->fillRect(0, 0, LCD_WIDTH, 32, 0x6000); // Dark red header
+    m_canvas->setFont(NULL);
+    m_canvas->setTextSize(2);
+    m_canvas->setTextColor(COLOR_ALERT);
+    m_canvas->setCursor(24, 8);
+    m_canvas->print("CAP NHAT LOI !");
+    m_canvas->drawFastHLine(0, 32, 240, COLOR_ALERT);
+
+    // Main Card
+    int boxX = 10;
+    int boxY = 42;
+    int boxW = 220;
+    int boxH = 186;
+    m_canvas->fillRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_CARD_BG);
+    m_canvas->drawRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_ALERT);
+
+    // Red X icon
+    int iconX = 120;
+    int iconY = boxY + 42;
+    m_canvas->fillCircle(iconX, iconY, 26, COLOR_ALERT);
+    m_canvas->fillCircle(iconX, iconY, 22, COLOR_CARD_BG);
+
+    for (int t = -1; t <= 1; t++) {
+        m_canvas->drawLine(iconX - 9 + t, iconY - 9, iconX + 9 + t, iconY + 9, COLOR_ALERT);
+        m_canvas->drawLine(iconX - 9 + t, iconY + 9, iconX + 9 + t, iconY - 9, COLOR_ALERT);
+    }
+
+    m_canvas->setFont(NULL);
+    m_canvas->setTextSize(2);
+    m_canvas->setTextColor(COLOR_ALERT);
+    int titleW = 8 * 12;
+    m_canvas->setCursor(120 - titleW / 2, boxY + 80);
+    m_canvas->print("THAT BAI");
+
+    m_canvas->setTextSize(1);
+    m_canvas->setTextColor(COLOR_WHITE);
+    if (reason && reason[0] != '\0') {
+        int rW = strlen(reason) * 6;
+        m_canvas->setCursor(120 - rW / 2, boxY + 112);
+        m_canvas->print(reason);
+    }
+
+    m_canvas->setTextColor(COLOR_SILVER);
+    m_canvas->setCursor(34, boxY + 134);
+    m_canvas->print("Kiem tra lai Pi 4 / WiFi");
+
+    m_canvas->setTextColor(COLOR_WARN);
+    m_canvas->setCursor(44, boxY + 158);
+    m_canvas->print("Tu dong quay lai HUD...");
+
+    m_canvas->flush();
+}
