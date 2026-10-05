@@ -21,13 +21,16 @@ DisplayManager::DisplayManager()
     : m_bus(nullptr), m_tft(nullptr), m_canvas(nullptr),
       m_speed(0), m_speedLimit(60), m_sats(0), m_fix(false), m_demo(true), m_muted(false),
       m_marqueeStartTime(0),
-      m_wifiEnabled(false), m_wifiConnected(false), m_isOtaUpdating(false), m_otaProgress(0),
+      m_wifiEnabled(false), m_wifiConnected(false),
+      m_otaWorkflowState(0), m_wifiRssi(0), m_otaProgress(0), m_otaCountdownSec(0),
       m_alertActive(false), m_alertType(0), m_alertDistance(0),
       m_brightness(255), m_rotation(0),
       m_lastFlashTime(0), m_flashState(false),
       m_toastColor(COLOR_WHITE), m_toastExpiry(0) {
     m_toastText[0] = '\0';
     m_wifiIp[0] = '\0';
+    m_wifiSsid[0] = '\0';
+    m_otaWorkflowMsg[0] = '\0';
     strncpy(m_roadName, "DUONG CAO TOC NOI BAI - LAO CAI", sizeof(m_roadName) - 1);
     m_roadName[sizeof(m_roadName) - 1] = '\0';
 }
@@ -145,8 +148,6 @@ void DisplayManager::updateData(
 
     m_wifiEnabled = wifiEnabled;
     m_wifiConnected = wifiConnected;
-    m_isOtaUpdating = isOtaUpdating;
-    m_otaProgress = otaProgress;
 
     m_alertActive = alertActive;
     m_alertType = alertType;
@@ -159,6 +160,44 @@ void DisplayManager::updateData(
 
     if (roadName && roadName[0] != '\0') {
         setRoadName(roadName);
+    }
+}
+
+void DisplayManager::updateWiFiState(
+    bool enabled,
+    uint8_t workflowState,
+    const char* workflowMsg,
+    const char* ssid,
+    const char* ipStr,
+    int rssi,
+    int progress,
+    int countdownSec
+) {
+    m_wifiEnabled = enabled;
+    m_otaWorkflowState = workflowState;
+    m_wifiRssi = rssi;
+    m_otaProgress = progress;
+    m_otaCountdownSec = countdownSec;
+
+    if (workflowMsg) {
+        strncpy(m_otaWorkflowMsg, workflowMsg, sizeof(m_otaWorkflowMsg) - 1);
+        m_otaWorkflowMsg[sizeof(m_otaWorkflowMsg) - 1] = '\0';
+    } else {
+        m_otaWorkflowMsg[0] = '\0';
+    }
+
+    if (ssid) {
+        strncpy(m_wifiSsid, ssid, sizeof(m_wifiSsid) - 1);
+        m_wifiSsid[sizeof(m_wifiSsid) - 1] = '\0';
+    } else {
+        m_wifiSsid[0] = '\0';
+    }
+
+    if (ipStr) {
+        strncpy(m_wifiIp, ipStr, sizeof(m_wifiIp) - 1);
+        m_wifiIp[sizeof(m_wifiIp) - 1] = '\0';
+    } else {
+        m_wifiIp[0] = '\0';
     }
 }
 
@@ -203,8 +242,6 @@ void DisplayManager::drawTopBar() {
     }
 
     // 4. Center Area: Road Name
-    // Available width: x = 28 to 214 (186 pixels).
-    // At setTextSize(1) (6px per char), fits up to 28 characters without wrapping.
     const char* displayName = (m_roadName[0] != '\0') ? m_roadName : "VIETHUD HANOI";
     int nameLen = strlen(displayName);
     const int MAX_VIEW_CHARS = 28;
@@ -214,17 +251,15 @@ void DisplayManager::drawTopBar() {
     m_canvas->setTextColor(COLOR_ROAD_TEXT);
 
     if (nameLen <= MAX_VIEW_CHARS) {
-        // Fits completely: perfectly centered
         int textW = nameLen * 6;
         int startX = 28 + (186 - textW) / 2;
         m_canvas->setCursor(startX, 7);
         m_canvas->print(displayName);
     } else {
-        // Long road name: smooth step ticker by character slicing (guarantees zero coordinate wrapping)
         int maxOffset = nameLen - MAX_VIEW_CHARS;
         uint32_t now = millis();
         uint32_t pauseStartMs = 1500;
-        uint32_t stepMs = 280; // 280ms per character
+        uint32_t stepMs = 280;
         uint32_t scrollDurationMs = maxOffset * stepMs;
         uint32_t pauseEndMs = 1200;
         uint32_t totalCycleMs = pauseStartMs + scrollDurationMs + pauseEndMs;
@@ -253,99 +288,77 @@ void DisplayManager::drawTopBar() {
 }
 
 // ---------------------------------------------------------------------------
-// TRAFFIC ALERT ICON DRAWING PRIMITIVES (Biểu tượng / Biển báo trực quan)
+// TRAFFIC ALERT ICON DRAWING PRIMITIVES
 // ---------------------------------------------------------------------------
 
-// 1. Camera icon: Blue rectangular sign with authentic CCTV silhouette & cyan lens
 void DisplayManager::drawIconCamera(int x, int y) {
     m_canvas->fillRoundRect(x, y, 42, 38, 4, 0x027B); // Highway Blue
     m_canvas->drawRoundRect(x, y, 42, 38, 4, COLOR_WHITE);
 
-    // Camera body (white silhouette)
     m_canvas->fillRoundRect(x + 5, y + 10, 22, 16, 2, COLOR_WHITE);
-    // Lens cone pointing right
     m_canvas->fillTriangle(x + 27, y + 13, x + 35, y + 9, x + 35, y + 27, COLOR_WHITE);
     m_canvas->fillTriangle(x + 27, y + 13, x + 35, y + 27, x + 27, y + 23, COLOR_WHITE);
 
-    // Cyan lens reflection
     m_canvas->fillCircle(x + 13, y + 18, 4, COLOR_CYAN);
     m_canvas->drawCircle(x + 13, y + 18, 4, 0x0010);
     m_canvas->fillCircle(x + 12, y + 17, 1, COLOR_WHITE);
 
-    // Mounting stem at bottom
     m_canvas->fillRect(x + 10, y + 26, 4, 7, COLOR_WHITE);
     m_canvas->fillRect(x + 6, y + 31, 12, 3, COLOR_WHITE);
 
-    // Blinking red recording LED
     bool blink = (millis() / 350) % 2;
     if (blink) {
         m_canvas->fillCircle(x + 23, y + 13, 2, COLOR_ALERT);
     }
 }
 
-// 2. Traffic Light: 3-lamp housing with bright glowing red lamp
 void DisplayManager::drawIconTrafficLight(int x, int y) {
-    m_canvas->fillRoundRect(x, y, 26, 40, 5, 0x10A2); // Dark slate/charcoal
+    m_canvas->fillRoundRect(x, y, 26, 40, 5, 0x10A2);
     m_canvas->drawRoundRect(x, y, 26, 40, 5, COLOR_SILVER);
 
-    // Red Lamp (TOP) - Active glowing red with lens reflection
     m_canvas->fillCircle(x + 13, y + 8, 5, COLOR_ALERT);
     m_canvas->drawCircle(x + 13, y + 8, 6, 0xC800);
     m_canvas->fillCircle(x + 11, y + 6, 1, COLOR_WHITE);
 
-    // Yellow Lamp (MIDDLE) - Inactive dark amber
     m_canvas->fillCircle(x + 13, y + 20, 4, 0x4200);
-
-    // Green Lamp (BOTTOM) - Inactive dark green
     m_canvas->fillCircle(x + 13, y + 31, 4, 0x01E0);
-
-    // Visor at top
     m_canvas->drawFastHLine(x + 7, y + 2, 12, COLOR_WHITE);
 }
 
-// 3. Populated Area (Biển R.420): Blue rectangle with white buildings
 void DisplayManager::drawIconResidentArea(int x, int y) {
-    m_canvas->fillRoundRect(x, y, 42, 38, 4, 0x027B); // Official Vietnam Highway Blue
+    m_canvas->fillRoundRect(x, y, 42, 38, 4, 0x027B);
     m_canvas->drawRoundRect(x, y, 42, 38, 4, COLOR_WHITE);
 
-    // Left building (High-rise):
     m_canvas->fillRect(x + 6, y + 10, 14, 22, COLOR_WHITE);
-    // Blue windows on left building
     m_canvas->fillRect(x + 8, y + 13, 3, 4, 0x027B);
     m_canvas->fillRect(x + 14, y + 13, 3, 4, 0x027B);
     m_canvas->fillRect(x + 8, y + 20, 3, 4, 0x027B);
     m_canvas->fillRect(x + 14, y + 20, 3, 4, 0x027B);
 
-    // Right house (Gable roof house):
     m_canvas->fillTriangle(x + 22, y + 18, x + 30, y + 11, x + 38, y + 18, COLOR_WHITE);
     m_canvas->fillRect(x + 23, y + 18, 14, 14, COLOR_WHITE);
-    m_canvas->fillRect(x + 28, y + 24, 4, 8, 0x027B); // Doorway
+    m_canvas->fillRect(x + 28, y + 24, 4, 8, 0x027B);
 }
 
-// 4. No Overtaking (Biển P.125): Red circle, white inner, red and black cars
 void DisplayManager::drawIconNoOvertaking(int x, int y) {
     int cx = x + 21;
     int cy = y + 19;
     int r = 18;
 
-    // Bold red circular border (4px thick)
     for (int i = 0; i < 4; i++) {
         m_canvas->drawCircle(cx, cy, r - i, COLOR_SIGN_RED);
     }
     m_canvas->fillCircle(cx, cy, r - 4, COLOR_WHITE);
 
-    // Right car (Black silhouette):
     m_canvas->fillRoundRect(cx + 2, cy - 5, 8, 10, 2, COLOR_BLACK);
     m_canvas->fillRect(cx + 4, cy - 2, 4, 4, 0x7BEF);
 
-    // Left car (Red overtaking car):
     m_canvas->fillRoundRect(cx - 10, cy - 5, 8, 10, 2, COLOR_ALERT);
     m_canvas->fillRect(cx - 8, cy - 2, 4, 4, COLOR_WHITE);
 }
 
-// 5. Toll Booth (Biển BOT P.135): Yellow sign with bold "BOT" and barie
 void DisplayManager::drawIconTollBooth(int x, int y) {
-    m_canvas->fillRoundRect(x, y, 42, 38, 4, 0xFDE0); // Vivid Highway Yellow
+    m_canvas->fillRoundRect(x, y, 42, 38, 4, 0xFDE0);
     m_canvas->drawRoundRect(x, y, 42, 38, 4, COLOR_SIGN_RED);
     m_canvas->drawRoundRect(x + 1, y + 1, 40, 36, 3, COLOR_SIGN_RED);
 
@@ -355,14 +368,12 @@ void DisplayManager::drawIconTollBooth(int x, int y) {
     m_canvas->setCursor(x + 4, y + 12);
     m_canvas->print("BOT");
 
-    // Striped barrier bar at bottom
     for (int i = 0; i < 32; i += 8) {
         m_canvas->fillRect(x + 5 + i, y + 29, 4, 3, COLOR_ALERT);
         m_canvas->fillRect(x + 9 + i, y + 29, 4, 3, COLOR_WHITE);
     }
 }
 
-// 6. Danger Sign (Biển W.208 / W.233): Yellow triangle, red border, black "!"
 void DisplayManager::drawIconDanger(int x, int y) {
     int x1 = x + 21, y1 = y + 2;
     int x2 = x + 2,  y2 = y + 36;
@@ -374,7 +385,6 @@ void DisplayManager::drawIconDanger(int x, int y) {
         m_canvas->drawTriangle(x1, y1 + i, x2 + i, y2 - i, x3 - i, y3 - i, COLOR_SIGN_RED);
     }
 
-    // Black exclamation mark
     m_canvas->fillRect(x + 19, y + 12, 4, 11, COLOR_BLACK);
     m_canvas->fillRect(x + 19, y + 26, 4, 4, COLOR_BLACK);
 }
@@ -389,11 +399,9 @@ void DisplayManager::drawTrafficAlertArea() {
     int boxH = 50;
 
     if (!m_alertActive || m_alertType == 0) {
-        // Quiet State: Clean minimal radar scanner
         m_canvas->fillRoundRect(boxX, boxY, boxW, boxH, 6, COLOR_CARD_BG);
         m_canvas->drawRoundRect(boxX, boxY, boxW, boxH, 6, COLOR_CARD_BORDER);
 
-        // Miniature radar scan icon on left
         m_canvas->drawCircle(26, 49, 12, COLOR_TRACK);
         m_canvas->drawCircle(26, 49, 6, COLOR_SAFE);
         m_canvas->fillCircle(26, 49, 2, COLOR_SAFE);
@@ -404,7 +412,6 @@ void DisplayManager::drawTrafficAlertArea() {
         int sy = 49 + (int)(sin(rad) * 11);
         m_canvas->drawLine(26, 49, sx, sy, COLOR_SAFE);
 
-        // Reassuring status text
         m_canvas->setFont(NULL);
         m_canvas->setTextSize(1);
         m_canvas->setTextColor(COLOR_SILVER);
@@ -417,36 +424,35 @@ void DisplayManager::drawTrafficAlertArea() {
         return;
     }
 
-    // ACTIVE ALERT: Traffic Alert Card with Visual Icon & Countdown Distance
     uint16_t alertColor = COLOR_WHITE;
     const char* alertTitle = "";
 
     switch (m_alertType) {
-        case 1: // ALERT_SPEED_CAMERA
+        case 1:
             alertColor = COLOR_ALERT;
             alertTitle = "CAM BAN TOC DO";
             break;
-        case 4: // ALERT_CAMERA
+        case 4:
             alertColor = COLOR_ALERT;
             alertTitle = "CAMERA PHAT NGUOI";
             break;
-        case 6: // ALERT_TRAFFIC_LIGHT
+        case 6:
             alertColor = COLOR_WARN;
             alertTitle = "CAM VUOT DEN DO";
             break;
-        case 2: // ALERT_RESIDENT_AREA
+        case 2:
             alertColor = COLOR_CYAN;
             alertTitle = "KHU DONG DAN CU";
             break;
-        case 3: // ALERT_NO_OVERTAKING
+        case 3:
             alertColor = COLOR_ALERT;
             alertTitle = "DOAN DUONG CAM VUOT";
             break;
-        case 5: // ALERT_TOLL_BOOTH
+        case 5:
             alertColor = COLOR_WARN;
             alertTitle = "TRAM THU PHI BOT";
             break;
-        case 10: // ALERT_DANGER
+        case 10:
         default:
             alertColor = COLOR_WARN;
             alertTitle = "CANH BAO NGUY HIEM";
@@ -457,7 +463,6 @@ void DisplayManager::drawTrafficAlertArea() {
     m_canvas->drawRoundRect(boxX, boxY, boxW, boxH, 6, alertColor);
     m_canvas->drawRoundRect(boxX + 1, boxY + 1, boxW - 2, boxH - 2, 5, alertColor);
 
-    // 1. Draw Visual Sign / Icon on Left: x = 14, y = 31
     switch (m_alertType) {
         case 1:
         case 4:
@@ -481,14 +486,12 @@ void DisplayManager::drawTrafficAlertArea() {
             break;
     }
 
-    // 2. Alert Title Text (Top Right)
     m_canvas->setFont(NULL);
     m_canvas->setTextSize(1);
     m_canvas->setTextColor(alertColor);
     m_canvas->setCursor(64, 32);
     m_canvas->print(alertTitle);
 
-    // 3. Countdown Distance in Large Digits (FreeSansBold18pt7b)
     char distStr[12];
     if (m_alertDistance > 0) {
         snprintf(distStr, sizeof(distStr), "%d", m_alertDistance);
@@ -506,14 +509,12 @@ void DisplayManager::drawTrafficAlertArea() {
     m_canvas->setCursor(64, 57);
     m_canvas->print(distStr);
 
-    // Unit "m" in small font
     m_canvas->setFont(NULL);
     m_canvas->setTextSize(1);
     m_canvas->setTextColor(COLOR_SILVER);
     m_canvas->setCursor(64 + w + 4, 48);
     m_canvas->print("m");
 
-    // 4. Distance Countdown Progress Bar
     int barX = 64;
     int barY = 64;
     int barW = 158;
@@ -538,7 +539,6 @@ void DisplayManager::drawTrafficAlertArea() {
 void DisplayManager::drawSpeedLimitSign(int cx, int cy, int radius, int limit) {
     bool isOver = (m_speedLimit > 0 && m_speed > m_speedLimit);
 
-    // Flash animation every 300ms when overspeeding
     uint32_t now = millis();
     if (now - m_lastFlashTime > 300) {
         m_lastFlashTime = now;
@@ -550,24 +550,19 @@ void DisplayManager::drawSpeedLimitSign(int cx, int cy, int radius, int limit) {
     uint16_t textColor = COLOR_BLACK;
 
     if (isOver && m_flashState) {
-        // High-contrast inverted emergency flash
         outerBorderColor = COLOR_WHITE;
         innerBgColor = COLOR_ALERT;
         textColor = COLOR_WHITE;
     }
 
-    // Outer subtle contrast halo
     m_canvas->drawCircle(cx, cy, radius + 1, 0x18C3);
 
-    // Massive bold red border (8px thick)
     for (int r = radius; r >= radius - 8; r--) {
         m_canvas->drawCircle(cx, cy, r, outerBorderColor);
     }
 
-    // Pure white center disk
     m_canvas->fillCircle(cx, cy, radius - 9, innerBgColor);
 
-    // Format text
     char buf[12];
     if (limit <= 0) {
         snprintf(buf, sizeof(buf), "--");
@@ -575,7 +570,6 @@ void DisplayManager::drawSpeedLimitSign(int cx, int cy, int radius, int limit) {
         snprintf(buf, sizeof(buf), "%d", limit);
     }
 
-    // Use FreeSansBold fonts: 24pt for 2 digits, 18pt for 3 digits (100, 120)
     const GFXfont* fontToUse = (limit >= 100) ? &FreeSansBold18pt7b : &FreeSansBold24pt7b;
     m_canvas->setFont(fontToUse);
     m_canvas->setTextColor(textColor);
@@ -610,11 +604,11 @@ void DisplayManager::drawCurrentSpeedSection(int cx, int cy, int speed, int limi
 
     uint16_t statusColor;
     if (isOver) {
-        statusColor = COLOR_ALERT; // Red
+        statusColor = COLOR_ALERT;
     } else if (isNearLimit) {
-        statusColor = COLOR_WARN;  // Amber
+        statusColor = COLOR_WARN;
     } else {
-        statusColor = COLOR_SAFE;  // Emerald Green
+        statusColor = COLOR_SAFE;
     }
 
     m_canvas->drawRoundRect(cardX, cardY, cardW, cardH, 8, statusColor);
@@ -622,7 +616,6 @@ void DisplayManager::drawCurrentSpeedSection(int cx, int cy, int speed, int limi
         m_canvas->drawRoundRect(cardX + 1, cardY + 1, cardW - 2, cardH - 2, 7, COLOR_ALERT);
     }
 
-    // Speed digits: FreeSansBold24pt7b
     char speedStr[8];
     snprintf(speedStr, sizeof(speedStr), "%d", speed);
 
@@ -638,7 +631,6 @@ void DisplayManager::drawCurrentSpeedSection(int cx, int cy, int speed, int limi
     m_canvas->setCursor(speedX, speedY);
     m_canvas->print(speedStr);
 
-    // Unit "km/h"
     m_canvas->setFont(NULL);
     m_canvas->setTextSize(2);
     m_canvas->setTextColor(isOver ? COLOR_ALERT : COLOR_CYAN);
@@ -646,7 +638,6 @@ void DisplayManager::drawCurrentSpeedSection(int cx, int cy, int speed, int limi
     m_canvas->setCursor(unitX, cardY + 14);
     m_canvas->print("km/h");
 
-    // Overspeed delta tag (+XX) if exceeding limit
     if (isOver && delta > 0) {
         char deltaStr[8];
         snprintf(deltaStr, sizeof(deltaStr), "+%d", delta);
@@ -662,7 +653,6 @@ void DisplayManager::drawCurrentSpeedSection(int cx, int cy, int speed, int limi
         m_canvas->print(deltaStr);
     }
 
-    // Automotive speed progress bar at bottom of card
     int barX = cardX + 12;
     int barY = cardY + cardH - 7;
     int barW = cardW - 24;
@@ -690,7 +680,7 @@ void DisplayManager::drawToast() {
         int boxW = textLen * 9 + 24;
         int boxH = 26;
         int boxX = 120 - boxW / 2;
-        int boxY = 82; // Positioned cleanly between alert card and speed sign
+        int boxY = 82;
 
         m_canvas->fillRoundRect(boxX, boxY, boxW, boxH, 6, COLOR_TOAST_BG);
         m_canvas->drawRoundRect(boxX, boxY, boxW, boxH, 6, m_toastColor);
@@ -703,46 +693,186 @@ void DisplayManager::drawToast() {
     }
 }
 
-void DisplayManager::drawOTAOverlay() {
-    m_canvas->fillRoundRect(16, 30, 208, 180, 10, COLOR_CARD_BG);
-    m_canvas->drawRoundRect(16, 30, 208, 180, 10, COLOR_CYAN);
-    m_canvas->drawRoundRect(17, 31, 206, 178, 9, COLOR_CYAN);
-
+// ---------------------------------------------------------------------------
+// DEDICATED FULL-SCREEN WIFI & OTA PAGE (Trang Kết Nối & Cập Nhật)
+// ---------------------------------------------------------------------------
+void DisplayManager::drawWiFiOTAPage() {
+    // 1. Header Bar (y: 0 .. 30)
+    m_canvas->fillRect(0, 0, LCD_WIDTH, 30, COLOR_BG);
     m_canvas->setFont(NULL);
     m_canvas->setTextSize(2);
     m_canvas->setTextColor(COLOR_CYAN);
-    m_canvas->setCursor(44, 48);
-    m_canvas->print("OTA UPDATE");
+    m_canvas->setCursor(54, 8);
+    m_canvas->print("WIFI & OTA");
 
-    int barX = 36;
-    int barY = 96;
-    int barW = 168;
-    int barH = 14;
+    m_canvas->drawFastHLine(8, 30, 224, COLOR_CARD_BORDER);
 
-    m_canvas->fillRect(barX, barY, barW, barH, COLOR_TRACK);
-    m_canvas->drawRect(barX, barY, barW, barH, COLOR_CARD_BORDER);
-
-    int progressFill = (m_otaProgress * barW) / 100;
-    if (progressFill > 0) {
-        m_canvas->fillRect(barX + 1, barY + 1, progressFill - 2, barH - 2, COLOR_SAFE);
+    // 2. Determine Theme Color based on OTAWorkflowState:
+    // 1: CONNECTING_WIFI, 2: WIFI_CONNECTED, 3: CHECKING_UPDATE,
+    // 4: DOWNLOADING, 5: UP_TO_DATE, 6: FAILED, 7: REBOOTING
+    uint16_t cardBorderColor = COLOR_CYAN;
+    if (m_otaWorkflowState == 5) {
+        cardBorderColor = COLOR_SAFE; // Green
+    } else if (m_otaWorkflowState == 4 || m_otaWorkflowState == 7) {
+        cardBorderColor = COLOR_WARN; // Amber
+    } else if (m_otaWorkflowState == 6) {
+        cardBorderColor = COLOR_ALERT; // Red
     }
 
-    char pctStr[8];
-    snprintf(pctStr, sizeof(pctStr), "%d%%", m_otaProgress);
-    m_canvas->setFont(&FreeSansBold18pt7b);
-    m_canvas->setTextColor(COLOR_WHITE);
+    int boxX = 8, boxY = 36, boxW = 224, boxH = 158;
+    m_canvas->fillRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_CARD_BG);
+    m_canvas->drawRoundRect(boxX, boxY, boxW, boxH, 8, cardBorderColor);
+    m_canvas->drawRoundRect(boxX + 1, boxY + 1, boxW - 2, boxH - 2, 7, cardBorderColor);
 
-    int16_t x1, y1;
-    uint16_t w, h;
-    m_canvas->getTextBounds(pctStr, 0, 0, &x1, &y1, &w, &h);
-    m_canvas->setCursor(120 - (w / 2) - x1, 148);
-    m_canvas->print(pctStr);
+    int cx = 120;
+
+    // 3. Central Graphic & Animation (y: 44 .. 92)
+    if (m_otaWorkflowState == 1) { // CONNECTING_WIFI
+        int wavePhase = (millis() / 240) % 4;
+        m_canvas->fillCircle(cx, 84, 3, COLOR_CYAN);
+
+        if (wavePhase >= 1) {
+            m_canvas->drawCircle(cx, 84, 10, COLOR_CYAN);
+            m_canvas->drawCircle(cx, 84, 11, COLOR_CYAN);
+            m_canvas->fillRect(cx - 15, 85, 30, 15, COLOR_CARD_BG);
+        }
+        if (wavePhase >= 2) {
+            m_canvas->drawCircle(cx, 84, 18, COLOR_CYAN);
+            m_canvas->drawCircle(cx, 84, 19, COLOR_CYAN);
+            m_canvas->fillRect(cx - 24, 85, 48, 20, COLOR_CARD_BG);
+        }
+        if (wavePhase >= 3) {
+            m_canvas->drawCircle(cx, 84, 26, COLOR_CYAN);
+            m_canvas->drawCircle(cx, 84, 27, COLOR_CYAN);
+            m_canvas->fillRect(cx - 32, 85, 64, 25, COLOR_CARD_BG);
+        }
+    } else if (m_otaWorkflowState == 2 || m_otaWorkflowState == 3) { // CONNECTED / CHECKING
+        m_canvas->fillCircle(cx, 68, 18, 0x01E0);
+        m_canvas->drawCircle(cx, 68, 18, COLOR_SAFE);
+        m_canvas->drawCircle(cx, 68, 10, COLOR_SAFE);
+
+        int angle = (millis() / 6) % 360;
+        float rad = angle * 0.0174533f;
+        int sx = cx + (int)(cos(rad) * 14);
+        int sy = 68 + (int)(sin(rad) * 14);
+        m_canvas->drawLine(cx, 68, sx, sy, COLOR_WHITE);
+        m_canvas->fillCircle(sx, sy, 2, COLOR_WHITE);
+    } else if (m_otaWorkflowState == 4 || m_otaWorkflowState == 7) { // DOWNLOADING / REBOOTING
+        m_canvas->fillCircle(cx, 68, 18, 0x5280);
+        m_canvas->drawCircle(cx, 68, 18, COLOR_WARN);
+
+        m_canvas->fillRect(cx - 2, 54, 5, 14, COLOR_WHITE);
+        m_canvas->fillTriangle(cx - 9, 68, cx + 9, 68, cx, 80, COLOR_WHITE);
+    } else if (m_otaWorkflowState == 5) { // UP_TO_DATE
+        m_canvas->fillCircle(cx, 68, 18, COLOR_SAFE);
+        m_canvas->drawLine(cx - 9, 68, cx - 3, 76, COLOR_WHITE);
+        m_canvas->drawLine(cx - 8, 68, cx - 2, 76, COLOR_WHITE);
+        m_canvas->drawLine(cx - 3, 76, cx + 9, 58, COLOR_WHITE);
+        m_canvas->drawLine(cx - 2, 76, cx + 10, 58, COLOR_WHITE);
+    } else { // FAILED (6)
+        m_canvas->fillTriangle(cx, 50, cx - 18, 84, cx + 18, 84, COLOR_ALERT);
+        m_canvas->fillTriangle(cx, 53, cx - 15, 82, cx + 15, 82, COLOR_WHITE);
+        m_canvas->fillRect(cx - 1, 60, 3, 12, COLOR_BLACK);
+        m_canvas->fillRect(cx - 1, 75, 3, 3, COLOR_BLACK);
+    }
+
+    // 4. Main Stage Title Text (y: 98)
+    m_canvas->setFont(NULL);
+    m_canvas->setTextSize(1);
+    m_canvas->setTextColor(cardBorderColor);
+
+    const char* titleMsg = m_otaWorkflowMsg[0] != '\0' ? m_otaWorkflowMsg : "DANG XU LY...";
+    int textW = strlen(titleMsg) * 6;
+    int textX = cx - textW / 2;
+    if (textX < boxX + 6) textX = boxX + 6;
+    m_canvas->setCursor(textX, 98);
+    m_canvas->print(titleMsg);
+
+    // 5. Detailed Body Info per state
+    if (m_otaWorkflowState == 1) { // CONNECTING
+        m_canvas->setTextColor(COLOR_SILVER);
+        m_canvas->setCursor(boxX + 16, 122);
+        m_canvas->print("1. iPhone cua Pham");
+        m_canvas->setCursor(boxX + 16, 138);
+        m_canvas->print("2. VuPQ");
+        m_canvas->setTextColor(COLOR_CYAN);
+        m_canvas->setCursor(boxX + 16, 158);
+        m_canvas->print("Dang do tim tin hieu...");
+    } else if (m_otaWorkflowState == 2 || m_otaWorkflowState == 3) { // CONNECTED / CHECKING
+        m_canvas->setTextColor(COLOR_WHITE);
+        m_canvas->setCursor(boxX + 16, 120);
+        m_canvas->printf("IP: %s", m_wifiIp);
+
+        m_canvas->setTextColor(COLOR_SAFE);
+        m_canvas->setCursor(boxX + 16, 136);
+        m_canvas->printf("Song: %d dBm (Tot)", m_wifiRssi);
+
+        m_canvas->setTextColor(COLOR_CYAN);
+        m_canvas->setCursor(boxX + 16, 156);
+        m_canvas->print("Pi4: http://192.168.1.65/");
+    } else if (m_otaWorkflowState == 4 || m_otaWorkflowState == 7) { // DOWNLOADING
+        int barX = boxX + 16;
+        int barY = 120;
+        int barW = boxW - 32;
+        int barH = 12;
+
+        m_canvas->fillRect(barX, barY, barW, barH, COLOR_TRACK);
+        m_canvas->drawRect(barX, barY, barW, barH, COLOR_CARD_BORDER);
+
+        int fillW = (m_otaProgress * barW) / 100;
+        if (fillW > 0) {
+            m_canvas->fillRect(barX + 1, barY + 1, fillW - 2, barH - 2, COLOR_SAFE);
+        }
+
+        char pctBuf[12];
+        snprintf(pctBuf, sizeof(pctBuf), "%d%%", m_otaProgress);
+        m_canvas->setFont(&FreeSansBold18pt7b);
+        m_canvas->setTextColor(COLOR_WHITE);
+
+        int16_t x1, y1;
+        uint16_t w, h;
+        m_canvas->getTextBounds(pctBuf, 0, 0, &x1, &y1, &w, &h);
+        m_canvas->setCursor(cx - (w / 2) - x1, 158);
+        m_canvas->print(pctBuf);
+
+        m_canvas->setFont(NULL);
+        m_canvas->setTextSize(1);
+        m_canvas->setTextColor(COLOR_ALERT);
+        m_canvas->setCursor(boxX + 32, 172);
+        m_canvas->print("KHONG NGAT NGUON !");
+    } else if (m_otaWorkflowState == 5) { // UP_TO_DATE
+        m_canvas->setTextColor(COLOR_SAFE);
+        m_canvas->setCursor(boxX + 16, 120);
+        m_canvas->print("Phien ban: v3.3.0");
+
+        m_canvas->setTextColor(COLOR_CYAN);
+        m_canvas->setCursor(boxX + 16, 136);
+        m_canvas->printf("Web OTA: http://%s/", m_wifiIp);
+
+        m_canvas->setTextColor(COLOR_WARN);
+        m_canvas->setCursor(boxX + 16, 158);
+        m_canvas->printf("Tu dong ve HUD sau: %ds", m_otaCountdownSec);
+    } else { // FAILED
+        m_canvas->setTextColor(COLOR_SILVER);
+        m_canvas->setCursor(boxX + 16, 120);
+        m_canvas->print("Khong tim thay AP hoac Server");
+        m_canvas->setCursor(boxX + 16, 136);
+        m_canvas->print("Kiem tra lai Pi 4 / Hotspot");
+
+        m_canvas->setTextColor(COLOR_WARN);
+        m_canvas->setCursor(boxX + 16, 158);
+        m_canvas->printf("Tu dong ve HUD sau: %ds", m_otaCountdownSec);
+    }
+
+    // 6. Footer Button Guide (y: 202 .. 232)
+    m_canvas->fillRoundRect(16, 202, 208, 28, 6, COLOR_CARD_BG);
+    m_canvas->drawRoundRect(16, 202, 208, 28, 6, COLOR_CARD_BORDER);
 
     m_canvas->setFont(NULL);
     m_canvas->setTextSize(1);
-    m_canvas->setTextColor(COLOR_SILVER);
-    m_canvas->setCursor(40, 178);
-    m_canvas->print("KHONG NGAT NGUON !");
+    m_canvas->setTextColor(COLOR_WHITE);
+    m_canvas->setCursor(32, 211);
+    m_canvas->print("[ NUT GIUA: VE TRANG HUD ]");
 }
 
 void DisplayManager::render() {
@@ -751,12 +881,14 @@ void DisplayManager::render() {
     // Clear frame to deep black
     m_canvas->fillScreen(COLOR_BG);
 
-    if (m_isOtaUpdating) {
-        drawOTAOverlay();
+    // If WiFi is enabled, switch completely to the dedicated WiFi & OTA connection screen!
+    if (m_wifiEnabled) {
+        drawWiFiOTAPage();
         m_canvas->flush();
         return;
     }
 
+    // Normal HUD Dashboard Mode
     // 1. Draw Top Bar with Road Name & GPS sats
     drawTopBar();
 

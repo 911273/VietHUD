@@ -11,7 +11,7 @@ public:
     DisplayManager();
     bool begin();
 
-    // Update data to display
+    // Update HUD data
     void updateData(
         int currentSpeed,
         int speedLimit,
@@ -28,6 +28,18 @@ public:
         bool alertActive = false,
         uint8_t alertType = 0,
         uint16_t alertDistance = 0
+    );
+
+    // Update WiFi & OTA dedicated screen state
+    void updateWiFiState(
+        bool enabled,
+        uint8_t workflowState,
+        const char* workflowMsg,
+        const char* ssid,
+        const char* ipStr,
+        int rssi,
+        int progress,
+        int countdownSec
     );
     
     // Render frame to display (canvas flush)
@@ -61,12 +73,16 @@ private:
     // Marquee scrolling state
     uint32_t m_marqueeStartTime;
 
-    // WiFi & OTA
+    // WiFi & OTA Dedicated Screen
     bool m_wifiEnabled;
     bool m_wifiConnected;
+    uint8_t m_otaWorkflowState;
+    char m_otaWorkflowMsg[48];
+    char m_wifiSsid[32];
     char m_wifiIp[24];
-    bool m_isOtaUpdating;
+    int m_wifiRssi;
     int m_otaProgress;
+    int m_otaCountdownSec;
 
     // Traffic Alert (Icon & Distance based)
     bool m_alertActive;
@@ -88,7 +104,7 @@ private:
     void drawSpeedLimitSign(int cx, int cy, int radius, int limit);
     void drawCurrentSpeedSection(int cx, int cy, int speed, int limit);
     void drawToast();
-    void drawOTAOverlay();
+    void drawWiFiOTAPage();
 
     // Traffic Alert Icon Drawing Primitives
     void drawIconCamera(int x, int y);
