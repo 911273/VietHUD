@@ -8,8 +8,8 @@
 #include <HTTPUpdate.h>
 #include <WebServer.h>
 
-#define FW_VERSION "3.3.0"
-#define FW_BUILD   "20261005_v2"
+#define FW_VERSION "3.4.0"
+#define FW_BUILD   "20261005_v3"
 
 enum WiFiState : uint8_t {
     WIFI_STATE_OFF = 0,

@@ -1,4 +1,5 @@
 #include "DisplayManager.h"
+#include "WiFiOTAManager.h"
 #include <math.h>
 
 // Curated Automotive Palette (RGB565)
@@ -845,7 +846,7 @@ void DisplayManager::drawWiFiOTAPage() {
     } else if (m_otaWorkflowState == 5) { // UP_TO_DATE
         m_canvas->setTextColor(COLOR_SAFE);
         m_canvas->setCursor(boxX + 16, 120);
-        m_canvas->print("Phien ban: v3.3.0");
+        m_canvas->print("Phien ban: v" FW_VERSION);
 
         m_canvas->setTextColor(COLOR_CYAN);
         m_canvas->setCursor(boxX + 16, 136);
