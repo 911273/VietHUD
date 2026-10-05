@@ -100,17 +100,17 @@ private:
     uint32_t m_toastExpiry;
 
     void drawTopBar();
-    void drawTrafficAlertArea();
+    void drawAlertLeftCard();
     void drawSpeedLimitSign(int cx, int cy, int radius, int limit);
     void drawCurrentSpeedSection(int cx, int cy, int speed, int limit);
     void drawToast();
     void drawWiFiOTAPage();
 
-    // Traffic Alert Icon Drawing Primitives
-    void drawIconCamera(int x, int y);
-    void drawIconTrafficLight(int x, int y);
-    void drawIconResidentArea(int x, int y);
-    void drawIconNoOvertaking(int x, int y);
-    void drawIconTollBooth(int x, int y);
-    void drawIconDanger(int x, int y);
+    // Traffic Alert Icon Drawing Primitives (Centered at cx, cy)
+    void drawIconCamera(int cx, int cy);
+    void drawIconTrafficLight(int cx, int cy);
+    void drawIconResidentArea(int cx, int cy);
+    void drawIconNoOvertaking(int cx, int cy);
+    void drawIconTollBooth(int cx, int cy);
+    void drawIconDanger(int cx, int cy);
 };
