@@ -5,6 +5,7 @@
 #include "HardwareConfig.h"
 #include "FreeSansBold24pt7b.h"
 #include "FreeSansBold18pt7b.h"
+#include "SpeedSignFonts.h"
 
 class DisplayManager {
 public:
