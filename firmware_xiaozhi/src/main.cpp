@@ -117,7 +117,6 @@ void handleSerialCommands() {
             currentSpeed = line.substring(6).toInt();
             Serial.printf("[CMD] Cap nhat toc do: %d km/h\n", currentSpeed);
         } else if (line.startsWith("ALERT=")) {
-            // e.g. ALERT=1,300 or ALERT=CAM,300 or ALERT=RED,150 or ALERT=OFF
             String param = line.substring(6);
             if (param.equalsIgnoreCase("OFF")) {
                 manualAlertActive = false;
@@ -161,8 +160,7 @@ void handleSerialCommands() {
             Serial.println("[CMD] Che do GPS");
         } else if (line.equalsIgnoreCase("WIFI")) {
             bool wifiState = wifiOta.toggleWiFi();
-            display.showToast(wifiState ? "WIFI: BAT" : "WIFI: TAT", wifiState ? 0x07E0 : 0xF800);
-            Serial.printf("[CMD] WiFi: %s\n", wifiState ? "ON" : "OFF");
+            Serial.printf("[CMD] WiFi: %s\n", wifiState ? "ON (CHUYEN TRANG KET NOI & OTA)" : "OFF (QUAY VE HUD)");
         } else if (line.equalsIgnoreCase("OTA")) {
             Serial.println("[CMD] Kiem tra cap nhat OTA tu Pi 4...");
             display.showToast("CHECK OTA...", 0x07FF);
@@ -274,31 +272,33 @@ void loop() {
     // --- BUTTON BOOT (GPIO 0, Middle button) ---
     ButtonEvent evCenter = buttons.getCenterEvent();
     if (evCenter == BTN_SHORT_CLICK) {
-        isDemoMode = !isDemoMode;
-        audio.playModeSwitch();
-        if (isDemoMode) {
-            display.showToast("DEMO", 0xFD20);
+        if (wifiOta.isEnabled()) {
+            // While on WiFi & OTA page, single click immediately exits and returns to HUD!
+            wifiOta.toggleWiFi();
+            audio.playClick();
+            Serial.println("[BUTTON] Thoat trang WiFi & OTA -> Quay lai HUD.");
         } else {
-            display.showToast("GPS", 0x07FF);
-            display.setRoadName("GPS LIVE");
+            isDemoMode = !isDemoMode;
+            audio.playModeSwitch();
+            if (isDemoMode) {
+                display.showToast("DEMO", 0xFD20);
+            } else {
+                display.showToast("GPS", 0x07FF);
+                display.setRoadName("GPS LIVE");
+            }
+            Serial.printf("[BUTTON] Mode switched: %s\n", isDemoMode ? "DEMO" : "LIVE GPS");
         }
-        Serial.printf("[BUTTON] Mode switched: %s\n", isDemoMode ? "DEMO" : "LIVE GPS");
     } else if (evCenter == BTN_DOUBLE_CLICK) {
         bool wifiState = wifiOta.toggleWiFi();
         audio.playModeSwitch();
-        if (wifiState) {
-            display.showToast("WIFI: BAT", 0x07E0);
-        } else {
-            display.showToast("WIFI: TAT", 0xF800);
-        }
-        Serial.printf("[BUTTON] WiFi toggled: %s\n", wifiState ? "ON (SEARCHING)" : "OFF");
+        Serial.printf("[BUTTON] WiFi toggled: %s\n", wifiState ? "ON (CHUYEN TRANG KET NOI & OTA)" : "OFF (QUAY VE HUD)");
     } else if (evCenter == BTN_LONG_PRESS) {
         display.toggleRotation();
         audio.playModeSwitch();
         Serial.println("[BUTTON] Screen rotation toggled 180 degrees.");
     }
 
-    // 5. Update Speed, Route & Traffic Alerts Data
+    // 5. Update Speed, Route & Traffic Alerts Data (runs in background even during WiFi)
     bool currentAlertActive = false;
     uint8_t currentAlertType = 0;
     uint16_t currentAlertDist = 0;
@@ -316,9 +316,8 @@ void loop() {
             display.setRoadName(HANOI_DEMO_ROUTES[currentRouteIdx].roadName);
             demoAlertDist = 480;
 
-            // Trigger corresponding sound alert when entering new route
             uint8_t aType = HANOI_DEMO_ROUTES[currentRouteIdx].alertType;
-            if (!isMuted) {
+            if (!isMuted && !wifiOta.isEnabled()) {
                 if (aType == ALERT_SPEED_CAMERA || aType == ALERT_CAMERA) {
                     audio.playAlertCamera();
                 } else if (aType == ALERT_TRAFFIC_LIGHT) {
@@ -352,7 +351,6 @@ void loop() {
             }
             currentSpeed = (int)round(demoSpeedFloat);
 
-            // Countdown simulated alert distance
             demoAlertDist -= 3;
             if (demoAlertDist < 40) demoAlertDist = 40;
         }
@@ -369,15 +367,13 @@ void loop() {
             float lon = gps.getLongitude();
             float heading = gps.getCourse();
 
-            // Query live database with 40,386 points in Hanoi & 200km radius!
             ActiveTrafficAlert alert = trafficAlerts.queryNearby(lat, lon, heading, currentSpeed);
             if (alert.active) {
                 currentAlertActive = true;
                 currentAlertType = alert.type;
                 currentAlertDist = alert.distanceM;
 
-                // Trigger sound chime once when alert is within 350m
-                if (!isMuted && alert.distanceM <= 350 && (now - lastSoundAlertTime >= 12000)) {
+                if (!isMuted && !wifiOta.isEnabled() && alert.distanceM <= 350 && (now - lastSoundAlertTime >= 12000)) {
                     lastSoundAlertTime = now;
                     if (alert.type == ALERT_SPEED_CAMERA || alert.type == ALERT_CAMERA) {
                         audio.playAlertCamera();
@@ -395,8 +391,8 @@ void loop() {
         }
     }
 
-    // 6. Overspeed Audio Alert (unless muted)
-    if (!isMuted && speedLimit > 0 && currentSpeed > speedLimit) {
+    // 6. Overspeed Audio Alert (only when not on WiFi page and unmuted)
+    if (!isMuted && !wifiOta.isEnabled() && speedLimit > 0 && currentSpeed > speedLimit) {
         if (now - lastOverspeedAlertTime >= 1400) {
             lastOverspeedAlertTime = now;
             audio.playOverspeed();
@@ -406,6 +402,19 @@ void loop() {
     // 7. Render to display at ~30-40 FPS
     if (now - lastRenderTime >= 25) {
         lastRenderTime = now;
+
+        // Keep DisplayManager synchronized on WiFi & OTA state
+        display.updateWiFiState(
+            wifiOta.isEnabled(),
+            wifiOta.getWorkflowState(),
+            wifiOta.getWorkflowMessage(),
+            wifiOta.getSSID().c_str(),
+            wifiOta.getIPString(),
+            wifiOta.getRSSI(),
+            wifiOta.getProgress(),
+            wifiOta.getCountdownSec()
+        );
+
         display.updateData(
             currentSpeed,
             speedLimit,
@@ -413,7 +422,7 @@ void loop() {
             gps.hasFix(),
             isDemoMode,
             isMuted,
-            nullptr, // Keep existing road name or updated via setRoadName
+            nullptr,
             wifiOta.isEnabled(),
             wifiOta.isConnected(),
             wifiOta.getIPString(),
