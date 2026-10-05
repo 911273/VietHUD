@@ -179,7 +179,7 @@ void setup() {
     Serial.begin(115200);
     delay(400);
     Serial.println("=========================================");
-    Serial.println("   VIETHUD LITE v3.4.0 - MAJOR UPGRADE   ");
+    Serial.println(" VIETHUD LITE v3.4.1 - ENLARGED DIGITS   ");
     Serial.println("=========================================");
 
     // 0. Initialize Settings from NVS flash

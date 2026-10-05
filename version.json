@@ -1,11 +1,11 @@
 {
-  "version": "3.4.0",
-  "build": "20261005_v3.4.0",
-  "url_pi4": "http://192.168.1.65/viethud/firmware/3.4.0/firmware.bin",
-  "url_pi4_tailscale": "http://100.107.34.92/viethud/firmware/3.4.0/firmware.bin",
-  "url_pi4_mdns": "http://homebridge.local/viethud/firmware/3.4.0/firmware.bin",
-  "url_github": "https://raw.githubusercontent.com/911273/VietHUD/main/firmware/3.4.0/firmware.bin",
+  "version": "3.4.1",
+  "build": "20261005_v3.4.1",
+  "url_pi4": "http://192.168.1.65/viethud/firmware/3.4.1/firmware.bin",
+  "url_pi4_tailscale": "http://100.107.34.92/viethud/firmware/3.4.1/firmware.bin",
+  "url_pi4_mdns": "http://homebridge.local/viethud/firmware/3.4.1/firmware.bin",
+  "url_github": "https://raw.githubusercontent.com/911273/VietHUD/main/firmware/3.4.1/firmware.bin",
   "alerts_db": "http://192.168.1.65/viethud/hanoi_alerts.bin",
   "alerts_db_tailscale": "http://100.107.34.92/viethud/hanoi_alerts.bin",
-  "notes": "VietHUD 3.4.0: Major Upgrade - Trang Cai Dat Setting giu nut giua (13 thong so, luu flash NVS), bien bao toc do sieu to (132px), nut 1-cham tang/giam volume, tien trinh update % truc quan va thong bao thanh cong"
+  "notes": "VietHUD 3.4.1: Chu so bien bao toc do sieu to (72pt/60pt Arial Bold), dien tich chu chiem 87% vong tron, cuc ky de nhin tu xa tren xe hoi"
 }

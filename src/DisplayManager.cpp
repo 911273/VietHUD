@@ -577,8 +577,23 @@ void DisplayManager::drawSpeedLimitSign(int cx, int cy, int radius, int limit) {
         snprintf(buf, sizeof(buf), "%d", limit);
     }
 
-    // Font selection: 24pt for 2 digits (< 100), 18pt for 3 digits (100, 120)
-    const GFXfont* fontToUse = (limit >= 100) ? &FreeSansBold18pt7b : &FreeSansBold24pt7b;
+    // Ultra-large font selection tailored to sign radius & digit count:
+    const GFXfont* fontToUse = nullptr;
+    if (radius >= 60) {
+        // Centered sign (R=66, diameter 132px)
+        if (limit >= 100) {
+            fontToUse = &SpeedSignBold52pt; // 3 digits: "100", "120" (37px tall)
+        } else {
+            fontToUse = &SpeedSignBold72pt; // 2 digits: "50", "60", "80", "--" (53px tall, fills 87% of white circle)
+        }
+    } else {
+        // Shifted sign when alert is active (R=54, diameter 108px)
+        if (limit >= 100) {
+            fontToUse = &SpeedSignBold42pt; // 3 digits: "100", "120" (30px tall)
+        } else {
+            fontToUse = &SpeedSignBold60pt; // 2 digits: "50", "60", "80", "--" (44px tall, fills 88% of white circle)
+        }
+    }
     m_canvas->setFont(fontToUse);
     m_canvas->setTextColor(textColor);
 
