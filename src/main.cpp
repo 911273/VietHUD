@@ -179,7 +179,7 @@ void setup() {
     Serial.begin(115200);
     delay(400);
     Serial.println("=========================================");
-    Serial.println("   VIETHUD LITE v3.3.0 - HANOI 200KM     ");
+    Serial.println("   VIETHUD LITE v3.4.0 - MAJOR UPGRADE   ");
     Serial.println("=========================================");
 
     // 0. Initialize Settings from NVS flash

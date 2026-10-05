@@ -8,8 +8,8 @@
 #include <HTTPUpdate.h>
 #include <WebServer.h>
 
-#define FW_VERSION "3.3.1"
-#define FW_BUILD   "20261005_v3.3.1"
+#define FW_VERSION "3.4.0"
+#define FW_BUILD   "20261005_v3.4.0"
 #define PI4_LAN_IP          "192.168.1.65"
 #define PI4_TAILSCALE_IP    "100.107.34.92"
 
