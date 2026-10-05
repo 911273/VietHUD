@@ -803,16 +803,20 @@ void DisplayManager::drawWiFiOTAPage() {
         m_canvas->print("Dang do tim tin hieu...");
     } else if (m_otaWorkflowState == 2 || m_otaWorkflowState == 3) { // CONNECTED / CHECKING
         m_canvas->setTextColor(COLOR_WHITE);
-        m_canvas->setCursor(boxX + 16, 120);
+        m_canvas->setCursor(boxX + 16, 114);
         m_canvas->printf("IP: %s", m_wifiIp);
 
         m_canvas->setTextColor(COLOR_SAFE);
-        m_canvas->setCursor(boxX + 16, 136);
+        m_canvas->setCursor(boxX + 16, 128);
         m_canvas->printf("Song: %d dBm (Tot)", m_wifiRssi);
 
         m_canvas->setTextColor(COLOR_CYAN);
-        m_canvas->setCursor(boxX + 16, 156);
-        m_canvas->print("Pi4: http://192.168.1.65/");
+        m_canvas->setCursor(boxX + 16, 144);
+        m_canvas->print("Pi4 LAN: " PI4_LAN_IP);
+
+        m_canvas->setTextColor(COLOR_ROAD_TEXT);
+        m_canvas->setCursor(boxX + 16, 160);
+        m_canvas->print("Pi4 TS:  " PI4_TAILSCALE_IP);
     } else if (m_otaWorkflowState == 4 || m_otaWorkflowState == 7) { // DOWNLOADING
         int barX = boxX + 16;
         int barY = 120;
@@ -845,25 +849,32 @@ void DisplayManager::drawWiFiOTAPage() {
         m_canvas->print("KHONG NGAT NGUON !");
     } else if (m_otaWorkflowState == 5) { // UP_TO_DATE
         m_canvas->setTextColor(COLOR_SAFE);
-        m_canvas->setCursor(boxX + 16, 120);
+        m_canvas->setCursor(boxX + 16, 114);
         m_canvas->print("Phien ban: v" FW_VERSION);
 
         m_canvas->setTextColor(COLOR_CYAN);
-        m_canvas->setCursor(boxX + 16, 136);
+        m_canvas->setCursor(boxX + 16, 128);
         m_canvas->printf("Web OTA: http://%s/", m_wifiIp);
 
+        m_canvas->setTextColor(COLOR_ROAD_TEXT);
+        m_canvas->setCursor(boxX + 16, 144);
+        m_canvas->print("Pi4 TS: " PI4_TAILSCALE_IP);
+
         m_canvas->setTextColor(COLOR_WARN);
-        m_canvas->setCursor(boxX + 16, 158);
+        m_canvas->setCursor(boxX + 16, 162);
         m_canvas->printf("Tu dong ve HUD sau: %ds", m_otaCountdownSec);
     } else { // FAILED
         m_canvas->setTextColor(COLOR_SILVER);
-        m_canvas->setCursor(boxX + 16, 120);
-        m_canvas->print("Khong tim thay AP hoac Server");
-        m_canvas->setCursor(boxX + 16, 136);
-        m_canvas->print("Kiem tra lai Pi 4 / Hotspot");
+        m_canvas->setCursor(boxX + 16, 114);
+        m_canvas->print("Khong tim thay AP / Pi 4");
+        m_canvas->setCursor(boxX + 16, 128);
+        m_canvas->print("Thu ca LAN & Tailscale");
+        m_canvas->setTextColor(COLOR_ROAD_TEXT);
+        m_canvas->setCursor(boxX + 16, 144);
+        m_canvas->print("TS IP: " PI4_TAILSCALE_IP);
 
         m_canvas->setTextColor(COLOR_WARN);
-        m_canvas->setCursor(boxX + 16, 158);
+        m_canvas->setCursor(boxX + 16, 162);
         m_canvas->printf("Tu dong ve HUD sau: %ds", m_otaCountdownSec);
     }
 

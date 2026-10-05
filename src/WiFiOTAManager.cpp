@@ -170,46 +170,81 @@ void WiFiOTAManager::setupWebServer() {
 }
 
 void WiFiOTAManager::executeHttpCheck() {
-    Serial.println("[OTA] Dang kiem tra version.json tu Pi 4 (192.168.1.65)...");
+    Serial.println("[OTA] Kiem tra version.json (LAN " PI4_LAN_IP " hoac Tailscale " PI4_TAILSCALE_IP ")...");
 
     bool hasUpdate = false;
     String targetUrl = "";
+    String backupUrl = "";
     String remoteVer = "";
     String remoteBuild = "";
 
+    const char* checkUrls[] = {
+        "http://" PI4_LAN_IP "/viethud/firmware/version.json",
+        "http://" PI4_TAILSCALE_IP "/viethud/firmware/version.json"
+    };
+
+    String payload = "";
+    bool connectedViaTailscale = false;
+
     HTTPClient http;
-    http.setTimeout(4500);
+    http.setTimeout(4000);
 
-    // Try Pi 4 LAN IP
-    if (http.begin("http://192.168.1.65/viethud/firmware/version.json")) {
-        int code = http.GET();
-        if (code == HTTP_CODE_OK) {
-            String payload = http.getString();
-            Serial.println("[OTA] Nhan version.json:");
-            Serial.println(payload);
-
-            int vIdx = payload.indexOf("\"version\":");
-            if (vIdx > 0) {
-                int q1 = payload.indexOf("\"", vIdx + 10);
-                int q2 = payload.indexOf("\"", q1 + 1);
-                if (q1 > 0 && q2 > q1) remoteVer = payload.substring(q1 + 1, q2);
+    for (int i = 0; i < 2; i++) {
+        Serial.printf("[OTA] Dang thu ket noi: %s\n", checkUrls[i]);
+        if (http.begin(checkUrls[i])) {
+            int code = http.GET();
+            if (code == HTTP_CODE_OK) {
+                payload = http.getString();
+                connectedViaTailscale = (i == 1);
+                Serial.printf("[OTA] Ket noi thanh cong qua %s!\n", (i == 0) ? "LAN (" PI4_LAN_IP ")" : "Tailscale (" PI4_TAILSCALE_IP ")");
+                http.end();
+                break;
             }
-
-            int uIdx = payload.indexOf("\"url_pi4\":");
-            if (uIdx > 0) {
-                int q1 = payload.indexOf("\"", uIdx + 10);
-                int q2 = payload.indexOf("\"", q1 + 1);
-                if (q1 > 0 && q2 > q1) targetUrl = payload.substring(q1 + 1, q2);
-            }
-
-            int bIdx = payload.indexOf("\"build\":");
-            if (bIdx > 0) {
-                int q1 = payload.indexOf("\"", bIdx + 8);
-                int q2 = payload.indexOf("\"", q1 + 1);
-                if (q1 > 0 && q2 > q1) remoteBuild = payload.substring(q1 + 1, q2);
-            }
+            http.end();
         }
-        http.end();
+    }
+
+    if (payload.length() > 0) {
+        Serial.println("[OTA] Nhan version.json:");
+        Serial.println(payload);
+
+        int vIdx = payload.indexOf("\"version\":");
+        if (vIdx > 0) {
+            int q1 = payload.indexOf("\"", vIdx + 10);
+            int q2 = payload.indexOf("\"", q1 + 1);
+            if (q1 > 0 && q2 > q1) remoteVer = payload.substring(q1 + 1, q2);
+        }
+
+        int bIdx = payload.indexOf("\"build\":");
+        if (bIdx > 0) {
+            int q1 = payload.indexOf("\"", bIdx + 8);
+            int q2 = payload.indexOf("\"", q1 + 1);
+            if (q1 > 0 && q2 > q1) remoteBuild = payload.substring(q1 + 1, q2);
+        }
+
+        String lanUrl = "";
+        int uIdx = payload.indexOf("\"url_pi4\":");
+        if (uIdx > 0) {
+            int q1 = payload.indexOf("\"", uIdx + 10);
+            int q2 = payload.indexOf("\"", q1 + 1);
+            if (q1 > 0 && q2 > q1) lanUrl = payload.substring(q1 + 1, q2);
+        }
+
+        String tsUrl = "";
+        int tsIdx = payload.indexOf("\"url_pi4_tailscale\":");
+        if (tsIdx > 0) {
+            int q1 = payload.indexOf("\"", tsIdx + 20);
+            int q2 = payload.indexOf("\"", q1 + 1);
+            if (q1 > 0 && q2 > q1) tsUrl = payload.substring(q1 + 1, q2);
+        }
+
+        if (connectedViaTailscale && tsUrl.length() > 0) {
+            targetUrl = tsUrl;
+            backupUrl = lanUrl;
+        } else {
+            targetUrl = lanUrl;
+            backupUrl = tsUrl;
+        }
     }
 
     if (remoteVer.length() > 0) {
@@ -236,6 +271,12 @@ void WiFiOTAManager::executeHttpCheck() {
 
         WiFiClient client;
         t_httpUpdate_return ret = httpUpdate.update(client, targetUrl);
+
+        if (ret != HTTP_UPDATE_OK && backupUrl.length() > 0) {
+            Serial.printf("[OTA] Thu lai voi backup URL: %s\n", backupUrl.c_str());
+            ret = httpUpdate.update(client, backupUrl);
+        }
+
         m_isUpdating = false;
 
         if (ret == HTTP_UPDATE_OK) {
@@ -262,7 +303,7 @@ void WiFiOTAManager::executeHttpCheck() {
         m_stateChangeTime = millis();
         m_autoReturnDurationMs = 8000;
         snprintf(m_workflowMsg, sizeof(m_workflowMsg), "KHONG KET NOI DUOC PI 4");
-        Serial.println("[OTA] Khong the tai version.json tu Pi 4.");
+        Serial.println("[OTA] Khong the tai version.json tu Pi 4 qua ca LAN va Tailscale.");
     }
 }
 
