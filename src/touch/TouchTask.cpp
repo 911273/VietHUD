@@ -1,9 +1,5 @@
 #include "TouchTask.h"
-#if defined(VIETHUD_BOARD_ES3C28P)
-#include "FT6336Touch.h"
-#else
-#include "AXS15231BTouch.h"
-#endif
+#include "core/Board.h" // boardTouchBegin/SetRotation/Read — the controller is the board's
 #include "core/AppConfig.h" // cfg.screenRotation
 #include "pincfg.h"
 #include "dispcfg.h"
@@ -13,11 +9,6 @@
 #include <freertos/semphr.h>
 #include <esp_task_wdt.h>
 
-#if defined(VIETHUD_BOARD_ES3C28P)
-static FT6336Touch touch(TOUCH_ADDR, TFT_RES_W, TFT_RES_H); // I2C bus already up — see core/Board.cpp
-#else
-static AXS15231BTouch touch(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_ADDR);
-#endif
 static SemaphoreHandle_t touchMutex;
 static TouchPoint sharedPoint;
 
@@ -29,23 +20,19 @@ TouchPoint touchSnapshot() {
 }
 
 static void touchTaskFn(void *) {
-    if (!touch.begin()) Serial.println("[touch] ERROR: touch I2C init failed");
+    if (!boardTouchBegin()) Serial.println("[touch] ERROR: touch I2C init failed");
     // Must numerically match display/DisplayDriver.cpp's gfx rotation —
     // confirmed by reading AXS15231BTouch::getPoint()'s own rotation switch,
     // it uses the identical 0-3 convention against the same native
     // TFT_RES_W/TFT_RES_H calibration range below (that range itself is NOT
     // rotation-dependent — it's the raw panel's native geometry regardless
     // of which way the logical screen is currently rotated).
-    touch.setRotation((uint8_t)cfg.screenRotation);
-#if !defined(VIETHUD_BOARD_ES3C28P) // FT6336 reports panel pixels directly, no calibration range
-    touch.enableOffsetCorrection(true);
-    touch.setOffsets(TOUCH_X_MIN, TOUCH_X_MAX, TFT_RES_W - 1, TOUCH_Y_MIN, TOUCH_Y_MAX, TFT_RES_H - 1);
-#endif
+    boardTouchSetRotation((uint8_t)cfg.screenRotation);
 
     esp_task_wdt_add(NULL);
     for (;;) {
         uint16_t x, y;
-        bool touched = touch.getPoint(&x, &y);
+        bool touched = boardTouchRead(&x, &y);
 
         xSemaphoreTake(touchMutex, portMAX_DELAY);
         sharedPoint.pressed = touched;

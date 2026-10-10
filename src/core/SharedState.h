@@ -10,6 +10,11 @@ struct GnssSnapshot {
     float rawSpeedKmh = 0;
     bool fix = true;          // a real, current position+speed fix — this is what safety logic (speeding
                                 // overlay, GNSS status) must key off, NOT linkAlive below.
+    // egoSpeedKmh is trustworthy for DISPLAY. True whenever fix is, and also
+    // earlier on NAV-PVT receivers (VietHUD 2.8): Doppler speed is accurate as
+    // soon as the module has any fix, well before the position passes the
+    // accuracy gate that `fix` waits for. Alerts must still key off `fix`.
+    bool speedValid = true;
     // Purely a UI/diagnostic signal — distinguishes "module is alive and
     // sending valid NMEA, just hasn't found satellites yet" (normal,
     // expected while indoors/cold-starting) from "not receiving anything at

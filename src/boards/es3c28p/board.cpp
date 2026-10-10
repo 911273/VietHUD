@@ -1,8 +1,10 @@
-#include "Board.h"
-#include "pincfg.h"
+// LCDwiki ES3C28P (VietHUD 2.8") — core/Board.h implementation.
+// Pins/capabilities: include/boards/es3c28p/board_config.h.
+#include "core/Board.h"
+#include "boards/board.h"
+#include "touch/FT6336Touch.h"
 #include <Arduino.h>
-
-#if defined(VIETHUD_BOARD_ES3C28P)
+#include <Arduino_GFX_Library.h>
 #include <Wire.h>
 
 // ES8311 mono codec, slave mode, MCLK = 256 x fs on its MCLK pin. With a
@@ -65,9 +67,21 @@ void boardEarlyInit() {
     boardAmpEnable(true);
 }
 
-#else
+// ILI9341V on plain 4-wire SPI (FSPI), behind the same Arduino_Canvas wrapper
+// as the 3.5" panel so rotation, the cache-friendly blit and every
+// gfx->width()/height() caller work unchanged — the canvas is only 150 KB
+// here and a full-frame push is ~31 ms at 40 MHz.
+// ips = true: this is an IPS ILI9341V that needs display inversion (BGR order
+// as the driver sets it) — confirmed on the real unit 2026-10-10 with a 4-way
+// invert x RGB/BGR test pattern; without it every colour is inverted.
+Arduino_GFX *boardCreatePanel() {
+    Arduino_DataBus *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, TFT_MISO, FSPI);
+    return new Arduino_ILI9341(bus, GFX_NOT_DEFINED, 0, true);
+}
 
-void boardEarlyInit() {}
-void boardAmpEnable(bool) {}
-
-#endif
+// FT6336 reports panel pixels directly (no calibration range). The I2C bus is
+// already up — boardEarlyInit() owns it (the ES8311 sits on it too).
+static FT6336Touch touch(TOUCH_ADDR, TFT_RES_W, TFT_RES_H);
+bool boardTouchBegin() { return touch.begin(); }
+void boardTouchSetRotation(uint8_t rotation) { touch.setRotation(rotation); }
+bool boardTouchRead(uint16_t *x, uint16_t *y) { return touch.getPoint(x, y); }

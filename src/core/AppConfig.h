@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include <Arduino.h>
 #include <math.h> // isfinite() — see sanitizeConfig() below
+#include "boards/board.h" // BOARD_DEFAULT_ROTATION / BOARD_LANDSCAPE_ONLY
 
 // User-tunable settings, persisted to NVS (core/NvsStore.cpp) and edited
 // from ui/Settings.cpp and net/WebPortal.cpp's /api/v1/config. Trimmed
@@ -187,13 +188,9 @@ struct AppConfig {
     // take effect live (see ui/Settings.cpp's rotation row): both Dashboard
     // and Settings are laid out once at boot for whichever orientation is
     // active then, so a change only applies on the next restart.
-#if defined(VIETHUD_BOARD_ES3C28P)
-    // VietHUD 2.8 only has a landscape (320x240) dashboard layout, so it
-    // boots landscape and clampConfig() keeps it there (1 or 3).
-    float screenRotation = 1;
-#else
-    float screenRotation = 0;
-#endif
+    // Per board (include/boards/<board>/board_config.h): a board with only a
+    // landscape layout boots landscape and clampConfig() keeps it there.
+    float screenRotation = BOARD_DEFAULT_ROTATION;
     // themeMode: 0=Auto (today's only behavior — ui/Dashboard.cpp's
     // applyTheme() follows gnss.daytime's real sunrise/sunset calculation),
     // 1=Light, 2=Dark (both override gnss.daytime rather than replacing the
@@ -258,8 +255,8 @@ inline void clampConfig(AppConfig &c) {
     c.aheadLimitWarnDistM = constrain(c.aheadLimitWarnDistM, 50.0f, 100.0f);
     c.cameraWarnDistM = constrain(c.cameraWarnDistM, 50.0f, 100.0f);
     c.screenRotation = constrain(c.screenRotation, 0.0f, 3.0f);
-#if defined(VIETHUD_BOARD_ES3C28P)
-    if (lroundf(c.screenRotation) != 3) c.screenRotation = 1; // landscape only on 2.8
+#if BOARD_LANDSCAPE_ONLY
+    if (lroundf(c.screenRotation) != 3) c.screenRotation = 1; // only a landscape layout exists for this board
 #endif
     c.themeMode = constrain(c.themeMode, 0.0f, 2.0f);
     c.brightnessMode = constrain(c.brightnessMode, 0.0f, 1.0f);
