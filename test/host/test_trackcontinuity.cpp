@@ -141,7 +141,17 @@ static Path makePath(bool takeElevated) {
 
 // Environment: open sky vs. under the viaduct (surface road below E, where GPS
 // multipath is bad). gradeFlags: data carries SEGFLAG_BRIDGE (rebuilt cards).
-struct Env { double openNoise, openBias, underNoise, underBias; bool gradeFlags; bool altitude; };
+struct Env {
+    double openNoise, openBias, underNoise, underBias;
+    bool gradeFlags;
+    bool altitude;
+    // NAV-PVT receiver (VietHUD 2.8): the climb comes from integrated Doppler
+    // vertical speed instead of differencing absolute altitude. (Driving the
+    // distance sigma from the receiver's hAcc was also tried 2026-10-10 and
+    // made every case WORSE — urban error is mostly slow multipath bias, which
+    // hAcc under-reports — so the fixed kSigmaDistM stays.)
+    bool navPvt = false;
+};
 static bool underViaduct(char road, double x) { return road == 'G' && x > 335 && x < 1505; }
 static double trueAltitude(char road, double x) {
     if (road == 'E') return 10.0;
@@ -178,6 +188,12 @@ static Result drive(bool takeElevated, bool newAlgo, unsigned seed, const Env &e
         static double az = 0;
         az = 0.95 * az + n01(rng) * 0.6;
         altHist[k] = trueAltitude(path.road[k], path.pts[k].first) + az + n01(rng) * 1.0;
+        // Integrated Doppler vertical speed: true height change + 0.15 m/s white
+        // noise per 1 s sample + a small 0.02 m/s bias (receiver velD model).
+        static double velHist[400];
+        velHist[k] = (k == 1 ? 0.0 : velHist[k - 1]) +
+                     (trueAltitude(path.road[k], path.pts[k].first) - trueAltitude(path.road[k - 1], path.pts[k - 1].first)) +
+                     n01(rng) * 0.15 + 0.02;
         double tx = path.pts[k].first - path.pts[k - 1].first, ty = path.pts[k].second - path.pts[k - 1].second;
         double heading = std::atan2(tx, ty) * 180.0 / M_PI + n01(rng) * 4.0;
 
@@ -201,7 +217,10 @@ static Result drive(bool takeElevated, bool newAlgo, unsigned seed, const Env &e
                 tc.step(&seed, 1, e0, nbFn, nullptr);
             }
             TrackEvidence ev;
-            if (env.altitude && k > 40) { ev.altValid = true; ev.climbM = (float)(altHist[k] - altHist[k - 40]); }
+            if (env.altitude && k > 40) {
+                ev.altValid = true;
+                ev.climbM = (float)(env.navPvt ? velHist[k] - velHist[k - 40] : altHist[k] - altHist[k - 40]);
+            }
             // sky blocked: detected 85% of the time under the viaduct, 5% false alarms elsewhere
             std::uniform_real_distribution<double> u01(0, 1);
             ev.skyBlocked = env.altitude && (under ? u01(rng) < 0.85 : u01(rng) < 0.05);
@@ -252,6 +271,12 @@ int main() {
          {3, 4, 5, 8, true, true}, 97.0},   // measured 97.6-100%
         {"stress: 5 m + 10 m drifting bias EVERYWHERE, no flags",
          {5, 10, 5, 10, false, false}, 0.0},
+        {"VietHUD 2.8 NAV-PVT: rebuilt cards + Doppler climb; same GPS",
+         {3, 4, 5, 8, true, true, true}, 97.0},
+        {"VietHUD 2.8 NAV-PVT stress: 5 m + 10 m bias everywhere, rebuilt cards",
+         {5, 10, 5, 10, true, true, true}, 0.0},
+        {"reference for the stress above without NAV-PVT extras",
+         {5, 10, 5, 10, true, true, false}, 0.0},
     };
     for (const Case &cs : cases) {
         for (double offset : {6.0, 0.0}) {

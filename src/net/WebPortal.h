@@ -54,6 +54,8 @@ bool webPortalIsEnabled();
 // What the UI last asked for (applied by the web task shortly after) — for a
 // switch that must not flicker back while the radio is still starting.
 bool webPortalRequestedOn();
+bool webPortalApActive();          // own access point is up (station-first: only as the fallback)
+int  webPortalApFallbackInSec();   // seconds until the AP fallback starts; -1 = not pending
 
 // Formats a short status string ("OFF" or "ON, IP=192.168.4.1") into buf —
 // used by Settings.cpp's WiFi tab. A formatted buffer, not a getter

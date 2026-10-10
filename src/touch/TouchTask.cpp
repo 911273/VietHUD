@@ -1,5 +1,9 @@
 #include "TouchTask.h"
+#if defined(VIETHUD_BOARD_ES3C28P)
+#include "FT6336Touch.h"
+#else
 #include "AXS15231BTouch.h"
+#endif
 #include "core/AppConfig.h" // cfg.screenRotation
 #include "pincfg.h"
 #include "dispcfg.h"
@@ -9,7 +13,11 @@
 #include <freertos/semphr.h>
 #include <esp_task_wdt.h>
 
+#if defined(VIETHUD_BOARD_ES3C28P)
+static FT6336Touch touch(TOUCH_ADDR, TFT_RES_W, TFT_RES_H); // I2C bus already up — see core/Board.cpp
+#else
 static AXS15231BTouch touch(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_ADDR);
+#endif
 static SemaphoreHandle_t touchMutex;
 static TouchPoint sharedPoint;
 
@@ -29,8 +37,10 @@ static void touchTaskFn(void *) {
     // rotation-dependent — it's the raw panel's native geometry regardless
     // of which way the logical screen is currently rotated).
     touch.setRotation((uint8_t)cfg.screenRotation);
+#if !defined(VIETHUD_BOARD_ES3C28P) // FT6336 reports panel pixels directly, no calibration range
     touch.enableOffsetCorrection(true);
     touch.setOffsets(TOUCH_X_MIN, TOUCH_X_MAX, TFT_RES_W - 1, TOUCH_Y_MIN, TOUCH_Y_MAX, TFT_RES_H - 1);
+#endif
 
     esp_task_wdt_add(NULL);
     for (;;) {

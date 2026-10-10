@@ -11,6 +11,15 @@
 // smoothing, per-target display toggles, demo mode) is gone with it rather
 // than left as dead config nobody reads; see git history if any of that is
 // ever needed again.
+
+// Wi-Fi networks every unit knows out of the box, after "iPhone của Pham"
+// (user-requested 2026-10-10). {ssid, password}.
+static const int kDefaultExtraNetworkCount = 2;
+static const char *const kDefaultExtraNetworks[kDefaultExtraNetworkCount][2] = {
+    {"Khoa CNNL", "cnnl2022"},
+    {"VuPQ", "moth@ib@bon"},
+};
+
 struct AppConfig {
     float brightness = 100; // % — drives the real backlight PWM
     // Gates the vehicle being continuously STATIONARY (see
@@ -141,6 +150,14 @@ struct AppConfig {
         strncpy(savedNetworks[0].password, "12345678@", sizeof(savedNetworks[0].password) - 1);
         savedNetworks[0].password[sizeof(savedNetworks[0].password) - 1] = '\0';
         savedNetworkCount = 1;
+        // More user-requested defaults (2026-10-10); NvsStore.cpp's schema 7
+        // adds the same list to units that already have saved networks.
+        for (int i = 0; i < kDefaultExtraNetworkCount && savedNetworkCount < kMaxSavedNetworks; i++) {
+            strncpy(savedNetworks[savedNetworkCount].ssid, kDefaultExtraNetworks[i][0], sizeof(savedNetworks[0].ssid) - 1);
+            strncpy(savedNetworks[savedNetworkCount].password, kDefaultExtraNetworks[i][1],
+                    sizeof(savedNetworks[0].password) - 1);
+            savedNetworkCount++;
+        }
     }
 
     // Base URL the online data updater fetches from (net/DataUpdater.cpp, added
@@ -170,7 +187,13 @@ struct AppConfig {
     // take effect live (see ui/Settings.cpp's rotation row): both Dashboard
     // and Settings are laid out once at boot for whichever orientation is
     // active then, so a change only applies on the next restart.
+#if defined(VIETHUD_BOARD_ES3C28P)
+    // VietHUD 2.8 only has a landscape (320x240) dashboard layout, so it
+    // boots landscape and clampConfig() keeps it there (1 or 3).
+    float screenRotation = 1;
+#else
     float screenRotation = 0;
+#endif
     // themeMode: 0=Auto (today's only behavior — ui/Dashboard.cpp's
     // applyTheme() follows gnss.daytime's real sunrise/sunset calculation),
     // 1=Light, 2=Dark (both override gnss.daytime rather than replacing the
@@ -235,6 +258,9 @@ inline void clampConfig(AppConfig &c) {
     c.aheadLimitWarnDistM = constrain(c.aheadLimitWarnDistM, 50.0f, 100.0f);
     c.cameraWarnDistM = constrain(c.cameraWarnDistM, 50.0f, 100.0f);
     c.screenRotation = constrain(c.screenRotation, 0.0f, 3.0f);
+#if defined(VIETHUD_BOARD_ES3C28P)
+    if (lroundf(c.screenRotation) != 3) c.screenRotation = 1; // landscape only on 2.8
+#endif
     c.themeMode = constrain(c.themeMode, 0.0f, 2.0f);
     c.brightnessMode = constrain(c.brightnessMode, 0.0f, 1.0f);
     c.mapSourceIndex = constrain(c.mapSourceIndex, 0.0f, 10.0f);
