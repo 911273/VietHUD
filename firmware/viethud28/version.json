@@ -1,0 +1,10 @@
+{
+  "model": "viethud28",
+  "version": "3.1.1",
+  "build": "20261010",
+  "url_pi4": "http://192.168.1.65/viethud/firmware/viethud28/3.1.1/firmware.bin",
+  "url_pi4_mdns": "http://homebridge.local/viethud/firmware/viethud28/3.1.1/firmware.bin",
+  "url_pi4_tailscale": "http://100.107.34.92/viethud/firmware/viethud28/3.1.1/firmware.bin",
+  "url_github": "https://raw.githubusercontent.com/911273/VietHUD/main/firmware/viethud28/3.1.1/firmware.bin",
+  "notes": "Tự kiểm tra cập nhật khi có WiFi, tối ưu GPS P18 Pro"
+}
