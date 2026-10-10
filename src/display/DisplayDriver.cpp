@@ -3,8 +3,20 @@
 #include "pincfg.h"
 #include "dispcfg.h"
 
+#if defined(VIETHUD_BOARD_ES3C28P)
+// VietHUD 2.8: ILI9341V on plain 4-wire SPI (FSPI). Kept behind the same
+// Arduino_Canvas wrapper as the 3.5" panel so rotation, the cache-friendly
+// blit below and every gfx->width()/height() caller work unchanged — the
+// canvas is only 150 KB here and a full-frame push is ~31 ms at 40 MHz.
+static Arduino_DataBus *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, TFT_MISO, FSPI);
+// ips = true: this is an IPS ILI9341V that needs display inversion (BGR order
+// as the driver sets it) — confirmed on the real unit 2026-10-10 with a 4-way
+// invert x RGB/BGR test pattern; without it every colour is inverted.
+static Arduino_GFX *panel = new Arduino_ILI9341(bus, GFX_NOT_DEFINED, 0, true);
+#else
 static Arduino_DataBus *bus = new Arduino_ESP32QSPI(TFT_CS, TFT_SCK, TFT_SDA0, TFT_SDA1, TFT_SDA2, TFT_SDA3);
 static Arduino_GFX *panel = new Arduino_AXS15231B(bus, GFX_NOT_DEFINED, 0, false, TFT_RES_W, TFT_RES_H);
+#endif
 // Constructed inside displayBegin(), NOT here at file-scope static-init
 // time — cfg.screenRotation isn't loaded from NVS until
 // loadConfigFromNVS(cfg) runs partway through main_ui_demo.cpp's setup(),
@@ -85,7 +97,11 @@ void displayBegin() {
     // runs (main_ui_demo.cpp's setup() calls loadConfigFromNVS(cfg) before
     // displayBegin() — this order is load-bearing, not incidental).
     gfx = new Arduino_Canvas(TFT_RES_W, TFT_RES_H, panel, 0, 0, (uint8_t)cfg.screenRotation);
+#if defined(VIETHUD_BOARD_ES3C28P)
+    if (!gfx->begin(TFT_SPI_HZ)) Serial.println("[display] ERROR: display init failed");
+#else
     if (!gfx->begin()) Serial.println("[display] ERROR: display init failed");
+#endif
     gfx->fillScreen(RGB565_BLACK); // "BLACK" alias was removed in GFX 1.6.x
     Serial.printf("[display] Canvas size after rotation=%d: %dx%d\n", (int)cfg.screenRotation, gfx->width(),
                   gfx->height());

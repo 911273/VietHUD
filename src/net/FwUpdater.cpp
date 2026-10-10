@@ -87,29 +87,42 @@ bool fwUpdaterCheck(FwUpdateInfo &info) {
 
     if (WiFi.status() != WL_CONNECTED) return false;
 
-    // Step 1: Probe Raspberry Pi 4 on LAN first
-    static const char *kPi4Endpoints[] = {
-        "http://192.168.1.65/viethud/firmware/version.json",
-        "http://homebridge.local/viethud/firmware/version.json"
+    // Step 1: Probe the Raspberry Pi 4 — home LAN first, then over Tailscale
+    // (same as VietHUD Lite), so a phone hotspot away from home still reaches
+    // it. The firmware is downloaded over the SAME route that answered: each
+    // endpoint names the version.json key holding its own download URL.
+    static const struct {
+        const char *url;
+        const char *base;   // fallback download base when version.json has no URL key
+        const char *urlKey; // version.json key with this route's firmware.bin URL
+        const char *name;
+    } kPi4Endpoints[] = {
+        {"http://192.168.1.65/viethud/" VIETHUD_FW_CHANNEL "/version.json", "http://192.168.1.65/viethud/",
+         "url_pi4", "Pi 4 (LAN)"},
+        {"http://homebridge.local/viethud/" VIETHUD_FW_CHANNEL "/version.json", "http://homebridge.local/viethud/",
+         "url_pi4_mdns", "Pi 4 (mDNS)"},
+        {"http://100.107.34.92/viethud/" VIETHUD_FW_CHANNEL "/version.json", "http://100.107.34.92/viethud/",
+         "url_pi4_tailscale", "Pi 4 (Tailscale)"},
     };
 
     String json;
     bool found = false;
 
-    for (const char *ep : kPi4Endpoints) {
-        Serial.printf("[fwupd] Probing Pi 4 at %s...\n", ep);
-        if (fetchUrl(ep, json, 2500)) {
+    for (const auto &ep : kPi4Endpoints) {
+        Serial.printf("[fwupd] Probing Pi 4 at %s...\n", ep.url);
+        if (fetchUrl(ep.url, json, 2500)) {
             char ver[16] = "";
             if (extractJsonString(json.c_str(), "version", ver, sizeof(ver))) {
                 strncpy(info.remoteVersion, ver, sizeof(info.remoteVersion) - 1);
                 char url[160] = "";
-                if (extractJsonString(json.c_str(), "url_pi4", url, sizeof(url))) {
+                if (extractJsonString(json.c_str(), ep.urlKey, url, sizeof(url))) {
                     strncpy(info.downloadUrl, url, sizeof(info.downloadUrl) - 1);
                 } else {
-                    snprintf(info.downloadUrl, sizeof(info.downloadUrl), "http://192.168.1.65/viethud/firmware/%s/firmware.bin", ver);
+                    snprintf(info.downloadUrl, sizeof(info.downloadUrl), "%s" VIETHUD_FW_CHANNEL "/%s/firmware.bin",
+                             ep.base, ver);
                 }
                 extractJsonString(json.c_str(), "notes", info.releaseNotes, sizeof(info.releaseNotes));
-                strncpy(info.sourceName, "Pi 4 (LAN)", sizeof(info.sourceName) - 1);
+                strncpy(info.sourceName, ep.name, sizeof(info.sourceName) - 1);
                 found = true;
                 Serial.printf("[fwupd] Found firmware %s on Pi 4!\n", ver);
                 break;
@@ -119,7 +132,7 @@ bool fwUpdaterCheck(FwUpdateInfo &info) {
 
     // Step 2: Probe GitHub if Pi 4 not found or has no update
     if (!found) {
-        static const char *kGithubUrl = "https://raw.githubusercontent.com/911273/VietHUD/main/firmware/version.json";
+        static const char *kGithubUrl = "https://raw.githubusercontent.com/911273/VietHUD/main/" VIETHUD_FW_CHANNEL "/version.json";
         Serial.printf("[fwupd] Probing GitHub at %s...\n", kGithubUrl);
         if (fetchUrl(kGithubUrl, json, 5000)) {
             char ver[16] = "";
@@ -129,7 +142,7 @@ bool fwUpdaterCheck(FwUpdateInfo &info) {
                 if (extractJsonString(json.c_str(), "url_github", url, sizeof(url))) {
                     strncpy(info.downloadUrl, url, sizeof(info.downloadUrl) - 1);
                 } else {
-                    snprintf(info.downloadUrl, sizeof(info.downloadUrl), "https://raw.githubusercontent.com/911273/VietHUD/main/firmware/%s/firmware.bin", ver);
+                    snprintf(info.downloadUrl, sizeof(info.downloadUrl), "https://raw.githubusercontent.com/911273/VietHUD/main/" VIETHUD_FW_CHANNEL "/%s/firmware.bin", ver);
                 }
                 extractJsonString(json.c_str(), "notes", info.releaseNotes, sizeof(info.releaseNotes));
                 strncpy(info.sourceName, "GitHub (Cloud)", sizeof(info.sourceName) - 1);
@@ -140,6 +153,17 @@ bool fwUpdaterCheck(FwUpdateInfo &info) {
     }
 
     if (found) {
+        // Wrong-product guard: an image for another VietHUD model (or VietHUD
+        // Lite, whose version.json has no "model" at all) must never be offered.
+        char model[24] = "";
+        extractJsonString(json.c_str(), "model", model, sizeof(model));
+        if (strcmp(model, VIETHUD_MODEL_ID) != 0) {
+            Serial.printf("[fwupd] REFUSED: server version.json is for model \"%s\", this device is \"%s\"\n",
+                          model[0] ? model : "(none)", VIETHUD_MODEL_ID);
+            info.remoteVersion[0] = '\0';
+            info.downloadUrl[0] = '\0';
+            return false;
+        }
         if (compareVersions(info.remoteVersion, info.currentVersion) > 0) {
             info.hasUpdate = true;
         }

@@ -730,15 +730,38 @@ static int trackNeighbors(uint32_t segId, uint32_t *out, int maxOut, void *) {
 
 // Layer evidence: GNSS altitude change over ~40 s of driving, and a sudden
 // sky-view loss (HDOP well above the recent open-sky baseline).
+// The height signal is, in order of preference: the running integral of the
+// Doppler vertical speed (NAV-PVT modules — VietHUD 2.8; centimetre-per-second
+// noise instead of the +-5..10 m jumps of absolute GNSS altitude, so a 6 m ramp
+// climb stands out clearly), else absolute altitude (NMEA modules). The window
+// history is restarted whenever the source switches so the two never mix.
 static TrackEvidence updateTrackEvidence(const GnssSnapshot &gnss) {
     static float altHist[64];
     static uint32_t altMs[64];
     static int altN = 0, altHead = 0;
     static float hdopBase = 0;
+    static int8_t srcUsed = -1;     // 0 absolute altitude, 1 integrated vertical speed
+    static float relHeightM = 0;
+    static uint32_t lastIntegMs = 0;
     TrackEvidence ev;
     uint32_t now = millis();
-    if (gnss.altitudeValid) {
-        altHist[altHead] = gnss.altitudeM;
+    int8_t src = gnss.vertSpeedValid ? 1 : (gnss.altitudeValid ? 0 : -1);
+    if (src != srcUsed) {
+        altN = 0;
+        relHeightM = 0;
+        srcUsed = src;
+        lastIntegMs = now;
+    }
+    float heightM = gnss.altitudeM;
+    if (src == 1) {
+        uint32_t dtMs = now - lastIntegMs;
+        if (dtMs > 2000) dtMs = 2000; // a stalled tick must not turn one sample into a big step
+        relHeightM += gnss.vertSpeedMs * (dtMs / 1000.0f);
+        lastIntegMs = now;
+        heightM = relHeightM;
+    }
+    if (src >= 0) {
+        altHist[altHead] = heightM;
         altMs[altHead] = now;
         altHead = (altHead + 1) % 64;
         if (altN < 64) altN++;
@@ -748,7 +771,7 @@ static TrackEvidence updateTrackEvidence(const GnssSnapshot &gnss) {
             uint32_t age = now - altMs[i];
             if (age <= 60000 && age >= 35000) {
                 ev.altValid = gnss.egoSpeedKmh > 15.0f; // only meaningful while actually driving
-                ev.climbM = gnss.altitudeM - altHist[i];
+                ev.climbM = heightM - altHist[i];
                 break;
             }
         }

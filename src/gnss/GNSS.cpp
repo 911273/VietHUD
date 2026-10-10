@@ -59,7 +59,8 @@ void gnssSimStart(float lat, float lon, float headingDeg, float speedKmh, float 
 // a wiring fault), 38400 decoded clean, valid NMEA immediately (12 sats,
 // real fix). Don't assume 9600 for a "default" M10N breakout again; verify
 // per-board like this was.
-static const uint32_t kGnssBaud = 38400;
+// VietHUD 2.8's module runs at 115200 instead (pincfg.h GNSS_BAUD).
+static const uint32_t kGnssBaud = GNSS_BAUD;
 
 // Spec section 5.3: raw GNSS speed must be filtered (median, then EMA/
 // low-pass) before it drives the audio-gate hysteresis, so sensor noise
@@ -156,6 +157,15 @@ static void ubxSend(uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t len) {
     Serial2.write(ck, 2);
 }
 
+#if defined(VIETHUD_BOARD_ES3C28P)
+// Sends "$<body>*CS\r\n" to the module (vendor NMEA-style commands).
+static void gnssSendNmeaCmd(const char *body) {
+    uint8_t cs = 0;
+    for (const char *p = body; *p; p++) cs ^= (uint8_t)*p;
+    Serial2.printf("$%s*%02X\r\n", body, cs);
+}
+#endif
+
 static void ubxValset(const UbxKv *kv, int n) {
     static uint8_t pl[4 + 16 * 8];
     int len = 0;
@@ -170,13 +180,178 @@ static void ubxValset(const UbxKv *kv, int n) {
     ubxSend(0x06, 0x8A, pl, len); // UBX-CFG-VALSET
 }
 
+// UBX NAV-PVT -> NMEA bridge (2026-10-10, VietHUD 2.8). The 2.8's GPS is a
+// "P18 Pro" drone module (reports M10 ROM SPG 5.10) that only outputs UBX
+// NAV-PVT + NAV-SAT at ~10 Hz and cannot be configured at all — confirmed on
+// the real unit: CFG-VALSET (RAM, and RAM+BBR+Flash), legacy CFG-MSG and
+// CFG-RATE are ACKed but change nothing; CASIC $PCAS and MediaTek $PMTK get
+// no reply. So the automotive dynamic model the 3.5" build sets on its M10
+// can't be had here; instead this bridge does the equivalent work on the
+// ESP32 side and feeds the result to the same TinyGPS instance as $GPRMC +
+// $GPGGA (+ $xxGSV counts from NAV-SAT), leaving everything downstream
+// untouched:
+//   * all ~10 samples of each second are used, not just one — velocity is
+//     averaged as a N/E vector (speed AND course, ~3x less noise), while the
+//     output cadence stays the 1 Hz the speed filter / fix-timeout logic was
+//     tuned on with the 3.5" NMEA module;
+//   * fixes worse than kMaxHAccM horizontal accuracy are reported as no-fix,
+//     so a wandering urban-canyon position can't map-match the wrong road;
+//   * stationary hold: an averaged speed below the module's own speed
+//     accuracy (and under kStaticHoldKmh) is reported as 0, which is what the
+//     automotive model's static hold would do at a red light.
+// Harmless on a module that does send NMEA (it never emits NAV-PVT unasked).
+static const float kMaxHAccM = 50.0f;
+static const float kStaticHoldKmh = 5.0f;
+
+static void feedNmea(const char *body) {
+    uint8_t cs = 0;
+    for (const char *p = body; *p; p++) cs ^= (uint8_t)*p;
+    char tail[6];
+    snprintf(tail, sizeof(tail), "*%02X\r\n", cs);
+    gps.encode('$');
+    for (const char *p = body; *p; p++) gps.encode(*p);
+    for (const char *p = tail; *p; p++) gps.encode(*p);
+}
+
+static void fmtCoord(char *out, size_t cap, int32_t e7, bool isLat) {
+    char hemi = isLat ? (e7 < 0 ? 'S' : 'N') : (e7 < 0 ? 'W' : 'E');
+    uint32_t a = (uint32_t)(e7 < 0 ? -(int64_t)e7 : e7);
+    uint32_t deg = a / 10000000u;
+    double minutes = (double)(a % 10000000u) * 60.0 / 1e7;
+    snprintf(out, cap, isLat ? "%02lu%08.5f,%c" : "%03lu%08.5f,%c", (unsigned long)deg, minutes, hemi);
+}
+
+static inline int32_t ubxI32(const uint8_t *p, int o) {
+    return (int32_t)((uint32_t)p[o] | ((uint32_t)p[o + 1] << 8) | ((uint32_t)p[o + 2] << 16) | ((uint32_t)p[o + 3] << 24));
+}
+static inline uint16_t ubxU16(const uint8_t *p, int o) { return (uint16_t)(p[o] | (p[o + 1] << 8)); }
+
+// Latest per-second vertical speed from the bridge (+ = up), picked up by the
+// GNSS task loop below into GnssSnapshot::vertSpeedMs. Same task, no locking.
+static const float kMaxVertSAccMs = 1.0f; // speed accuracy above this = don't trust velD
+static float sBridgeVertMs = 0;
+static bool sBridgeVertValid = false;
+static uint32_t sBridgeVertAtMs = 0;
+
+static void bridgeNavPvt(const uint8_t *p) {
+    // Per-second accumulators (good samples only).
+    static double sVelN = 0, sVelE = 0, sVelD = 0, sSAcc = 0;
+    static int sGood = 0;
+    static uint8_t sLast[92];
+    static bool sHaveLast = false;
+    static uint32_t sWindowStartMs = 0;
+    static bool sFirst = true;
+
+    uint8_t fixType = p[20], flags = p[21];
+    float hAccM = (uint32_t)ubxI32(p, 40) / 1000.0f;
+    bool fixOk = (flags & 0x01) && (fixType == 2 || fixType == 3 || fixType == 4) && hAccM <= kMaxHAccM;
+    if (fixOk) {
+        sVelN += ubxI32(p, 48); // mm/s
+        sVelE += ubxI32(p, 52);
+        sVelD += ubxI32(p, 56); // + = down
+        sSAcc += (uint32_t)ubxI32(p, 68);
+        sGood++;
+    }
+    memcpy(sLast, p, sizeof(sLast));
+    sHaveLast = true;
+
+    // Emit about once a second on the local clock (iTOW sits at 0 until the
+    // module has satellites, so it can't pace this).
+    uint32_t now = millis();
+    if (!sFirst && now - sWindowStartMs < 950) return;
+    sFirst = false;
+    sWindowStartMs = now;
+    if (!sHaveLast) return;
+
+    const uint8_t *q = sLast; // latest sample: position, time, sats, DOP
+    uint16_t year = ubxU16(q, 4);
+    uint8_t month = q[6], day = q[7], hh = q[8], mm = q[9], ss = q[10], valid = q[11], numSV = q[23];
+    bool timeOk = (valid & 0x03) == 0x03; // validDate + validTime
+    float lastHAccM = (uint32_t)ubxI32(q, 40) / 1000.0f;
+    bool outFix = sGood > 0 && (q[21] & 0x01) && lastHAccM <= kMaxHAccM;
+
+    double speedMs = 0, course = 0;
+    if (sGood > 0) {
+        double vn = sVelN / sGood / 1000.0, ve = sVelE / sGood / 1000.0;
+        speedMs = sqrt(vn * vn + ve * ve);
+        course = atan2(ve, vn) * 180.0 / M_PI;
+        if (course < 0) course += 360.0;
+        double sAccMs = sSAcc / sGood / 1000.0;
+        if (speedMs * 3.6 < kStaticHoldKmh && speedMs < sAccMs) speedMs = 0; // static hold
+        sBridgeVertMs = (float)(-sVelD / sGood / 1000.0);
+        sBridgeVertValid = outFix && sAccMs <= kMaxVertSAccMs;
+    } else {
+        sBridgeVertValid = false;
+    }
+    sBridgeVertAtMs = now;
+    sVelN = sVelE = sVelD = sSAcc = 0;
+    sGood = 0;
+
+    char tm[12] = "", dt[8] = "", lat[20] = ",", lon[20] = ",";
+    if (timeOk) {
+        snprintf(tm, sizeof(tm), "%02u%02u%02u.00", hh, mm, ss);
+        snprintf(dt, sizeof(dt), "%02u%02u%02u", day, month, year % 100);
+    }
+    if (outFix) {
+        fmtCoord(lat, sizeof(lat), ubxI32(q, 28), true);
+        fmtCoord(lon, sizeof(lon), ubxI32(q, 24), false);
+    }
+    double dop = ubxU16(q, 76) / 100.0; // pDOP — closest thing NAV-PVT has to HDOP
+    double alt = ubxI32(q, 36) / 1000.0; // hMSL
+
+    char s[128];
+    snprintf(s, sizeof(s), "GPRMC,%s,%c,%s,%s,%.2f,%.1f,%s,,,%c", tm, outFix ? 'A' : 'V', lat, lon,
+             speedMs * 1.9438445, course, dt, outFix ? 'A' : 'N');
+    feedNmea(s);
+    if (outFix) {
+        snprintf(s, sizeof(s), "GPGGA,%s,%s,%s,1,%02u,%.1f,%.1f,M,0.0,M,,", tm, lat, lon, numSV, dop, alt);
+    } else {
+        snprintf(s, sizeof(s), "GPGGA,%s,,,,,0,%02u,,,M,,M,,", tm, numSV);
+    }
+    feedNmea(s);
+}
+
+// Satellites actually used in the fix and their mean C/N0 (dB-Hz), from the
+// latest NAV-SAT — logged only for now: a sudden drop is the most direct
+// "driving under a viaduct" signal, but it should be tuned on real drive logs
+// before it replaces the HDOP rule in SpeedLimitManager's skyBlocked.
+static int sSatUsed = -1;
+static float sSatCn0Mean = 0;
+
+// NAV-SAT -> per-constellation "satellites in view" as minimal $xxGSV
+// sentences (only field 3, the total, which is all the diagnostics read).
+static void bridgeNavSat(const uint8_t *p, uint16_t n) {
+    if (n < 8) return;
+    uint8_t numSvs = p[5];
+    int cnt[7] = {0}; // by gnssId: 0 GPS, 1 SBAS, 2 Galileo, 3 BeiDou, 5 QZSS, 6 GLONASS
+    int used = 0, cn0Sum = 0;
+    for (int i = 0; i < numSvs && 8 + 12 * i + 12 <= n; i++) {
+        const uint8_t *sv = p + 8 + 12 * i;
+        uint8_t g = sv[0];
+        if (g < 7) cnt[g]++;
+        if (sv[8] & 0x08) { // flags.svUsed
+            used++;
+            cn0Sum += sv[2];
+        }
+    }
+    sSatUsed = used;
+    sSatCn0Mean = used ? (float)cn0Sum / used : 0;
+    static const struct { uint8_t id; const char *talker; } kMap[] = {
+        {0, "GP"}, {6, "GL"}, {2, "GA"}, {3, "GB"}, {5, "GQ"}};
+    for (const auto &m : kMap) {
+        char s[32];
+        snprintf(s, sizeof(s), "%sGSV,1,1,%02d", m.talker, cnt[m.id]);
+        feedNmea(s);
+    }
+}
+
 // Minimal UBX frame receiver interleaved with the NMEA stream (0xB5 never
 // occurs in NMEA ASCII, so UBX bytes are cleanly separable from TinyGPS input).
 static volatile int8_t sValsetAck = 0; // 0 pending, 1 ACK, -1 NAK
 static bool ubxFeed(uint8_t c) {
     static uint8_t st = 0, cls, id, ckA, ckB;
     static uint16_t len, got;
-    static uint8_t buf[200];
+    static uint8_t buf[8 + 12 * 48]; // NAV-SAT: 8-byte header + 12 per satellite
     switch (st) {
     case 0: if (c == 0xB5) { st = 1; return true; } return false;
     case 1: if (c == 0x62) { st = 2; ckA = ckB = 0; return true; } st = 0; return false;
@@ -199,6 +374,10 @@ static bool ubxFeed(uint8_t c) {
         uint16_t n = len < sizeof(buf) ? len : sizeof(buf);
         if (cls == 0x05 && n >= 2 && buf[0] == 0x06 && buf[1] == 0x8A) {
             sValsetAck = (id == 0x01) ? 1 : -1; // ACK-ACK / ACK-NAK for CFG-VALSET
+        } else if (cls == 0x01 && id == 0x07 && n >= 92) { // NAV-PVT
+            bridgeNavPvt(buf);
+        } else if (cls == 0x01 && id == 0x35) { // NAV-SAT
+            bridgeNavSat(buf, n);
         } else if (cls == 0x0A && id == 0x04 && n >= 40) { // MON-VER
             char sw[31], hw[11];
             memcpy(sw, buf, 30); sw[30] = 0;
@@ -249,13 +428,25 @@ static void ubxConfigStep(uint32_t sinceBootMs) {
     switch (step) {
     case 0:
         if (sinceBootMs < 800) return;
+#if defined(VIETHUD_BOARD_ES3C28P)
+        // The P18 Pro's real config interface is a Quectel-style PQTM subset
+        // (found 2026-10-10: answers $PQTMVERNO with "SUB,V01", firmware
+        // "#VERSIONA,B01-V5.34.8"). Only message rates are writable there —
+        // constellation/fix-rate/UART/nav-mode are rejected (ERROR,1) or
+        // ignored. This build reads NAV-PVT (it carries hAcc/sAcc that the
+        // bridge above gates on), so make sure native NMEA is off in case it
+        // was left on: two position streams would be mixed into one TinyGPS.
+        // RAM only (no $PQTMSAVEPAR), so the module stays stock for a drone.
+        gnssSendNmeaCmd("PQTMCFGMSGRATE,W,RMC,0");
+        gnssSendNmeaCmd("PQTMCFGMSGRATE,W,GGA,0");
+#endif
         ubxSend(0x0A, 0x04, nullptr, 0); // poll MON-VER
         sentAt = sinceBootMs;
         step = 1;
         return;
     case 1:
         if (sinceBootMs - sentAt < 400) return;
-        sValsetAck = 0; ubxValset(kBase, 2); sentAt = sinceBootMs; step = 2;
+        sValsetAck = 0; ubxValset(kBase, sizeof(kBase) / sizeof(kBase[0])); sentAt = sinceBootMs; step = 2;
         return;
     case 2:
         if (!waitAck("automotive + AssistNow Autonomous")) return;
@@ -367,6 +558,10 @@ static void gnssTaskFn(void *) {
         if (haveRecentFix && gps.altitude.isValid()) {
             snap.altitudeM = (float)gps.altitude.meters();
             snap.altitudeValid = true;
+        }
+        if (haveRecentFix && sBridgeVertValid && millis() - sBridgeVertAtMs < 2000) {
+            snap.vertSpeedMs = sBridgeVertMs;
+            snap.vertSpeedValid = true;
         }
 
         // Course over ground (spec architecture note: "M10N xác định vị trí,
@@ -483,9 +678,11 @@ static void gnssTaskFn(void *) {
         uint32_t now = millis();
         if (now - lastDebugMs > 3000) {
             lastDebugMs = now;
-            Serial.printf("[gnss] fix=%d link=%d sats=%d speed=%.1fkm/h chars=%lu sentencesWithFix=%lu "
-                          "failedChecksum=%lu\n",
+            Serial.printf("[gnss] fix=%d link=%d sats=%d speed=%.1fkm/h alt=%.1fm vs=%+.2fm/s%s hdop=%.1f "
+                          "used=%d cn0=%.0f chars=%lu sentencesWithFix=%lu failedChecksum=%lu\n",
                           snap.fix, snap.linkAlive, snap.satCount, (double)snap.egoSpeedKmh,
+                          (double)snap.altitudeM, (double)snap.vertSpeedMs, snap.vertSpeedValid ? "" : "(n/a)",
+                          (double)snap.hdop, sSatUsed, (double)sSatCn0Mean,
                           gps.charsProcessed(), gps.sentencesWithFix(), gps.failedChecksum());
             static uint32_t sLastViewLogMs = 0;
             if (now - sLastViewLogMs > 10000) {

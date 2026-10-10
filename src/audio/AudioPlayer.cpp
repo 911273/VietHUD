@@ -14,11 +14,23 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 
+#include "core/Board.h" // boardAmpEnable() — VietHUD 2.8 speaker amp
+#include "pincfg.h"
+
 #define I2S_PORT        I2S_NUM_0
 #define I2S_SAMPLE_RATE 16000
+#if defined(VIETHUD_BOARD_ES3C28P)
+// VietHUD 2.8: ES8311 codec (configured once in core/Board.cpp) needs a real
+// MCLK = 256 x fs — pins come from pincfg.h.
+#define I2S_MCLK_OUT    I2S_MCLK_PIN
+#define AUDIO_HW_NAME   "ES8311"
+#else
 #define I2S_BCLK_PIN    42
 #define I2S_LRCK_PIN    2
 #define I2S_DOUT_PIN    41
+#define I2S_MCLK_OUT    I2S_PIN_NO_CHANGE
+#define AUDIO_HW_NAME   "NS4168"
+#endif
 
 // Extra digital gain on the decoded VOICE stream, on top of the 0-100% volume.
 // The spoken clips are mastered well below full scale, so at 100% volume they
@@ -106,6 +118,7 @@ static bool installToneI2S() {
     };
 
     i2s_pin_config_t pin_config = {
+        .mck_io_num = I2S_MCLK_OUT,
         .bck_io_num = I2S_BCLK_PIN,
         .ws_io_num = I2S_LRCK_PIN,
         .data_out_num = I2S_DOUT_PIN,
@@ -146,7 +159,8 @@ void audioInit() {
     }
     if (installToneI2S()) {
         s_initialized = true;
-        Serial.println("[audio] NS4168 I2S audio driver initialized on BCLK=42, LRCK=2, DOUT=41");
+        Serial.printf("[audio] %s I2S audio driver initialized on BCLK=%d, LRCK=%d, DOUT=%d\n", AUDIO_HW_NAME,
+                      I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
     }
 }
 
@@ -377,6 +391,7 @@ static void audioTaskFn(void *) {
         Serial.printf("[audio] playing voice: %s\n", path);
 
         if (s_i2sMutex) xSemaphoreTake(s_i2sMutex, portMAX_DELAY);
+        boardAmpEnable(false); // MCLK stops during the driver swap — mute the amp so it doesn't pop
         i2s_driver_uninstall(I2S_PORT);
         s_initialized = false;
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -384,10 +399,16 @@ static void audioTaskFn(void *) {
         AudioFileSourceFS source(SD_MMC, path);
         if (source.isOpen()) {
             AudioOutputI2S out;
+#if defined(VIETHUD_BOARD_ES3C28P)
+            out.SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_OUT);
+#else
             out.SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
+#endif
             out.SetGain((float)s_volume / 100.0f * VOICE_GAIN_BOOST);
             AudioGeneratorMP3 mp3;
-            if (mp3.begin(&source, &out)) {
+            bool begun = mp3.begin(&source, &out);
+            boardAmpEnable(true);
+            if (begun) {
                 while (mp3.isRunning()) {
                     if (!mp3.loop()) mp3.stop();
                     vTaskDelay(1);
@@ -401,7 +422,9 @@ static void audioTaskFn(void *) {
         }
         vTaskDelay(pdMS_TO_TICKS(10));
 
+        boardAmpEnable(false);
         if (installToneI2S()) s_initialized = true;
+        boardAmpEnable(true);
         if (s_i2sMutex) xSemaphoreGive(s_i2sMutex);
     }
 }

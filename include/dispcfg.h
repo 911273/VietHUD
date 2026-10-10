@@ -1,5 +1,14 @@
 #pragma once
 
+#if defined(VIETHUD_BOARD_ES3C28P)
+// VietHUD 2.8: ILI9341V native portrait 240x320. Rotation is applied on the
+// Arduino_Canvas wrapper exactly as on the 3.5" build (rotation 1/3 = the
+// 320x240 landscape the compact dashboard layout is drawn for).
+#define TFT_RES_W 240
+#define TFT_RES_H 320
+#define TFT_SPI_HZ 40000000 // full 240x320 frame = ~31 ms; raise only after checking for corruption on the real panel
+#else
+
 // Display
 //
 // IMPORTANT: gfx->setRotation() called directly on the raw Arduino_AXS15231B
@@ -22,3 +31,4 @@
 #define TOUCH_X_MAX 310
 #define TOUCH_Y_MIN 14
 #define TOUCH_Y_MAX 461
+#endif

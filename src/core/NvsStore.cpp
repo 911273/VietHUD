@@ -98,7 +98,7 @@ void loadConfigFromNVS(AppConfig &cfg) {
     // when a road's limit is unknown (VN urban baseline). Reset it to the code
     // default exactly ONCE (guarded by a schema-version key) so a later manual
     // change the user makes is still respected and never re-clobbered.
-    const uint32_t kCfgSchemaVer = 6;
+    const uint32_t kCfgSchemaVer = 7;
     uint32_t cfgVer = prefs.getUInt("cfgVer", 0);
     if (cfgVer < 2) {
         cfg.defaultLimitKmh = 50.0f;
@@ -160,6 +160,28 @@ void loadConfigFromNVS(AppConfig &cfg) {
                 snprintf(keyS, sizeof(keyS), "netS%d", i);
                 prefs.putString(keyS, cfg.savedNetworks[i].ssid);
             }
+        }
+    }
+    // Schema 7 (2026-10-10): add the newer default networks (AppConfig.h
+    // kDefaultExtraNetworks) to units that already have a saved list — only
+    // the missing ones, and only while there is a free slot.
+    if (cfgVer < 7) {
+        for (int d = 0; d < kDefaultExtraNetworkCount; d++) {
+            bool have = false;
+            for (int i = 0; i < cfg.savedNetworkCount; i++)
+                if (strcmp(cfg.savedNetworks[i].ssid, kDefaultExtraNetworks[d][0]) == 0) have = true;
+            if (have || cfg.savedNetworkCount >= AppConfig::kMaxSavedNetworks) continue;
+            int i = cfg.savedNetworkCount++;
+            strncpy(cfg.savedNetworks[i].ssid, kDefaultExtraNetworks[d][0], sizeof(cfg.savedNetworks[i].ssid) - 1);
+            cfg.savedNetworks[i].ssid[sizeof(cfg.savedNetworks[i].ssid) - 1] = '\0';
+            strncpy(cfg.savedNetworks[i].password, kDefaultExtraNetworks[d][1], sizeof(cfg.savedNetworks[i].password) - 1);
+            cfg.savedNetworks[i].password[sizeof(cfg.savedNetworks[i].password) - 1] = '\0';
+            char keyS[8], keyP[8];
+            snprintf(keyS, sizeof(keyS), "netS%d", i);
+            snprintf(keyP, sizeof(keyP), "netP%d", i);
+            prefs.putString(keyS, cfg.savedNetworks[i].ssid);
+            prefs.putString(keyP, cfg.savedNetworks[i].password);
+            prefs.putInt("netCount", cfg.savedNetworkCount);
         }
     }
     if (cfgVer < kCfgSchemaVer) prefs.putUInt("cfgVer", kCfgSchemaVer);

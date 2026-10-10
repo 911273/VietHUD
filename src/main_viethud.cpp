@@ -49,6 +49,8 @@
 #include "map/SdCardManager.h"
 #include "log/TripLogger.h"
 #include "net/WebPortal.h"
+#include "core/Board.h" // boardEarlyInit()
+#include "core/Version.h" // VIETHUD_MODEL / VIETHUD_FW_VERSION boot banner
 #include "net/DataUpdater.h" // dataUpdateStart()/GetStatus() — serial 'u' bench trigger
 #include "update/DataInstaller.h" // boot-time atomic data install + rollback (Phone Update Bridge)
 #include <esp_ota_ops.h> // esp_ota_mark_app_valid_cancel_rollback() — firmware OTA rollback
@@ -324,6 +326,36 @@ static void runDataUpdateMode() {
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false); // keep the radio hot while we wait for the AP to appear
+
+    // Try only the saved networks that are actually on the air (keeping the
+    // order above: last working network first), so an absent hotspot doesn't
+    // cost 30 s before the network that is there. If the scan finds none of
+    // them (e.g. a hidden SSID, or an iPhone hotspot still asleep), fall back
+    // to trying every candidate as before.
+    {
+        int found = WiFi.scanNetworks();
+        const char *ps[AppConfig::kMaxSavedNetworks + 1], *pp[AppConfig::kMaxSavedNetworks + 1];
+        int np = 0;
+        for (int c = 0; c < nc; c++) {
+            for (int j = 0; j < found; j++) {
+                if (WiFi.SSID(j) == ssids[c]) {
+                    ps[np] = ssids[c];
+                    pp[np++] = passes[c];
+                    break;
+                }
+            }
+        }
+        WiFi.scanDelete();
+        Serial.printf("[update-mode] %d of %d saved network(s) in range\n", np, nc);
+        if (np > 0) {
+            for (int c = 0; c < np; c++) {
+                ssids[c] = ps[c];
+                passes[c] = pp[c];
+            }
+            nc = np;
+        }
+    }
+    const uint32_t tAll = millis();
     bool up = false;
     for (int c = 0; c < nc && !up; c++) {
         Serial.printf("[update-mode] connecting to \"%s\"\n", ssids[c]);
@@ -339,9 +371,11 @@ static void runDataUpdateMode() {
                 WiFi.begin(ssids[c], passes[c]);
                 lastRebegin = millis();
             }
-            char b[96];
-            snprintf(b, sizeof(b), "Connecting to Wi-Fi \"%s\"... %lus", ssids[c],
-                     (unsigned long)((millis() - t0) / 1000));
+            // No network name on screen (user request 2026-10-10): several saved
+            // networks are tried in turn, and naming each one read as "it wants
+            // that specific network".
+            char b[64];
+            snprintf(b, sizeof(b), "Connecting to Wi-Fi... %lus", (unsigned long)((millis() - tAll) / 1000));
             lv_label_set_text(s.msg, b);
             setupPump();
         }
@@ -389,7 +423,8 @@ static void runDataUpdateMode() {
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println("\n[viethud] VietHUD — offline GPS speed-limit/camera/sign warning device");
+    Serial.printf("\n[viethud] %s fw %s — offline GPS speed-limit/camera/sign warning device\n", VIETHUD_MODEL,
+                  VIETHUD_FW_VERSION);
     // Shared with log/TripLogger.cpp, which persists the same string into
     // every session's CSV — see tripLogResetReasonStr()'s own comment for
     // why that matters (a reset mid-drive has no serial monitor attached).
@@ -406,6 +441,7 @@ void setup() {
 
     loadConfigFromNVS(cfg);
 
+    boardEarlyInit(); // VietHUD 2.8: shared touch/codec I2C bus, FT6336 reset, ES8311 setup (no-op on 3.5")
     backlightBegin();
     applyConfig(); // sets initial backlight duty from loaded cfg.brightness
 
@@ -621,6 +657,7 @@ void loop() {
     lastTick = now;
     lv_timer_handler();
     updateScreenPoll();
+    updatePromptPoll(); // auto firmware check on Wi-Fi + "update now?" prompt (UpdateScreen.cpp)
 
     // Report where the frame time actually goes, so tuning stops being guesswork.
     if (now - lastStatsMs > 5000) {

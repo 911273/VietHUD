@@ -133,19 +133,36 @@ bool webPortalDeleteNetwork(int idx) {
 // a single bool has no torn/garbage intermediate value to race on.
 static volatile bool wifiEnabledRequest = false;
 static volatile bool wifiActuallyEnabled = false;
+// Station-first Wi-Fi (2026-10-10, user-requested): turning Wi-Fi on now only
+// joins the saved networks; the device's own access point comes up as a
+// FALLBACK when no saved network has linked within kApFallbackMs (or right
+// away when nothing is saved), so another device can still reach the portal
+// directly. Once up, the AP stays until Wi-Fi is switched off (someone may be
+// using it), while the station keeps trying in the background (AP_STA).
+static const uint32_t kApFallbackMs = 2UL * 60UL * 1000UL;
+static volatile bool g_apActive = false;
+static uint32_t g_wifiOnMs = 0;
 
 void webPortalRequestEnable(bool on) { wifiEnabledRequest = on; }
 bool webPortalIsEnabled() { return wifiActuallyEnabled; }
 bool webPortalRequestedOn() { return wifiEnabledRequest; }
+bool webPortalApActive() { return wifiActuallyEnabled && g_apActive; }
+int webPortalApFallbackInSec() {
+    if (!wifiActuallyEnabled || g_apActive || staConnected) return -1;
+    uint32_t el = millis() - g_wifiOnMs;
+    return el >= kApFallbackMs ? 0 : (int)((kApFallbackMs - el + 999) / 1000);
+}
 // Cached by the web task (the only task that touches WiFi.*) so the UI can poll
 // it every frame without calling into the WiFi driver from Core 1.
 static volatile int g_apClients = 0;
 int webPortalClientCount() { return wifiActuallyEnabled ? g_apClients : 0; }
 
 void webPortalStatusText(char *buf, size_t cap) {
-    if (wifiActuallyEnabled)
+    if (wifiActuallyEnabled && g_apActive)
         snprintf(buf, cap, "%s  %s  %d may", g_apSsid, WiFi.softAPIP().toString().c_str(),
                  (int)WiFi.softAPgetStationNum());
+    else if (wifiActuallyEnabled)
+        snprintf(buf, cap, "%s", staConnected ? WiFi.localIP().toString().c_str() : "...");
     else
         snprintf(buf, cap, "OFF");
 }
@@ -640,7 +657,9 @@ static void handleWifiDel() {
 // the page open (phones probe a handful of "is there internet?" URLs on
 // join; answering them with a 302 to us is what triggers the captive sign-in).
 static void handleCaptiveRedirect() {
-    server.sendHeader("Location", String("http://") + kApIp.toString(), true);
+    // Station clients reach us on the LAN IP, AP clients on 192.168.4.1.
+    IPAddress local = server.client().localIP();
+    server.sendHeader("Location", String("http://") + (local == IPAddress(0, 0, 0, 0) ? kApIp : local).toString(), true);
     server.send(302, "text/plain", "");
 }
 
@@ -741,7 +760,8 @@ static void wmTick() {
     cfg.staSsid[sizeof(cfg.staSsid) - 1] = '\0';
     strncpy(cfg.staPassword, cfg.savedNetworks[ni].password, sizeof(cfg.staPassword) - 1);
     cfg.staPassword[sizeof(cfg.staPassword) - 1] = '\0';
-    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+    wifi_mode_t want = g_apActive ? WIFI_AP_STA : WIFI_STA;
+    if (WiFi.getMode() != want) WiFi.mode(want);
     WiFi.begin(cfg.staSsid, cfg.staPassword);
     configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
     staConnected = false;
@@ -750,48 +770,63 @@ static void wmTick() {
     Serial.printf("[wm] trying \"%s\" (candidate %d/%d)\n", cfg.staSsid, g_wmTry + 1, g_wmCandCount);
 }
 
+// Brings up the device's own access point (+ captive DNS) alongside the
+// station. Called by applyWifiState() when nothing is saved, otherwise by the
+// web task as the 2-minute fallback (see kApFallbackMs).
+static void startSoftAp(const char *why) {
+    if (g_apActive) return;
+    // AP SSID: a user-set custom name, else "VietHUD-XXXX" (last 4 MAC hex)
+    // so multiple units don't collide (spec 2.1). "VietHUD" alone counts as
+    // "not customised" and gets the MAC suffix too.
+    char apSsid[40];
+    if (cfg.wifiSsid[0] && strcmp(cfg.wifiSsid, "VietHUD") != 0) {
+        strncpy(apSsid, cfg.wifiSsid, sizeof(apSsid) - 1);
+        apSsid[sizeof(apSsid) - 1] = '\0';
+    } else {
+        uint8_t mac[6];
+        WiFi.macAddress(mac);
+        snprintf(apSsid, sizeof(apSsid), "VietHUD-%02X%02X", mac[4], mac[5]);
+    }
+    strncpy(g_apSsid, apSsid, sizeof(g_apSsid) - 1);
+    g_apSsid[sizeof(g_apSsid) - 1] = '\0';
+    bool wantSta = cfg.savedNetworkCount > 0;
+    WiFi.mode(wantSta ? WIFI_AP_STA : WIFI_AP);
+    size_t pwLen = strlen(cfg.wifiPassword);
+    bool secured = pwLen >= 8; // WPA2 minimum — WiFi.softAP() silently fails to secure below this
+    bool ok = secured ? WiFi.softAP(apSsid, cfg.wifiPassword) : WiFi.softAP(apSsid);
+    if (!secured) {
+        Serial.printf("[web] WARN: password %s (%u chars, WPA2 needs >=8) — starting an OPEN (unsecured) AP\n",
+                      pwLen == 0 ? "empty" : "too short", (unsigned)pwLen);
+    }
+    dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+    dnsServer.start(53, "*", kApIp); // feature E: captive portal — resolve everything to us
+    g_apActive = true;
+    Serial.printf("[web] AP \"%s\" (%s) %s, IP=%s — %s\n", apSsid, secured ? "secured" : "OPEN",
+                  ok ? "up" : "FAILED to start", WiFi.softAPIP().toString().c_str(), why);
+}
+
 static void applyWifiState(bool enable) {
     if (enable == wifiActuallyEnabled) return;
     if (enable) {
-        // AP + optional STATION (feature F): if the user configured a station
-        // SSID, join it too (AP_STA) for internet/NTP; otherwise plain AP.
-        // WiFi Manager: if any network is saved, come up in AP_STA and let
-        // wmTick() scan + connect to the strongest saved network in range.
-        bool wantSta = cfg.savedNetworkCount > 0 || cfg.staSsid[0] != '\0';
-        WiFi.mode(wantSta ? WIFI_AP_STA : WIFI_AP);
+        g_wifiOnMs = millis();
+        g_apActive = false;
         // Modem sleep ON by default (heat: with it off permanently the die ran past
         // 80 C on a windscreen). The web task switches it off only while a phone
         // is actually transferring data (see webTaskFn), where STA round-trips
         // would otherwise swing 30-190 ms and transfers crawl at ~20-40 KB/s.
-        WiFi.setSleep(true);
-        // AP SSID: a user-set custom name, else "VietHUD-XXXX" (last 4 MAC hex)
-        // so multiple units don't collide (spec 2.1). "VietHUD" alone counts as
-        // "not customised" and gets the MAC suffix too.
-        char apSsid[40];
-        if (cfg.wifiSsid[0] && strcmp(cfg.wifiSsid, "VietHUD") != 0) {
-            strncpy(apSsid, cfg.wifiSsid, sizeof(apSsid) - 1);
-            apSsid[sizeof(apSsid) - 1] = '\0';
-        } else {
-            uint8_t mac[6];
-            WiFi.macAddress(mac);
-            snprintf(apSsid, sizeof(apSsid), "VietHUD-%02X%02X", mac[4], mac[5]);
-        }
-        strncpy(g_apSsid, apSsid, sizeof(g_apSsid) - 1);
-        g_apSsid[sizeof(g_apSsid) - 1] = '\0';
-        const char *ssid = apSsid;
-        size_t pwLen = strlen(cfg.wifiPassword);
-        bool secured = pwLen >= 8; // WPA2 minimum — WiFi.softAP() silently fails to secure below this
-        bool ok = secured ? WiFi.softAP(ssid, cfg.wifiPassword) : WiFi.softAP(ssid);
-        if (!secured) {
-            Serial.printf("[web] WARN: password %s (%u chars, WPA2 needs >=8) — starting an OPEN (unsecured) AP\n",
-                          pwLen == 0 ? "empty" : "too short", (unsigned)pwLen);
-        }
-        if (wantSta) {
+        if (cfg.savedNetworkCount > 0) {
+            // Station first: wmTick() scans and joins the strongest saved network.
+            WiFi.mode(WIFI_STA);
+            WiFi.setSleep(true);
             // VN UTC+7; NTP daemon fills the system clock in the background once
             // the station associates — webPortalLocalTime() reads it afterwards.
             configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
-            g_wmTry = -1; g_wmAttemptMs = 0;  // trigger wmTick() to scan + connect the best saved net
-            Serial.printf("[web] STA manager armed (%d saved network(s))\n", cfg.savedNetworkCount);
+            g_wmTry = -1; g_wmAttemptMs = 0;
+            Serial.printf("[web] WiFi ON — joining saved networks (%d), own AP only if none links within %lu s\n",
+                          cfg.savedNetworkCount, (unsigned long)(kApFallbackMs / 1000));
+        } else {
+            startSoftAp("no saved network");
+            WiFi.setSleep(true);
         }
         server.begin();
         MDNS.end();                 // in case a stale instance is lingering
@@ -799,13 +834,8 @@ static void applyWifiState(bool enable) {
             MDNS.addService("http", "tcp", 80);
             Serial.printf("[web] mDNS up: http://%s.local\n", kMdnsHost);
         }
-        dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
-        dnsServer.start(53, "*", kApIp); // feature E: captive portal — resolve everything to us
-        Serial.printf("[web] WiFi ON — AP \"%s\" (%s) %s, IP=%s%s\n", ssid, secured ? "secured" : "OPEN",
-                      ok ? "up" : "FAILED to start", WiFi.softAPIP().toString().c_str(),
-                      wantSta ? " (+STA)" : "");
     } else {
-        dnsServer.stop();
+        if (g_apActive) dnsServer.stop();
         MDNS.end();
         server.stop();
         WiFi.softAPdisconnect(true);
@@ -813,6 +843,7 @@ static void applyWifiState(bool enable) {
         WiFi.mode(WIFI_OFF);
         staConnected = false;
         ntpSynced = false;
+        g_apActive = false;
         Serial.println("[web] WiFi OFF");
     }
     if (!enable) g_apClients = 0;
@@ -871,7 +902,7 @@ static void webTaskFn(void *) {
             wmTick();
         }
         if (wifiActuallyEnabled) {
-            dnsServer.processNextRequest(); // feature E: captive portal DNS
+            if (g_apActive) dnsServer.processNextRequest(); // feature E: captive portal DNS
             server.handleClient();
             updateApiLoop();                // deferred reboot after a staged data install
             {   // full-power radio only while a phone is transferring data
@@ -891,6 +922,22 @@ static void webTaskFn(void *) {
                 Serial.printf("[web] STA %s%s\n", sta ? "connected, IP=" : "disconnected",
                               sta ? WiFi.localIP().toString().c_str() : "");
                 if (sta) {
+                    // Remember WHICH saved network actually linked (wmTick() only
+                    // sets cfg.staSsid in RAM): the data-update boot mode tries
+                    // cfg.staSsid first, and with the stale NVS value it sat on a
+                    // hotspot that wasn't there before reaching this network
+                    // (seen 2026-10-10). Written only when it changes.
+                    {
+                        Preferences p;
+                        if (p.begin("radarcar", false)) {
+                            if (p.getString("staSsid", "") != cfg.staSsid) {
+                                p.putString("staSsid", cfg.staSsid);
+                                p.putString("staPass", cfg.staPassword);
+                                Serial.printf("[web] remembered \"%s\" as the last working network\n", cfg.staSsid);
+                            }
+                            p.end();
+                        }
+                    }
                     // OTA auto-check on connect: probe the remote manifest version
                     // (downloads nothing else, never reboots). Give the link a
                     // moment to settle + NTP; a small delay before the first check
@@ -927,9 +974,16 @@ static void webTaskFn(void *) {
                 Serial.println("[web] NTP time synced");
             }
 
-            // Feature D: auto-off after wifiAutoOffMin with no AP client.
-            g_apClients = (int)WiFi.softAPgetStationNum();
-            if (g_apClients > 0 || updateApiBusy()) lastClientMs = millis();
+            // Station-first fallback: no saved network linked in time -> own AP.
+            if (!g_apActive && !sta && millis() - g_wifiOnMs >= kApFallbackMs) {
+                startSoftAp("no saved Wi-Fi linked within 2 min (fallback)");
+            }
+
+            // Feature D: auto-off after wifiAutoOffMin with no AP client. A live
+            // station link counts as in use (portal reachable on the LAN IP,
+            // update checks running), so it never cuts a working connection.
+            g_apClients = g_apActive ? (int)WiFi.softAPgetStationNum() : 0;
+            if (g_apClients > 0 || updateApiBusy() || sta) lastClientMs = millis();
             uint32_t idleLimitMs = (uint32_t)(cfg.wifiAutoOffMin * 60000.0f);
             if (idleLimitMs > 0 && millis() - lastClientMs > idleLimitMs) {
                 Serial.printf("[web] WiFi auto-off: no client for %.0f min\n", (double)cfg.wifiAutoOffMin);

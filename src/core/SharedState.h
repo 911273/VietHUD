@@ -31,6 +31,12 @@ struct GnssSnapshot {
     // car climbing onto / descending off an elevated road (map matcher).
     float altitudeM = 0;
     bool altitudeValid = false;
+    // Doppler vertical speed (m/s, + = climbing), from UBX NAV-PVT velD —
+    // only modules that send NAV-PVT have it (VietHUD 2.8's P18 Pro), NMEA
+    // carries none. Integrated, it tracks a ramp climb far more smoothly than
+    // differencing altitudeM, so the map matcher prefers it when valid.
+    float vertSpeedMs = 0;
+    bool vertSpeedValid = false;
     float hdop = 0;       // horizontal dilution of precision (0 = unknown); jumps under viaducts
     uint32_t fixSeq = 0;  // increments on every NEW position fix (the matcher's HMM steps once per fix)
     // Sunrise/sunset estimate from GNSS date+time+position (spec section

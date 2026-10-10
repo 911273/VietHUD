@@ -16,6 +16,7 @@
 #include "audio/AudioPlayer.h"
 
 LV_FONT_DECLARE(lv_font_montserrat_speed); // big speed digits
+LV_FONT_DECLARE(lv_font_montserrat_speed64); // same digits at 64 px — VietHUD 2.8 compact layout
 #include "driver/temp_sensor.h" // ESP32-S3 die sensor with selectable range (readDieTempC)
 LV_FONT_DECLARE(lv_font_vn_14); // Vietnamese-capable text font (Arial 14px, ASCII+VN); drop-in for montserrat_14
 LV_FONT_DECLARE(lv_font_vn_20); // same at 20px — landscape top bar (matches the 20px bottom-corner readouts)
@@ -141,8 +142,16 @@ struct ThemePalette {
     uint32_t neutral;     // temperature (normal), audio icon (on)
     uint32_t toastBg, toastText;
 };
+// VietHUD 2.8's IPS panel (display inversion on) visibly lifts the lowest
+// RGB565 codes, so its near-black 0x04060A showed as a tinted grey on the real
+// unit (2026-10-10) while true 0x000000 stayed black — use pure black there.
+#if defined(VIETHUD_BOARD_ES3C28P)
+#define DARK_BG 0x000000
+#else
+#define DARK_BG 0x04060A
+#endif
 static const ThemePalette kDarkPalette = {
-    0x04060A, 0x7FD3E0, 0xB4BCC6, 0x8A94A0, 0x616A76, 0xFFFFFF, 0xD0E0F0, 0x182232,
+    DARK_BG, 0x7FD3E0, 0xB4BCC6, 0x8A94A0, 0x616A76, 0xFFFFFF, 0xD0E0F0, 0x182232,
     0x0C1522, 0x1F314A, 0xF0F4F8, 0x00E5FF, 0x0C1420, 0x28384C, 0xFFFFFF, 0x182434,
     0x93A0AE, 0x151C24, 0xFFFFFF};
 static const ThemePalette kLightPalette = {
@@ -231,8 +240,18 @@ static int gCanvasW = 480, gCanvasH = 320;
 // Landscape status bars: top (GNSS / street / clock / WiFi / settings) and the
 // bottom one holding the heading letter + board temperature — both 20px text,
 // both marked by the same 1px line.
+// VietHUD 2.8 (320x240) uses thinner bars — see buildDashboardCompact().
+#if defined(VIETHUD_BOARD_ES3C28P)
+static const int kTopBarH = 28;
+static const int kBottomBarH = 28;
+#else
 static const int kTopBarH = 40;
 static const int kBottomBarH = 40;
+#endif
+// Speed-limit sign digit fonts: 2-digit limits use the big one, 100/120 the
+// small one to fit the ring. Set per layout (the compact layout's ring is smaller).
+static const lv_font_t *gLimitFontBig = &lv_font_montserrat_48;
+static const lv_font_t *gLimitFontSmall = &lv_font_montserrat_36;
 static int gMapSideS = 578, gMapCenter = 289; // oversized heading-up canvas: square side + its center (rotation pivot)
 static int gRefMinDim = 160;                  // on-screen minDim framing the zoom (see buildMapCanvas)
 static float gMapZoomScale = 2.0f; // default 2.0x (2026-09-27 user request); tap cycles 2.0 -> 2.5 -> 1.5
@@ -601,7 +620,7 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
     lv_canvas_set_buffer(mapCanvas, mapCanvasBuf, S, S, LV_COLOR_FORMAT_RGB565);
     lv_obj_set_pos(mapCanvas, screenAnchorX - S / 2, screenAnchorY - S / 2);
     lv_obj_set_size(mapCanvas, S, S);
-    lv_canvas_fill_bg(mapCanvas, lv_color_hex(0x06080C), LV_OPA_COVER);
+    lv_canvas_fill_bg(mapCanvas, lv_color_hex(pal().bg), LV_OPA_COVER);
     lv_obj_set_style_opa(mapCanvas, LV_OPA_COVER, 0); // opaque: avoids blending the large map canvas over the bg every redraw (perf)
     lv_obj_clear_flag(mapCanvas, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(mapCanvas, LV_OBJ_FLAG_CLICKABLE);
@@ -754,8 +773,9 @@ static void updateMapCanvas() {
         float dx = x - cc, dy = y - cc;
         float sx = egoAnchorX + dx * cR - dy * sR;
         float sy = egoAnchorY + dx * sR + dy * cR;
-        float fx = fminf(sx, gCanvasW - sx) / 100.0f;
-        float fy = fminf(sy, gCanvasH - sy) / 80.0f;
+        // 100/80 px on the 480x320 panel; scaled with the canvas on smaller screens
+        float fx = fminf(sx, gCanvasW - sx) / (100.0f * gCanvasW / 480.0f);
+        float fy = fminf(sy, gCanvasH - sy) / (80.0f * gCanvasH / 320.0f);
         float f = fminf(fx, fy);
         if (f <= 0.0f) return 0;
         if (f >= 1.0f) return LV_OPA_COVER;
@@ -1048,6 +1068,153 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 }
 
 // ---------------------------------------------------------------------
+// Compact landscape content (VietHUD 2.8, 320x240) — the landscape
+// arrangement scaled down for the 2.8" ILI9341 panel rather than squeezed:
+// thinner 28 px bars, the 64 px speed font, a smaller P.127 ring and a
+// shorter alert capsule, so the map in the middle keeps as much room as
+// the 3.5" layout gives it proportionally. Same widgets, same globals, same
+// no-flex/plain-positioning rule as buildDashboardLandscape() above.
+// ---------------------------------------------------------------------
+static void buildDashboardCompact(lv_obj_t *scr) {
+    const int scrW = 320, scrH = 240;
+    const int topH = kTopBarH;
+
+    // ---------------- Top status bar ----------------
+    lv_obj_t *topBar = makePane(scr, 0, 0, scrW, topH);
+    gTopBar = topBar;
+    lv_obj_set_style_bg_opa(topBar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(topBar, lv_color_hex(0x182232), 0);
+    lv_obj_set_style_border_width(topBar, 1, 0);
+    lv_obj_set_style_border_side(topBar, LV_BORDER_SIDE_BOTTOM, 0);
+
+    gnssIcon = lv_label_create(topBar);
+    lv_obj_set_style_text_font(gnssIcon, &lv_font_montserrat_14, 0);
+    lv_label_set_text(gnssIcon, LV_SYMBOL_GPS);
+    lv_obj_align(gnssIcon, LV_ALIGN_LEFT_MID, 6, 0);
+
+    gnssCaption = lv_label_create(topBar);
+    lv_obj_set_style_text_font(gnssCaption, &lv_font_vn_14, 0);
+    lv_label_set_text(gnssCaption, "--");
+    lv_obj_align_to(gnssCaption, gnssIcon, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
+
+    clockLabel = lv_label_create(topBar);
+    lv_obj_set_style_text_font(clockLabel, &lv_font_vn_20, 0);
+    lv_label_set_text(clockLabel, "--:--");
+    lv_obj_align(clockLabel, LV_ALIGN_RIGHT_MID, -6, 0);
+    audioTopIcon = lv_label_create(topBar);
+    lv_obj_set_style_text_font(audioTopIcon, &lv_font_montserrat_14, 0);
+    lv_obj_align(audioTopIcon, LV_ALIGN_RIGHT_MID, -62, 0); // left of "HH:MM" (~50 px in vn_20)
+    updateAudioTopIcon();
+
+    gearIcon = lv_label_create(topBar);
+    lv_obj_add_flag(gearIcon, LV_OBJ_FLAG_HIDDEN);
+    sunIcon = makeIcon(topBar, &sun_icon);
+    lv_obj_add_flag(sunIcon, LV_OBJ_FLAG_HIDDEN);
+
+    streetNameBadge = lv_obj_create(topBar);
+    lv_obj_set_size(streetNameBadge, 160, 22);
+    lv_obj_align(streetNameBadge, LV_ALIGN_CENTER, -4, 0);
+    lv_obj_set_style_bg_color(streetNameBadge, lv_color_hex(0x0C1522), 0);
+    lv_obj_set_style_bg_opa(streetNameBadge, LV_OPA_80, 0);
+    lv_obj_set_style_border_color(streetNameBadge, lv_color_hex(0x1F314A), 0);
+    lv_obj_set_style_border_width(streetNameBadge, 1, 0);
+    lv_obj_set_style_radius(streetNameBadge, 11, 0);
+    lv_obj_set_style_pad_all(streetNameBadge, 0, 0);
+    lv_obj_clear_flag(streetNameBadge, LV_OBJ_FLAG_SCROLLABLE);
+
+    streetNameIcon = lv_label_create(streetNameBadge);
+    lv_obj_set_style_text_font(streetNameIcon, &lv_font_montserrat_14, 0);
+    lv_label_set_text(streetNameIcon, LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_color(streetNameIcon, lv_color_hex(0x00E5FF), 0);
+    lv_obj_align(streetNameIcon, LV_ALIGN_LEFT_MID, 6, 0);
+
+    streetNameLabel = lv_label_create(streetNameBadge);
+    lv_obj_set_style_text_font(streetNameLabel, &lv_font_vn_14, 0);
+    lv_obj_set_style_text_color(streetNameLabel, lv_color_hex(0xF0F4F8), 0);
+    lv_label_set_long_mode(streetNameLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(streetNameLabel, 132);
+    lv_obj_align(streetNameLabel, LV_ALIGN_LEFT_MID, 22, 0);
+    lv_label_set_text(streetNameLabel, "");
+    lv_obj_add_flag(streetNameBadge, LV_OBJ_FLAG_HIDDEN);
+
+    static lv_point_precise_t divPts[2][2];
+    for (int i = 0; i < 2; i++) {
+        colDividerLine[i] = lv_line_create(scr);
+        lv_point_precise_t p[2] = {{0, 0}, {0, 0}};
+        memcpy(divPts[i], p, sizeof(p));
+        lv_line_set_points(colDividerLine[i], divPts[i], 2);
+        lv_obj_add_flag(colDividerLine[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(colDividerLine[i], LV_OBJ_FLAG_CLICKABLE);
+    }
+
+    // ---------------- Middle: speed (left) / speed-limit sign (right) ----------------
+    lv_obj_t *speedPane = makePane(scr, 4, topH + 4, 124, 110);
+    speedLabel = lv_label_create(speedPane);
+    lv_obj_set_style_text_font(speedLabel, &lv_font_montserrat_speed64, 0);
+    lv_obj_align(speedLabel, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(speedLabel, "0");
+
+    kmhCaption = lv_label_create(speedPane);
+    lv_label_set_text(kmhCaption, "");
+    lv_obj_add_flag(kmhCaption, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *signPane = makePane(scr, scrW - 96 - 4, topH + 4, 96, 110);
+    static const int kSignDiam = 80;
+    speedLimitSign = lv_obj_create(signPane);
+    lv_obj_set_size(speedLimitSign, kSignDiam, kSignDiam);
+    lv_obj_align(speedLimitSign, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(speedLimitSign, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(speedLimitSign, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(speedLimitSign, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(speedLimitSign, lv_color_hex(0xE60000), 0);
+    lv_obj_set_style_border_width(speedLimitSign, 9, 0);
+    lv_obj_set_style_shadow_color(speedLimitSign, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_width(speedLimitSign, 8, 0);
+    lv_obj_set_style_shadow_opa(speedLimitSign, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(speedLimitSign, 0, 0);
+    lv_obj_clear_flag(speedLimitSign, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(speedLimitSign, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(speedLimitSign, LV_OBJ_FLAG_HIDDEN);
+
+    gLimitFontBig = &lv_font_montserrat_36;
+    gLimitFontSmall = &lv_font_montserrat_28;
+    speedLimitValueLabel = lv_label_create(signPane);
+    lv_obj_set_style_text_font(speedLimitValueLabel, gLimitFontSmall, 0);
+    lv_obj_set_width(speedLimitValueLabel, kSignDiam - 16);
+    lv_label_set_long_mode(speedLimitValueLabel, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(speedLimitValueLabel, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align_to(speedLimitValueLabel, speedLimitSign, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(speedLimitValueLabel, "--");
+
+    // ---------------- Bottom bar: heading (left), WiFi (centre), temperature (right) ----------------
+    lv_obj_t *bottomBar = makePane(scr, 0, scrH - kBottomBarH, scrW, kBottomBarH);
+    gBottomBar = bottomBar;
+    lv_obj_set_style_border_color(bottomBar, lv_color_hex(0x182232), 0);
+    lv_obj_set_style_border_width(bottomBar, 1, 0);
+    lv_obj_set_style_border_side(bottomBar, LV_BORDER_SIDE_TOP, 0);
+
+    wifiTopIcon = lv_label_create(bottomBar);
+    lv_obj_set_style_text_font(wifiTopIcon, &lv_font_montserrat_14, 0);
+    lv_label_set_text(wifiTopIcon, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_color(wifiTopIcon, lv_color_hex(0x7C8A9A), 0);
+    lv_obj_set_width(wifiTopIcon, 60);
+    lv_obj_set_style_text_align(wifiTopIcon, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(wifiTopIcon, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(wifiTopIcon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
+
+    // Alert capsule just above the bottom bar.
+    const int cardW = 236, cardH = 48;
+    midCol = makePane(scr, (scrW - cardW) / 2, scrH - kBottomBarH - 4 - cardH, cardW, cardH);
+    buildTrafficCard(midCol, cardW, cardH);
+    lv_obj_set_style_text_font(alertDistLabel, &lv_font_montserrat_28, 0);
+
+    bottomInfoLabel = lv_label_create(scr);
+    lv_obj_align(bottomInfoLabel, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_add_flag(bottomInfoLabel, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ---------------------------------------------------------------------
 // Portrait content (rotation 0/2, 320x480) — a different ARRANGEMENT of the
 // exact same widgets/information as buildDashboardLandscape() above, not a
 // parametric reflow of it (see this file's own layout-constants comment for
@@ -1230,6 +1397,8 @@ void buildDashboard() {
 
     if (scrH > scrW) {
         buildDashboardPortrait(scr);
+    } else if (scrW <= 320) {
+        buildDashboardCompact(scr); // VietHUD 2.8 (320x240)
     } else {
         buildDashboardLandscape(scr);
     }
@@ -1849,12 +2018,12 @@ void refreshDashboard() {
         lv_label_set_text(speedLimitValueLabel, "--");
     }
     {
-        // 48 px digits for 2-digit limits; 3 digits (100/120) keep 36 px to fit the ring.
+        // Big digits for 2-digit limits; 3 digits (100/120) use the smaller font to fit the ring.
         static int sLastLimitFont = -1;
-        int want = strlen(lv_label_get_text(speedLimitValueLabel)) >= 3 ? 36 : 48;
+        int want = strlen(lv_label_get_text(speedLimitValueLabel)) >= 3 ? 0 : 1;
         if (want != sLastLimitFont) {
             sLastLimitFont = want;
-            lv_obj_set_style_text_font(speedLimitValueLabel, want == 48 ? &lv_font_montserrat_48 : &lv_font_montserrat_36, 0);
+            lv_obj_set_style_text_font(speedLimitValueLabel, want ? gLimitFontBig : gLimitFontSmall, 0);
         }
     }
     {

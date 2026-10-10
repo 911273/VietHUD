@@ -310,7 +310,17 @@ bool dataUpdateCheckStart() {
 bool dataUpdateAvailable() { return s_updateAvailable; }
 bool dataUpdateCheckInProgress() { return s_checkRunning; }
 const char *dataUpdateRemoteVersion() { return s_remoteVersion; }
-const char *dataUpdateLocalVersion() { return s_localVersion; }
+const char *dataUpdateLocalVersion() {
+    // Normally filled by the online check; read it from the card directly when
+    // no check has run yet (Wi-Fi off), so the Update screen doesn't claim
+    // "(none)" over a card that has data. Retried at most every 5 s if empty.
+    static uint32_t sLastTryMs = 0;
+    if (!s_localVersion[0] && !s_checkRunning && (sLastTryMs == 0 || millis() - sLastTryMs > 5000)) {
+        sLastTryMs = millis() | 1;
+        readLocalVersion(s_localVersion, sizeof(s_localVersion));
+    }
+    return s_localVersion;
+}
 
 bool dataUpdateStart() {
     if (s_running) return false;
