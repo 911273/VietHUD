@@ -19,18 +19,15 @@
 
 #define I2S_PORT        I2S_NUM_0
 #define I2S_SAMPLE_RATE 16000
-#if defined(VIETHUD_BOARD_ES3C28P)
-// VietHUD 2.8: ES8311 codec (configured once in core/Board.cpp) needs a real
-// MCLK = 256 x fs — pins come from pincfg.h.
-#define I2S_MCLK_OUT    I2S_MCLK_PIN
-#define AUDIO_HW_NAME   "ES8311"
+// I2S pins, MCLK and the amp/codec name come from the board config
+// (include/boards/<board>/board_config.h). A codec (ES8311) needs a real
+// MCLK = 256 x fs; a plain I2S amp (NS4168) has none (BOARD_I2S_MCLK_PIN -1).
+#if BOARD_I2S_MCLK_PIN >= 0
+#define I2S_MCLK_OUT    BOARD_I2S_MCLK_PIN
 #else
-#define I2S_BCLK_PIN    42
-#define I2S_LRCK_PIN    2
-#define I2S_DOUT_PIN    41
 #define I2S_MCLK_OUT    I2S_PIN_NO_CHANGE
-#define AUDIO_HW_NAME   "NS4168"
 #endif
+#define AUDIO_HW_NAME   BOARD_AUDIO_NAME
 
 // Extra digital gain on the decoded VOICE stream, on top of the 0-100% volume.
 // The spoken clips are mastered well below full scale, so at 100% volume they
@@ -399,7 +396,7 @@ static void audioTaskFn(void *) {
         AudioFileSourceFS source(SD_MMC, path);
         if (source.isOpen()) {
             AudioOutputI2S out;
-#if defined(VIETHUD_BOARD_ES3C28P)
+#if BOARD_I2S_MCLK_PIN >= 0
             out.SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_OUT);
 #else
             out.SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);

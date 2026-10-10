@@ -1,6 +1,7 @@
 ﻿#include "map/SpeedLimitManager.h"
 #include <esp_task_wdt.h>
 #include "Dashboard.h"
+#include "boards/board.h" // BOARD_DARK_BG, TFT_RES_W (bar heights)
 #include "map/MapRenderer.h"
 #include "map/SdCardManager.h" // sdMgrExists() — full-sentence voice prompts present on the card?
 #include "Settings.h"
@@ -145,11 +146,7 @@ struct ThemePalette {
 // VietHUD 2.8's IPS panel (display inversion on) visibly lifts the lowest
 // RGB565 codes, so its near-black 0x04060A showed as a tinted grey on the real
 // unit (2026-10-10) while true 0x000000 stayed black — use pure black there.
-#if defined(VIETHUD_BOARD_ES3C28P)
-#define DARK_BG 0x000000
-#else
-#define DARK_BG 0x04060A
-#endif
+#define DARK_BG BOARD_DARK_BG // per board: include/boards/<board>/board_config.h
 static const ThemePalette kDarkPalette = {
     DARK_BG, 0x7FD3E0, 0xB4BCC6, 0x8A94A0, 0x616A76, 0xFFFFFF, 0xD0E0F0, 0x182232,
     0x0C1522, 0x1F314A, 0xF0F4F8, 0x00E5FF, 0x0C1420, 0x28384C, 0xFFFFFF, 0x182434,
@@ -240,14 +237,10 @@ static int gCanvasW = 480, gCanvasH = 320;
 // Landscape status bars: top (GNSS / street / clock / WiFi / settings) and the
 // bottom one holding the heading letter + board temperature — both 20px text,
 // both marked by the same 1px line.
-// VietHUD 2.8 (320x240) uses thinner bars — see buildDashboardCompact().
-#if defined(VIETHUD_BOARD_ES3C28P)
-static const int kTopBarH = 28;
-static const int kBottomBarH = 28;
-#else
-static const int kTopBarH = 40;
-static const int kBottomBarH = 40;
-#endif
+// A 240px-short panel (320x240, VietHUD 2.8) uses thinner bars — see
+// buildDashboardCompact(). Keyed off the panel's native short side.
+static const int kTopBarH = TFT_RES_W <= 240 ? 28 : 40;
+static const int kBottomBarH = TFT_RES_W <= 240 ? 28 : 40;
 // Speed-limit sign digit fonts: 2-digit limits use the big one, 100/120 the
 // small one to fit the ring. Set per layout (the compact layout's ring is smaller).
 static const lv_font_t *gLimitFontBig = &lv_font_montserrat_48;
@@ -1955,7 +1948,9 @@ void refreshDashboard() {
     }
     lastSpeeding = speeding;
 
-    if (gnss.fix) {
+    // speedValid, not fix: on NAV-PVT receivers the Doppler speed is shown as
+    // soon as it's trustworthy, before the position is good enough for alerts.
+    if (gnss.speedValid) {
         // NOTE: LVGL's builtin vsnprintf has %f support compiled out when
         // LV_USE_FLOAT=0 (our lv_conf.h) — passing %f to lv_label_set_text_fmt
         // silently corrupts the varargs and crashes (LoadProhibited).

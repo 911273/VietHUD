@@ -157,7 +157,7 @@ static void ubxSend(uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t len) {
     Serial2.write(ck, 2);
 }
 
-#if defined(VIETHUD_BOARD_ES3C28P)
+#if BOARD_GNSS_PQTM
 // Sends "$<body>*CS\r\n" to the module (vendor NMEA-style commands).
 static void gnssSendNmeaCmd(const char *body) {
     uint8_t cs = 0;
@@ -233,7 +233,50 @@ static float sBridgeVertMs = 0;
 static bool sBridgeVertValid = false;
 static uint32_t sBridgeVertAtMs = 0;
 
+// Fast speed path (2026-10-10, "tốc độ không đúng với tốc độ xe"): the bridged
+// RMC speed below is a 1-second average published once a second, so the
+// display trailed real acceleration/braking by ~1-1.5 s. Here every NAV-PVT
+// (~10 Hz) updates a speed from the last kFastWin samples (~0.3 s) of the
+// Doppler velocity, and the GNSS task loop uses it whenever it is fresh.
+// Gated on the receiver's own speed accuracy only — NOT on the 50 m position
+// gate — since Doppler speed is accurate as soon as there is any fix, which
+// also lets the speed show up well before the position is good enough for
+// map matching. Position/fix cadence (and so map-matching load) stays 1 Hz.
+static const int kFastWin = 3;
+static const float kMaxFastSAccMs = 1.5f;
+static float sBridgeFastKmh = 0;
+static bool sBridgeFastValid = false;
+static uint32_t sBridgeFastAtMs = 0;
+
+static void updateFastSpeed(const uint8_t *p) {
+    static float vn[kFastWin], ve[kFastWin];
+    static int n = 0, idx = 0;
+    uint8_t fixType = p[20], flags = p[21];
+    float sAccMs = (uint32_t)ubxI32(p, 68) / 1000.0f;
+    bool ok = (flags & 0x01) && fixType >= 2 && fixType <= 4 && sAccMs <= kMaxFastSAccMs;
+    if (!ok) {
+        n = 0;
+        sBridgeFastValid = false;
+        return;
+    }
+    vn[idx] = ubxI32(p, 48) / 1000.0f;
+    ve[idx] = ubxI32(p, 52) / 1000.0f;
+    idx = (idx + 1) % kFastWin;
+    if (n < kFastWin) n++;
+    float sn = 0, se = 0;
+    for (int i = 0; i < n; i++) {
+        sn += vn[i];
+        se += ve[i];
+    }
+    float ms = sqrtf(sn * sn + se * se) / n;
+    if (ms * 3.6f < kStaticHoldKmh && ms < sAccMs) ms = 0; // stationary hold, as in the 1 Hz path
+    sBridgeFastKmh = ms * 3.6f;
+    sBridgeFastAtMs = millis();
+    sBridgeFastValid = true;
+}
+
 static void bridgeNavPvt(const uint8_t *p) {
+    updateFastSpeed(p);
     // Per-second accumulators (good samples only).
     static double sVelN = 0, sVelE = 0, sVelD = 0, sSAcc = 0;
     static int sGood = 0;
@@ -428,7 +471,7 @@ static void ubxConfigStep(uint32_t sinceBootMs) {
     switch (step) {
     case 0:
         if (sinceBootMs < 800) return;
-#if defined(VIETHUD_BOARD_ES3C28P)
+#if BOARD_GNSS_PQTM
         // The P18 Pro's real config interface is a Quectel-style PQTM subset
         // (found 2026-10-10: answers $PQTMVERNO with "SUB,V01", firmware
         // "#VERSIONA,B01-V5.34.8"). Only message rates are writable there —
@@ -474,6 +517,14 @@ static uint32_t lastMovingMs = 0;
 uint32_t gnssMsSinceStationary() { return millis() - lastMovingMs; }
 
 static void gnssTaskFn(void *) {
+    // 4 KB RX buffer (must be set before begin()). The Arduino default of 256 B
+    // overflowed with VietHUD 2.8's P18 Pro (binary UBX ~10x/s at 115200)
+    // whenever speedLimitTask kept this core busy for a moment — and after an
+    // overflow the IDF driver makes every read wait a tick in
+    // uart_check_buf_full(), so draining fell behind the incoming stream for
+    // good and the task watchdog rebooted the unit while driving (2026-10-10,
+    // reproduced on the bench: "did not reset the watchdog: gnssTask").
+    Serial2.setRxBufferSize(4096);
     Serial2.begin(kGnssBaud, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
 
     SpeedFilter speedFilter;
@@ -495,9 +546,17 @@ static void gnssTaskFn(void *) {
     const uint32_t kLinkTimeoutMs = 5000; // generous vs. NMEA's ~1s sentence burst cadence
 
     for (;;) {
-        while (Serial2.available()) {
-            uint8_t c = (uint8_t)Serial2.read();
-            if (!ubxFeed(c)) gps.encode((char)c); // UBX replies are consumed here, NMEA goes to TinyGPS
+        // Bounded bulk read: at most kRxChunk bytes per pass (one driver call,
+        // not one per byte), so the rest of this loop — including the watchdog
+        // feed — always runs, even if the module streams faster than we parse.
+        static const int kRxChunk = 1024; // per 50 ms pass = ~20 KB/s, above 115200 baud's ~11.5 KB/s line rate
+        static uint8_t rx[kRxChunk];
+        int avail = Serial2.available();
+        if (avail > 0) {
+            int n = Serial2.readBytes(rx, avail < kRxChunk ? avail : kRxChunk);
+            for (int i = 0; i < n; i++) {
+                if (!ubxFeed(rx[i])) gps.encode((char)rx[i]); // UBX replies are consumed here, NMEA goes to TinyGPS
+            }
         }
         ubxConfigStep(millis() - taskStartMs);
 
@@ -523,18 +582,23 @@ static void gnssTaskFn(void *) {
         GnssSnapshot snap;
         snap.fix = haveRecentFix;
         snap.linkAlive = linkAlive;
-        if (haveRecentFix && gps.speed.isValid()) {
+        // NAV-PVT receivers: the ~10 Hz Doppler speed (updateFastSpeed()) when
+        // fresh, else the 1 Hz NMEA/bridged speed.
+        bool fastFresh = sBridgeFastValid && millis() - sBridgeFastAtMs < 500;
+        if (fastFresh || (haveRecentFix && gps.speed.isValid())) {
             // Calibration applied here, before the filter, so both
             // rawSpeedKmh and the filtered egoSpeedKmh reflect the corrected
             // value (AppConfig.h's gnssSpeedCalibrationPct comment) — no
             // separate "true" vs "displayed" speed anywhere downstream.
-            float measuredKmh = (float)gps.speed.kmph();
+            float measuredKmh = fastFresh ? sBridgeFastKmh : (float)gps.speed.kmph();
             snap.rawSpeedKmh = measuredKmh * (1.0f + cfg.gnssSpeedCalibrationPct / 100.0f);
             snap.egoSpeedKmh = speedFilter.push(snap.rawSpeedKmh);
+            snap.speedValid = true;
         } else {
             speedFilter.reset();
             snap.rawSpeedKmh = 0;
             snap.egoSpeedKmh = 0; // consumers must gate on .fix, never trust this while !fix
+            snap.speedValid = false;
         }
         snap.satCount = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
         snap.hdop = gps.hdop.isValid() ? (float)gps.hdop.hdop() : 0.0f;
@@ -665,6 +729,7 @@ static void gnssTaskFn(void *) {
                 snap.latDeg = gSimLat;
                 snap.lonDeg = gSimLon;
                 snap.egoSpeedKmh = snap.rawSpeedKmh = gSimSpeedKmh;
+                snap.speedValid = true;
                 snap.headingDeg = gSimHeadingDeg;
                 snap.headingValid = true;
                 snap.headingPredicted = false;
