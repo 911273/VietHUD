@@ -84,6 +84,9 @@ uint8_t calculateChecksum(const uint8_t* data, size_t len) {
 // Forward Declarations
 void sendHeartbeatPacket();
 void sendHudInfoPacket();
+void sendHudInfoPacketA5();
+void sendObdTelemetryPacketA5();
+void sendHeartbeatPacketA5();
 void sendObdTelemetryPacket();
 void parseIncomingPacket(const uint8_t* data, size_t len);
 void startRawAdvertising(const char* name = nullptr);
@@ -102,8 +105,12 @@ class VietMapServerCallbacks : public BLEServerCallbacks {
         Serial.println("[BLE] ==================================================\n");
         
         delay(100);
+        sendHudInfoPacketA5();
+        delay(30);
         sendHudInfoPacket();
-        delay(50);
+        delay(30);
+        sendObdTelemetryPacketA5();
+        delay(30);
         sendObdTelemetryPacket();
     }
 
@@ -140,53 +147,169 @@ class VietMapRxCallbacks : public BLECharacteristicCallbacks {
 // PROTOCOL PACKET PARSER & DECODER
 // =============================================================================
 void parseIncomingPacket(const uint8_t* data, size_t len) {
-    if (len < 3) return;
+    if (len < 2) return;
 
+    // 1. VIETMAP LIVE A5 5A PROTOCOL
+    if (data[0] == 0xA5 && data[1] == 0x5A) {
+        uint8_t cmd = (len >= 3) ? data[2] : 0x00;
+        uint8_t sub = (len >= 4) ? data[3] : 0x00;
+        Serial.printf("  -> [VIETMAP LIVE A5 5A] CMD: 0x%02X, SUB: 0x%02X (Total %d bytes)\n", cmd, sub, len);
+
+        if (!pTxCharacteristic) return;
+
+        // XU LY BAT TAY & DONG BO THOI GIAN: CMD 0x37, SUB 0xC3
+        if (cmd == 0x37 && sub == 0xC3) {
+            uint32_t ts = 0;
+            if (len >= 12) {
+                ts = ((uint32_t)data[8] << 24) | ((uint32_t)data[9] << 16) | ((uint32_t)data[10] << 8) | data[11];
+            }
+            Serial.printf("  [HANDSHAKE] Nhan ma dong bo gio iPhone: %u\n", ts);
+
+            // 1. Phan hoi ACK Echo day du Timestamp
+            uint8_t respC3[22];
+            memset(respC3, 0, sizeof(respC3));
+            respC3[0] = 0xA5;
+            respC3[1] = 0x5A;
+            respC3[2] = 0x37;
+            respC3[3] = 0xC3; // SubCMD C3
+            respC3[4] = 0x00;
+            respC3[5] = 0x00;
+            respC3[6] = 0x00;
+            respC3[7] = 0x0E; // 14 bytes
+            if (len >= 12) memcpy(&respC3[8], &data[8], 4);
+            respC3[12] = 0x00; // Status OK
+            respC3[13] = 0x00;
+            if (len >= 22) memcpy(&respC3[14], &data[14], 8);
+
+            pTxCharacteristic->setValue(respC3, sizeof(respC3));
+            pTxCharacteristic->notify();
+            totalPacketsTx++;
+
+            // 2. Gui kem SubCMD 0xC4 (Status Response cap nhat)
+            respC3[3] = 0xC4;
+            pTxCharacteristic->setValue(respC3, sizeof(respC3));
+            pTxCharacteristic->notify();
+            totalPacketsTx++;
+
+            // 3. Gui goi ACK tieu chuan
+            uint8_t ackStd[] = {0xA5, 0x5A, 0x37, 0xC3, 0x00, 0x00, 0x00, 0x01, 0x00};
+            pTxCharacteristic->setValue(ackStd, sizeof(ackStd));
+            pTxCharacteristic->notify();
+            totalPacketsTx++;
+
+            Serial.println("  [TX A5 5A] >>> Da phan hoi HANDSHAKE & TIME SYNC (C3/C4) <<<");
+            return;
+        }
+
+        // XU LY TRUY VAN THONG SO THIET BI: CMD 0x37, SUB 0xC5 (Info Query 0x02)
+        if (cmd == 0x37 && sub == 0xC5) {
+            Serial.println("  [QUERY] Vietmap Live yeu cau thong tin Model & Hardware Profile (0xC5)...");
+
+            // Goi tin phan hoi Device Info Profile day du
+            uint8_t devProfile[28];
+            memset(devProfile, 0, sizeof(devProfile));
+            devProfile[0] = 0xA5;
+            devProfile[1] = 0x5A;
+            devProfile[2] = 0x37;
+            devProfile[3] = 0xC5; // SubCMD C5
+            devProfile[4] = 0x00;
+            devProfile[5] = 0x00;
+            devProfile[6] = 0x00;
+            devProfile[7] = 0x14; // 20 bytes payload
+
+            devProfile[8]  = 0x02; // Query ID: 0x02 (Device Info)
+            devProfile[9]  = 0x00; // Status: 0 = OK / SUCCESS
+            devProfile[10] = 'H';  // Model: H1N
+            devProfile[11] = '1';
+            devProfile[12] = 'N';
+            devProfile[13] = 0x00;
+            devProfile[14] = 0x01; // HW Version 1.0
+            devProfile[15] = 0x00;
+            devProfile[16] = 0x01; // FW Version 1.2.0
+            devProfile[17] = 0x02;
+            devProfile[18] = 0x00;
+            devProfile[19] = 0x07; // Status: OBD Active, GPS Ready, Pro Active
+            devProfile[20] = 0x00;
+            devProfile[21] = 0x00; // Battery 13.8V
+            devProfile[22] = 138;
+            devProfile[23] = 0x01; // Protocol Version 1
+            // Echo request tag
+            devProfile[24] = (len >= 12) ? data[10] : 0x3A;
+            devProfile[25] = (len >= 12) ? data[11] : 0xA1;
+            devProfile[26] = 0x00;
+            devProfile[27] = 0x00;
+
+            // Gui voi SubCMD C5
+            pTxCharacteristic->setValue(devProfile, sizeof(devProfile));
+            pTxCharacteristic->notify();
+            totalPacketsTx++;
+
+            // Gui kem voi SubCMD C6 (cap phan hoi cua C5)
+            devProfile[3] = 0xC6;
+            pTxCharacteristic->setValue(devProfile, sizeof(devProfile));
+            pTxCharacteristic->notify();
+            totalPacketsTx++;
+
+            // Dong thoi phan hoi goi HUD_INFO A5 va Telemetry
+            delay(10);
+            sendHudInfoPacketA5();
+            delay(10);
+            sendObdTelemetryPacketA5();
+
+            Serial.println("  [TX A5 5A] >>> Da phan hoi MODEL H1N PROFILE cho C5 & C6 <<<");
+            return;
+        }
+
+        // PHAN HOI MAC DINH CHO CAC GOI TIN A5 5A KHAC
+        uint8_t genericAck[9] = {0xA5, 0x5A, cmd, sub, 0x00, 0x00, 0x00, 0x01, 0x00};
+        pTxCharacteristic->setValue(genericAck, sizeof(genericAck));
+        pTxCharacteristic->notify();
+        totalPacketsTx++;
+        Serial.printf("  [TX A5 5A] >>> Generic ACK cho CMD 0x%02X, SUB 0x%02X <<<\n", cmd, sub);
+        return;
+    }
+
+    // 2. LEGACY 55 AA PROTOCOL
     if (data[0] == FRAME_HEADER_1 && data[1] == FRAME_HEADER_2) {
         uint8_t cmd = data[2];
         Serial.printf("  -> [CMD 0x%02X] ", cmd);
 
         switch (cmd) {
             case CMD_HEARTBEAT:
-                Serial.println("App Heartbeat Ping -> Phản hồi ACK");
+                Serial.println("App Heartbeat Ping -> Phan hoi ACK");
                 sendHeartbeatPacket();
                 break;
-
             case CMD_HUD_INFO:
-                Serial.println("App yêu cầu xác thực thiết bị (verifyHUD) -> Phản hồi HUD_INFO");
+                Serial.println("App yeu cau xac thuc -> Phan hoi HUD_INFO");
                 sendHudInfoPacket();
                 break;
-
             case CMD_SPEED_LIMIT:
                 if (len >= 4) {
                     currentSpeedLimit = data[3];
-                    Serial.printf("CẬP NHẬT TỐC ĐỘ GIỚI HẠN: %u km/h\n", currentSpeedLimit);
+                    Serial.printf("CAP NHAT TOC DO GIOI HAN: %u km/h\n", currentSpeedLimit);
                 }
                 break;
-
             case CMD_CAMERA_ALERT:
                 if (len >= 6) {
                     uint8_t camType = data[3];
                     lastCameraDistance = (data[4] << 8) | data[5];
-                    const char* typeName = "Camera Phạt Nguội";
-                    if (camType == 1) typeName = "Camera Bắn Tốc Độ";
-                    else if (camType == 2) typeName = "Camera Vượt Đèn Đỏ";
-                    else if (camType == 3) typeName = "Camera Giám Sát Phân Làn";
+                    const char* typeName = "Camera Phat Nguoi";
+                    if (camType == 1) typeName = "Camera Ban Toc Do";
+                    else if (camType == 2) typeName = "Camera Vuot Den Do";
+                    else if (camType == 3) typeName = "Camera Giam Sat Phan Lan";
                     lastCameraAlert = String(typeName);
-                    Serial.printf("CẢNH BÁO CAMERA: %s | Khoảng cách: %u m\n", typeName, lastCameraDistance);
+                    Serial.printf("CANH BAO CAMERA: %s | Khoang cach: %u m\n", typeName, lastCameraDistance);
                 }
                 break;
-
             case CMD_NAVIGATION:
                 if (len >= 6) {
                     uint8_t navAction = data[3];
                     lastNavDistance = (data[4] << 8) | data[5];
-                    Serial.printf("ĐIỀU HƯỚNG: Hướng 0x%02X | Còn %u m\n", navAction, lastNavDistance);
+                    Serial.printf("DIEU HUONG: Huong 0x%02X | Con %u m\n", navAction, lastNavDistance);
                 }
                 break;
-
             default:
-                Serial.println("Lệnh ứng dụng VietMap khác -> Trả về ACK");
+                Serial.println("Lenh VietMap khac -> Tra ve ACK");
                 uint8_t ackPkt[] = {FRAME_HEADER_1, FRAME_HEADER_2, CMD_ACK, 0x01, cmd, 0x00};
                 ackPkt[5] = calculateChecksum(ackPkt, 5);
                 if (pTxCharacteristic) {
@@ -197,14 +320,7 @@ void parseIncomingPacket(const uint8_t* data, size_t len) {
                 break;
         }
     } else {
-        String strMsg = "";
-        for (size_t i = 0; i < len; i++) {
-            if (data[i] >= 32 && data[i] <= 126) strMsg += (char)data[i];
-        }
-        if (strMsg.length() > 0) {
-            Serial.printf("  -> [RAW TEXT]: \"%s\"\n", strMsg.c_str());
-        }
-        uint8_t ack[] = {FRAME_HEADER_1, FRAME_HEADER_2, CMD_ACK, 0x00, 0x01};
+        uint8_t ack[] = {0xA5, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00};
         if (pTxCharacteristic) {
             pTxCharacteristic->setValue(ack, sizeof(ack));
             pTxCharacteristic->notify();
@@ -457,6 +573,84 @@ void onGapEvent(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
     }
 }
 
+
+// =============================================================================
+// VIETMAP LIVE A5 5A PROTOCOL PACKET TRANSMITTERS
+// =============================================================================
+void sendHudInfoPacketA5() {
+    if (!deviceConnected || !pTxCharacteristic) return;
+
+    uint8_t pkt[20];
+    pkt[0] = 0xA5;
+    pkt[1] = 0x5A;
+    pkt[2] = 0x02; // CMD_HUD_INFO
+    pkt[3] = 0x00; // SEQ
+    pkt[4] = 0x00;
+    pkt[5] = 0x00;
+    pkt[6] = 0x00;
+    pkt[7] = 0x0A; // Payload len = 10 bytes
+
+    pkt[8]  = 'H';
+    pkt[9]  = '1';
+    pkt[10] = 'N';
+    pkt[11] = 0x01; // FW 1.2.0
+    pkt[12] = 0x02;
+    pkt[13] = 0x00;
+    pkt[14] = 0x00;
+    pkt[15] = 138;  // 13.8V
+    pkt[16] = 0x07; // Status: Bit0=OBD, Bit1=GPS, Bit2=Pro Active
+    pkt[17] = 0x00;
+
+    pTxCharacteristic->setValue(pkt, 18);
+    pTxCharacteristic->notify();
+    totalPacketsTx++;
+    Serial.println("[TX A5 5A] >>> Da phan hoi HUD_INFO A5 5A (Model: H1N, Pro Licensed) <<<");
+}
+
+void sendHeartbeatPacketA5() {
+    if (!deviceConnected || !pTxCharacteristic) return;
+
+    uint8_t pkt[12];
+    pkt[0] = 0xA5;
+    pkt[1] = 0x5A;
+    pkt[2] = 0x01; // CMD_HEARTBEAT
+    pkt[3] = 0x00;
+    pkt[4] = 0x00;
+    pkt[5] = 0x00;
+    pkt[6] = 0x00;
+    pkt[7] = 0x02;
+    pkt[8] = currentSpeed;
+    pkt[9] = 0x01; // Link alive
+
+    pTxCharacteristic->setValue(pkt, 10);
+    pTxCharacteristic->notify();
+    totalPacketsTx++;
+}
+
+void sendObdTelemetryPacketA5() {
+    if (!deviceConnected || !pTxCharacteristic) return;
+
+    uint8_t pkt[16];
+    pkt[0] = 0xA5;
+    pkt[1] = 0x5A;
+    pkt[2] = 0x03; // CMD_OBD_TELEMETRY
+    pkt[3] = 0x00;
+    pkt[4] = 0x00;
+    pkt[5] = 0x00;
+    pkt[6] = 0x00;
+    pkt[7] = 0x06;
+    pkt[8] = currentSpeed;
+    pkt[9] = (currentRpm >> 8) & 0xFF;
+    pkt[10] = currentRpm & 0xFF;
+    pkt[11] = currentCoolantTemp;
+    pkt[12] = (uint8_t)(batteryVoltage * 10);
+    pkt[13] = 0x00;
+
+    pTxCharacteristic->setValue(pkt, 14);
+    pTxCharacteristic->notify();
+    totalPacketsTx++;
+}
+
 // =============================================================================
 // SETUP & MAIN LOOP
 // =============================================================================
@@ -515,10 +709,12 @@ void setup() {
 void loop() {
     uint32_t now = millis();
 
-    if (deviceConnected) {
+        if (deviceConnected) {
         if (now - lastHeartbeatMs >= 1500) {
             lastHeartbeatMs = now;
             sendHeartbeatPacket();
+            sendHeartbeatPacketA5();
+            sendObdTelemetryPacketA5();
         }
     }
 
