@@ -1,4 +1,5 @@
 #pragma once
+#include <FS.h>
 #include "SpeedMapFormat.h"
 #include <stddef.h> // size_t — sdMgrReadFileChunk()'s offset/length parameters
 
@@ -189,3 +190,8 @@ int sdMgrClearDir(const char *dir);             // remove all files in dir (non-
 void sdMgrSetBaseDir(const char *dir);
 const char *sdMgrGetBaseDir();
 int sdMgrScanDataSources(char names[][32], char dirs[][32], int maxCount);
+
+// The filesystem holding /speedmap etc.: the microSD card, or the on-chip FFat
+// partition on boards with BOARD_HAS_FLASH_DATA. Valid once a mount succeeded.
+fs::FS &sdMgrDataFs();
+bool sdMgrDataOnFlash();

@@ -25,3 +25,9 @@ Arduino_GFX *boardCreatePanel();
 bool boardTouchBegin();
 void boardTouchSetRotation(uint8_t rotation);
 bool boardTouchRead(uint16_t *x, uint16_t *y);
+
+// Physical buttons (boards without touch, BOARD_HAS_TOUCH 0): the raw, un-
+// debounced pressed state as a bitmask of BOARD_KEY_*. Touch boards return 0.
+// ui/ButtonInput.cpp turns it into short/long/double presses and actions.
+enum : uint8_t { BOARD_KEY_LEFT = 1, BOARD_KEY_CENTER = 2, BOARD_KEY_RIGHT = 4 };
+uint8_t boardButtonsRaw();

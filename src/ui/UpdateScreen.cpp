@@ -507,7 +507,7 @@ void updatePromptPoll() {
     if (!stopped || s_updatingFw || s_isOpen || fwUpdaterIsRunning()) return;
     if (s_fwInfo.hasUpdate && s_fwInfo.downloadUrl[0] && strcmp(s_declinedFw, s_fwInfo.remoteVersion) != 0) {
         showPrompt(PROMPT_FW);
-    } else if (!s_checkingFw && s_fwCheckedSinceLink && sdMgrIsAvailable() && dataUpdateAvailable() &&
+    } else if (!s_checkingFw && s_fwCheckedSinceLink && sdMgrIsAvailable() && !sdMgrDataOnFlash() && dataUpdateAvailable() &&
                strcmp(s_declinedData, dataUpdateRemoteVersion()) != 0) {
         // Data only AFTER this link's firmware check (firmware first), and only
         // with a mounted card: with the card missing the local data version reads
@@ -516,4 +516,12 @@ void updatePromptPoll() {
         // 2026-10-10). A blank card can still be filled from the Update screen.
         showPrompt(PROMPT_DATA);
     }
+}
+
+// Button boards (no touch): answer the update prompt from ui/ButtonInput.cpp.
+bool updatePromptActive() { return s_promptKind != PROMPT_NONE; }
+void updatePromptAnswer(bool update) {
+    if (s_promptKind == PROMPT_NONE) return;
+    if (update) onPromptUpdate(nullptr);
+    else onPromptLater(nullptr);
 }

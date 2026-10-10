@@ -60,6 +60,8 @@ static void tripLoggerTaskFn(void *) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(200));
         if (!cfg.tripLoggingEnabled) continue;
+        // Not on on-chip data flash (no card slot): a line a second would wear it out.
+        if (sdMgrDataOnFlash()) continue;
 
         if (!headerWritten) {
             // Retried every tick until it succeeds (e.g. card not mounted

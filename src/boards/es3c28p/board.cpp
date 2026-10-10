@@ -85,3 +85,4 @@ static FT6336Touch touch(TOUCH_ADDR, TFT_RES_W, TFT_RES_H);
 bool boardTouchBegin() { return touch.begin(); }
 void boardTouchSetRotation(uint8_t rotation) { touch.setRotation(rotation); }
 bool boardTouchRead(uint16_t *x, uint16_t *y) { return touch.getPoint(x, y); }
+uint8_t boardButtonsRaw() { return 0; } // touch board: no keys

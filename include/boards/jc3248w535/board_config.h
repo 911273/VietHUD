@@ -95,6 +95,9 @@
 #define BOARD_DARK_BG             0x04060A // panel renders near-black fine
 #define BOARD_I2S_MCLK_PIN        -1       // NS4168 amp: no MCLK
 #define BOARD_AUDIO_NAME          "NS4168"
+#define BOARD_HAS_SD_SLOT         1        // microSD on SD_MMC
+#define BOARD_HAS_FLASH_DATA      0        // no on-chip data partition
+#define BOARD_HAS_TOUCH           1
 #define BOARD_GNSS_PQTM           0        // plain u-blox M10 (NMEA)
 #define GNSS_BAUD                 38400    // see GNSS.cpp kGnssBaud
 #define I2S_BCLK_PIN              42
