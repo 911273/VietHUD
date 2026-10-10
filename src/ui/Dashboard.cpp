@@ -1061,7 +1061,7 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 }
 
 // ---------------------------------------------------------------------
-// Compact landscape content (VietHUD 2.8, 320x240) — the landscape
+// Compact content (VietHUD 2.8 320x240, VietHUD Lite 240x240) — the landscape
 // arrangement scaled down for the 2.8" ILI9341 panel rather than squeezed:
 // thinner 28 px bars, the 64 px speed font, a smaller P.127 ring and a
 // shorter alert capsule, so the map in the middle keeps as much room as
@@ -1069,7 +1069,8 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 // no-flex/plain-positioning rule as buildDashboardLandscape() above.
 // ---------------------------------------------------------------------
 static void buildDashboardCompact(lv_obj_t *scr) {
-    const int scrW = 320, scrH = 240;
+    // 320x240 (VietHUD 2.8) or 240x240 (Lite 1.54"): widths follow the panel.
+    const int scrW = gfx->width(), scrH = gfx->height();
     const int topH = kTopBarH;
 
     // ---------------- Top status bar ----------------
@@ -1105,7 +1106,8 @@ static void buildDashboardCompact(lv_obj_t *scr) {
     lv_obj_add_flag(sunIcon, LV_OBJ_FLAG_HIDDEN);
 
     streetNameBadge = lv_obj_create(topBar);
-    lv_obj_set_size(streetNameBadge, 160, 22);
+    const int badgeW = scrW >= 320 ? 160 : scrW - 150; // clears GNSS (left) + audio/clock (right)
+    lv_obj_set_size(streetNameBadge, badgeW, 22);
     lv_obj_align(streetNameBadge, LV_ALIGN_CENTER, -4, 0);
     lv_obj_set_style_bg_color(streetNameBadge, lv_color_hex(0x0C1522), 0);
     lv_obj_set_style_bg_opa(streetNameBadge, LV_OPA_80, 0);
@@ -1125,7 +1127,7 @@ static void buildDashboardCompact(lv_obj_t *scr) {
     lv_obj_set_style_text_font(streetNameLabel, &lv_font_vn_14, 0);
     lv_obj_set_style_text_color(streetNameLabel, lv_color_hex(0xF0F4F8), 0);
     lv_label_set_long_mode(streetNameLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(streetNameLabel, 132);
+    lv_obj_set_width(streetNameLabel, badgeW - 28);
     lv_obj_align(streetNameLabel, LV_ALIGN_LEFT_MID, 22, 0);
     lv_label_set_text(streetNameLabel, "");
     lv_obj_add_flag(streetNameBadge, LV_OBJ_FLAG_HIDDEN);
@@ -1197,7 +1199,7 @@ static void buildDashboardCompact(lv_obj_t *scr) {
     lv_obj_add_flag(wifiTopIcon, LV_OBJ_FLAG_HIDDEN);
 
     // Alert capsule just above the bottom bar.
-    const int cardW = 236, cardH = 48;
+    const int cardW = scrW - 12 < 236 ? scrW - 12 : 236, cardH = 48;
     midCol = makePane(scr, (scrW - cardW) / 2, scrH - kBottomBarH - 4 - cardH, cardW, cardH);
     buildTrafficCard(midCol, cardW, cardH);
     lv_obj_set_style_text_font(alertDistLabel, &lv_font_montserrat_28, 0);
@@ -1391,7 +1393,7 @@ void buildDashboard() {
     if (scrH > scrW) {
         buildDashboardPortrait(scr);
     } else if (scrW <= 320) {
-        buildDashboardCompact(scr); // VietHUD 2.8 (320x240)
+        buildDashboardCompact(scr); // VietHUD 2.8 (320x240), Lite 1.54" (240x240)
     } else {
         buildDashboardLandscape(scr);
     }
@@ -2433,4 +2435,14 @@ void burnInTimerCb(lv_timer_t *) {
             Serial.println("[uidemo] vehicle stationary -> screen dimmed (burn-in mitigation)");
         }
     }
+}
+
+// Short centred message over the Dashboard (zoom level, sound on/off, volume…)
+// — the same toast the touch gestures use; ui/ButtonInput.cpp shows its button
+// actions through it.
+void dashboardToast(const char *text, uint32_t ms) {
+    if (!wifiToastLabel) return;
+    lv_label_set_text(wifiToastLabel, text);
+    lv_obj_clear_flag(wifiToastLabel, LV_OBJ_FLAG_HIDDEN);
+    wifiToastUntilMs = millis() + ms;
 }

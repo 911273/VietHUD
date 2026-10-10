@@ -50,6 +50,7 @@
 #include "log/TripLogger.h"
 #include "net/WebPortal.h"
 #include "core/Board.h" // boardEarlyInit()
+#include "ui/ButtonInput.h" // buttonInputPoll()
 #include "core/Version.h" // VIETHUD_MODEL / VIETHUD_FW_VERSION boot banner
 #include "net/DataUpdater.h" // dataUpdateStart()/GetStatus() — serial 'u' bench trigger
 #include "update/DataInstaller.h" // boot-time atomic data install + rollback (Phone Update Bridge)
@@ -658,6 +659,7 @@ void loop() {
     lv_timer_handler();
     updateScreenPoll();
     updatePromptPoll(); // auto firmware check on Wi-Fi + "update now?" prompt (UpdateScreen.cpp)
+    buttonInputPoll();  // physical buttons on boards without touch (ui/ButtonInput.cpp)
 
     // Report where the frame time actually goes, so tuning stops being guesswork.
     if (now - lastStatsMs > 5000) {

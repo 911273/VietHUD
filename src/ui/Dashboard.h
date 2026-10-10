@@ -15,6 +15,7 @@ void burnInTimerCb(lv_timer_t *);
 // touch indev callback (wake-on-touch) both need these.
 void applyConfig();
 void wakeScreen();
+void dashboardToast(const char *text, uint32_t ms); // short centred message
 
 // millis() timestamp of the last touch anywhere in the app (wakeScreen() is
 // called from the touch indev callback regardless of which screen is

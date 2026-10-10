@@ -81,4 +81,7 @@
 #define BOARD_AUDIO_NAME          "ES8311"
 // "P18 Pro" GPS: UBX-only, its real config interface is a Quectel-style
 // PQTM subset (see GNSS.cpp) — NMEA is switched off over it at boot.
+#define BOARD_HAS_SD_SLOT         1        // microSD on SD_MMC
+#define BOARD_HAS_FLASH_DATA      0        // no on-chip data partition
+#define BOARD_HAS_TOUCH           1
 #define BOARD_GNSS_PQTM           1

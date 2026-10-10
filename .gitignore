@@ -59,3 +59,25 @@ backups/
 capture/
 logs/
 reports/
+
+# Large datasets and external tooling
+speedmap_gofa/
+speedmap_vietmap/
+speedmap_wyn/
+tools/platform-tools.zip
+tools/platform-tools/
+tools/gofa_extract/
+tools/map_builder/gofa_harvest/
+data/speedmap/NGAN_HANG_CAU_HOI/
+*.csv
+/camera.bin
+/cameras.bin
+/sign.bin
+/signs.bin
+speedmap/camera.bin
+speedmap/sign.bin
+speedmap/cameras.bin
+speedmap/signs.bin
+speedmap/manifest.txt
+speedmap/manifest.txt.sig
+__pycache__/

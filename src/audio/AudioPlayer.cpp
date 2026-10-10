@@ -338,23 +338,23 @@ static void audioTaskFn(void *) {
         // It must NOT be replaced by pack-specific greetings (like dan-duong-gofa).
         if (strcmp(c.file, "welcome/voice.mp3") == 0) {
             snprintf(path, sizeof(path), "%s/sounds/welcome/voice.mp3", baseDir);
-            if (SD_MMC.exists(path)) {
+            if (sdMgrDataFs().exists(path)) {
                 found = true;
             } else {
                 snprintf(path, sizeof(path), "/speedmap_gofa/sounds/welcome/voice.mp3");
-                if (SD_MMC.exists(path)) {
+                if (sdMgrDataFs().exists(path)) {
                     found = true;
                 } else {
                     snprintf(path, sizeof(path), "/speedmap/sounds/welcome/voice.mp3");
-                    if (SD_MMC.exists(path)) {
+                    if (sdMgrDataFs().exists(path)) {
                         found = true;
                     } else {
                         snprintf(path, sizeof(path), "/speedmap_wyn/sounds/welcome/voice.mp3");
-                        if (SD_MMC.exists(path)) {
+                        if (sdMgrDataFs().exists(path)) {
                             found = true;
                         } else {
                             snprintf(path, sizeof(path), "/speedmap/sounds/vi/welcome/voice.mp3");
-                            if (SD_MMC.exists(path)) found = true;
+                            if (sdMgrDataFs().exists(path)) found = true;
                         }
                     }
                 }
@@ -363,17 +363,17 @@ static void audioTaskFn(void *) {
         else if (s_voicePack >= 0 && s_voicePack < 6) {
             // Check 1: in current active baseDir
             snprintf(path, sizeof(path), "%s/sounds/packs/%s/%s", baseDir, kVoicePackDirs[s_voicePack], c.file);
-            if (SD_MMC.exists(path)) {
+            if (sdMgrDataFs().exists(path)) {
                 found = true;
             } else {
                 // Check 2: in /speedmap_gofa
                 snprintf(path, sizeof(path), "/speedmap_gofa/sounds/packs/%s/%s", kVoicePackDirs[s_voicePack], c.file);
-                if (SD_MMC.exists(path)) {
+                if (sdMgrDataFs().exists(path)) {
                     found = true;
                 } else {
                     // Check 3: in /speedmap
                     snprintf(path, sizeof(path), "/speedmap/sounds/packs/%s/%s", kVoicePackDirs[s_voicePack], c.file);
-                    if (SD_MMC.exists(path)) {
+                    if (sdMgrDataFs().exists(path)) {
                         found = true;
                     }
                 }
@@ -381,7 +381,7 @@ static void audioTaskFn(void *) {
         }
         if (!found) {
             snprintf(path, sizeof(path), "%s/sounds/vi/%s", baseDir, c.file);
-            if (!SD_MMC.exists(path)) {
+            if (!sdMgrDataFs().exists(path)) {
                 snprintf(path, sizeof(path), "/speedmap/sounds/vi/%s", c.file);
             }
         }
@@ -393,7 +393,7 @@ static void audioTaskFn(void *) {
         s_initialized = false;
         vTaskDelay(pdMS_TO_TICKS(10));
 
-        AudioFileSourceFS source(SD_MMC, path);
+        AudioFileSourceFS source(sdMgrDataFs(), path); // card or on-chip data partition
         if (source.isOpen()) {
             AudioOutputI2S out;
 #if BOARD_I2S_MCLK_PIN >= 0
