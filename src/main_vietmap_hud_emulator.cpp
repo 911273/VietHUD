@@ -23,7 +23,7 @@
 // =============================================================================
 // BLUETOOTH BLE DEFINITIONS & UUIDS
 // =============================================================================
-#define DEVICE_NAME         "H1N"          // Prefix 'H1N' triggers hudH1N / H1NewProtocol
+#define DEVICE_NAME         "VIETMAP_HUD"          // Prefix 'H1N' triggers hudH1N / H1NewProtocol
 #define DEVICE_NAME_ALT     "VIETMAP_HUD"
 
 // Custom VietMap GATT UUIDs (16-bit mapped to 128-bit Bluetooth Base)
@@ -56,6 +56,7 @@ BLECharacteristic* pAuxCharacteristic = nullptr;
 
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
+char currentDevName[32] = DEVICE_NAME;
 uint32_t lastHeartbeatMs = 0;
 uint32_t totalPacketsRx = 0;
 uint32_t totalPacketsTx = 0;
@@ -85,6 +86,8 @@ void sendHeartbeatPacket();
 void sendHudInfoPacket();
 void sendObdTelemetryPacket();
 void parseIncomingPacket(const uint8_t* data, size_t len);
+void startRawAdvertising(const char* name = nullptr);
+static volatile bool advertising = false;
 
 // =============================================================================
 // BLE SERVER CALLBACKS
@@ -92,6 +95,7 @@ void parseIncomingPacket(const uint8_t* data, size_t len);
 class VietMapServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) override {
         deviceConnected = true;
+        advertising = false; // the stack stops advertising once a central connects
         Serial.println("\n[BLE] ==================================================");
         Serial.println("[BLE] >>> VIETMAP LIVE APP ĐÃ KẾT NỐI THÀNH CÔNG! <<<");
         Serial.println("[BLE] Đang kích hoạt chế độ VIETMAP PRO...");
@@ -339,12 +343,117 @@ void handleSerialCLI() {
         sendObdTelemetryPacket();
         Serial.println("✅ Đã phát gói tin OBD Telemetry.");
     }
+        else if (line.startsWith("name ")) {
+        String newName = line.substring(5);
+        newName.trim();
+        if (newName.length() > 0 && newName.length() <= 16) {
+            Serial.printf("✅ Đổi tên Bluetooth thành: \"%s\"\n", newName.c_str());
+            startRawAdvertising(newName.c_str());
+        }
+    }
     else if (line.startsWith("limit ")) {
         currentSpeedLimit = line.substring(6).toInt();
         Serial.printf("✅ Đã cập nhật giới hạn tốc độ: %u km/h\n", currentSpeedLimit);
     }
     else {
         Serial.printf("Lệnh không hợp lệ: \"%s\". Gõ 'help' để xem danh sách lệnh.\n", line.c_str());
+    }
+}
+
+// =============================================================================
+// RAW ADVERTISING (adv data -> scan rsp -> start, sequenced by GAP events)
+// =============================================================================
+static uint8_t rawAdvData[31];
+static uint8_t rawAdvDataLen = 0;
+static uint8_t rawScanRespData[31];
+static uint8_t rawScanRespDataLen = 0;
+static volatile bool advDataSet = false;
+static volatile bool scanRspSet = false;
+
+static void beginAdvertisingNow() {
+    esp_ble_adv_params_t advParams;
+    memset(&advParams, 0, sizeof(advParams));
+    advParams.adv_int_min = 0x20;
+    advParams.adv_int_max = 0x40;
+    advParams.adv_type = ADV_TYPE_IND;
+    advParams.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+    advParams.channel_map = ADV_CHNL_ALL;
+    advParams.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+    esp_err_t err = esp_ble_gap_start_advertising(&advParams);
+    if (err != ESP_OK) Serial.printf("[BLE] LOI start_advertising: %s\n", esp_err_to_name(err));
+}
+
+void startRawAdvertising(const char* name) {
+    if (name && strlen(name) > 0) {
+        strncpy(currentDevName, name, sizeof(currentDevName) - 1);
+        currentDevName[sizeof(currentDevName) - 1] = '\0';
+    }
+    advDataSet = scanRspSet = false;
+
+    // 1. Build rawAdvData (Flags + 16-bit UUID + Name)
+    rawAdvDataLen = 0;
+    rawAdvData[rawAdvDataLen++] = 0x02;
+    rawAdvData[rawAdvDataLen++] = 0x01;
+    rawAdvData[rawAdvDataLen++] = 0x06; // Flags
+
+    rawAdvData[rawAdvDataLen++] = 0x03;
+    rawAdvData[rawAdvDataLen++] = 0x03;
+    rawAdvData[rawAdvDataLen++] = 0xF0;
+    rawAdvData[rawAdvDataLen++] = 0xFF; // Complete 16-bit Service UUID: 0xFFF0
+
+    uint8_t nlen = strlen(currentDevName);
+    if (rawAdvDataLen + 2 + nlen <= 31) {
+        rawAdvData[rawAdvDataLen++] = nlen + 1;
+        rawAdvData[rawAdvDataLen++] = 0x09; // Complete Local Name
+        memcpy(&rawAdvData[rawAdvDataLen], currentDevName, nlen);
+        rawAdvDataLen += nlen;
+    }
+
+    // 2. Build rawScanRespData (128-bit UUID + Name)
+    rawScanRespDataLen = 0;
+    rawScanRespData[rawScanRespDataLen++] = 0x11;
+    rawScanRespData[rawScanRespDataLen++] = 0x07; // Complete 128-bit Service UUID
+    static const uint8_t u128[] = { 0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0xF0, 0xFF, 0x00, 0x00 };
+    memcpy(&rawScanRespData[rawScanRespDataLen], u128, 16);
+    rawScanRespDataLen += 16;
+
+    if (rawScanRespDataLen + 2 + nlen <= 31) {
+        rawScanRespData[rawScanRespDataLen++] = nlen + 1;
+        rawScanRespData[rawScanRespDataLen++] = 0x09; // Complete Local Name
+        memcpy(&rawScanRespData[rawScanRespDataLen], currentDevName, nlen);
+        rawScanRespDataLen += nlen;
+    }
+
+    esp_ble_gap_set_device_name(currentDevName);
+    esp_err_t err = esp_ble_gap_config_adv_data_raw(rawAdvData, rawAdvDataLen);
+    if (err != ESP_OK) Serial.printf("[BLE] LOI config_adv_data_raw: %s\n", esp_err_to_name(err));
+    err = esp_ble_gap_config_scan_rsp_data_raw(rawScanRespData, rawScanRespDataLen);
+    if (err != ESP_OK) Serial.printf("[BLE] LOI config_scan_rsp_data_raw: %s\n", esp_err_to_name(err));
+}
+
+void onGapEvent(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
+    switch (event) {
+        case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
+            if (param->adv_data_raw_cmpl.status != ESP_BT_STATUS_SUCCESS)
+                Serial.printf("[BLE] Adv data bi tu choi (status %d)\n", param->adv_data_raw_cmpl.status);
+            advDataSet = true;
+            if (scanRspSet) beginAdvertisingNow();
+            break;
+        case ESP_GAP_BLE_SCAN_RSP_DATA_RAW_SET_COMPLETE_EVT:
+            if (param->scan_rsp_data_raw_cmpl.status != ESP_BT_STATUS_SUCCESS)
+                Serial.printf("[BLE] Scan response bi tu choi (status %d)\n", param->scan_rsp_data_raw_cmpl.status);
+            scanRspSet = true;
+            if (advDataSet) beginAdvertisingNow();
+            break;
+        case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+            advertising = (param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS);
+            Serial.printf("[BLE] Advertising %s (status %d)\n", advertising ? "DA BAT" : "THAT BAI", param->adv_start_cmpl.status);
+            break;
+        case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+            advertising = false;
+            break;
+        default:
+            break;
     }
 }
 
@@ -395,29 +504,9 @@ void setup() {
 
     pService->start();
 
-        static const uint8_t rawAdvData[] = {
-        0x02, 0x01, 0x06,               // Flags
-        0x03, 0x03, 0xF0, 0xFF,         // Complete 16-bit Service UUID: 0xFFF0
-        0x04, 0x09, 'H', '1', 'N'       // Complete Local Name: "H1N"
-    };
-    static const uint8_t rawScanRespData[] = {
-        0x11, 0x07, 0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0xF0, 0xFF, 0x00, 0x00,
-        0x04, 0x09, 'H', '1', 'N'
-    };
-    esp_err_t err;
-    err = esp_ble_gap_config_adv_data_raw((uint8_t*)rawAdvData, sizeof(rawAdvData));
-    err = esp_ble_gap_config_scan_rsp_data_raw((uint8_t*)rawScanRespData, sizeof(rawScanRespData));
-    delay(100);
-    esp_ble_adv_params_t advParams;
-    memset(&advParams, 0, sizeof(advParams));
-    advParams.adv_int_min = 0x20;
-    advParams.adv_int_max = 0x40;
-    advParams.adv_type = ADV_TYPE_IND;
-    advParams.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
-    advParams.channel_map = ADV_CHNL_ALL;
-    advParams.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
-    err = esp_ble_gap_start_advertising(&advParams);
-    Serial.println(err);
+    BLEDevice::setCustomGapHandler(onGapEvent);
+    Serial.printf("[SETUP] Dia chi MAC BLE: %s\n", BLEDevice::getAddress().toString().c_str());
+    startRawAdvertising();
     Serial.println("[SETUP] ✅ BLE GATT Server đã sẵn sàng và đang phát quảng bá (Advertising)!");
     Serial.println("[SETUP] 👉 BẬT BLUETOOTH TRÊN MÁY TÍNH BẢNG VÀ MỞ VIETMAP LIVE ĐỂ KẾT NỐI!");
     Serial.println("[SETUP] Gõ 'help' trên cổng COM11 để xem các lệnh điều khiển.\n");
@@ -435,21 +524,21 @@ void loop() {
 
     if (!deviceConnected && oldDeviceConnected) {
         delay(500);
-        esp_ble_adv_params_t advParams;
-        memset(&advParams, 0, sizeof(advParams));
-        advParams.adv_int_min = 0x20;
-        advParams.adv_int_max = 0x40;
-        advParams.adv_type = ADV_TYPE_IND;
-        advParams.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
-        advParams.channel_map = ADV_CHNL_ALL;
-        advParams.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
-        esp_ble_gap_start_advertising(&advParams);
+        startRawAdvertising();
         Serial.println("[BLE] Dang tiep tuc quang ba RAW (Advertising) cho thiet bi ket noi lai...");
         oldDeviceConnected = deviceConnected;
     }
 
     if (deviceConnected && !oldDeviceConnected) {
         oldDeviceConnected = deviceConnected;
+    }
+
+    static uint32_t lastAdvLogMs = 0;
+    if (!deviceConnected && now - lastAdvLogMs >= 5000) {
+        lastAdvLogMs = now;
+        Serial.printf("[BLE] %s | ten H1N | MAC %s\n",
+                      advertising ? "Dang phat quang ba, cho ket noi..." : "KHONG phat quang ba!",
+                      BLEDevice::getAddress().toString().c_str());
     }
 
     handleSerialCLI();
