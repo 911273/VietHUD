@@ -1,26 +1,23 @@
 /**
  * @file main_vietmap_hud_classic.cpp
- * @brief VietMap Hardware HUD Clone for ESP32 Classic (ESP32-WROOM-32 / NodeMCU-32S)
+ * @brief VietMap Hardware HUD Clone for ESP32 Classic (Dual-Mode: Classic SPP + BLE GATT)
  * 
- * Uses Bluetooth Classic BR/EDR RFCOMM SPP (Serial Port Profile, UUID 0x1101)
- * to clone VietMap HUD H1N and activate VietMap Live Pro on Android.
- * 
- * Target Hardware: ESP32 Classic (DOIT DevKit V1, NodeMCU-32S, ESP32-WROOM-32)
- * Profile: Bluetooth Classic SPP (BluetoothSerial)
+ * Target Hardware: ESP32 Classic (NodeMCU-32S, ESP32-WROOM-32, DOIT DevKit V1)
  * Device Name: VIETMAP_HUD
+ * Dual-Mode Support:
+ *   1. Bluetooth Classic RFCOMM SPP (UUID 0x1101) for Android Settings & Android App
+ *   2. Bluetooth Low Energy BLE GATT (Service 0xFFF0) for iOS / iPhone & Android App
  */
 
 #include <Arduino.h>
 #include "BluetoothSerial.h"
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include "esp_bt_main.h"
+#include "esp_gap_bt_api.h"
 #include "mbedtls/md5.h"
-
-#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run make menuconfig to enable it
-#endif
-
-#if !defined(CONFIG_BT_SPP_ENABLED)
-#error Bluetooth SPP is not enabled!
-#endif
 
 #ifndef LED_BUILTIN
   #define LED_BUILTIN 2
@@ -28,17 +25,9 @@
 
 #define DEVICE_NAME "VIETMAP_HUD"
 
-#define FRAME_HEADER_1      0x55
-#define FRAME_HEADER_2      0xAA
-
-#define CMD_HEARTBEAT       0x01
-#define CMD_HUD_INFO        0x02
-#define CMD_OBD_TELEMETRY   0x03
-#define CMD_SPEED_LIMIT     0x04
-#define CMD_CAMERA_ALERT    0x05
-#define CMD_NAVIGATION      0x06
-#define CMD_TPMS_INFO       0x07
-#define CMD_ACK             0xFF
+#define SERVICE_UUID           "0000FFF0-0000-1000-8000-00805F9B34FB"
+#define CHAR_TX_NOTIFY_UUID    "0000FFF1-0000-1000-8000-00805F9B34FB"
+#define CHAR_RX_WRITE_UUID     "0000FFF2-0000-1000-8000-00805F9B34FB"
 
 static const uint8_t KEY_C[16] = {
     0xF7, 0xF8, 0x15, 0x75, 0x02, 0xDA, 0x52, 0x8E, 
@@ -46,8 +35,13 @@ static const uint8_t KEY_C[16] = {
 };
 
 BluetoothSerial SerialBT;
+BLEServer* pBleServer = nullptr;
+BLECharacteristic* pTxCharacteristic = nullptr;
+BLECharacteristic* pRxCharacteristic = nullptr;
 
-bool clientConnected = false;
+bool sppConnected = false;
+bool bleConnected = false;
+
 uint32_t lastHeartbeatMs = 0;
 uint32_t totalPacketsRx = 0;
 uint32_t totalPacketsTx = 0;
@@ -61,9 +55,6 @@ String lastCameraAlert = "None";
 uint16_t lastCameraDistance = 0;
 String lastNavDirection = "Straight";
 uint16_t lastNavDistance = 0;
-
-static uint8_t rxBuffer[512];
-static size_t rxBufferLen = 0;
 
 uint32_t calculateV221HashSum(const uint8_t* rawData, size_t rawLen, const uint8_t* key16) {
     size_t totalHashLen = rawLen + 16;
@@ -118,126 +109,125 @@ size_t buildV221Frame(uint8_t cmd, uint8_t sub, const uint8_t* payload, size_t p
     }
 
     uint32_t sumC = calculateV221HashSum(outBuf, 12 + payloadLen, KEY_C);
-    uint32_t sumB = sumC;
 
-    size_t offset = 12 + payloadLen;
-    outBuf[offset + 0] = (sumB >> 24) & 0xFF;
-    outBuf[offset + 1] = (sumB >> 16) & 0xFF;
-    outBuf[offset + 2] = (sumB >> 8) & 0xFF;
-    outBuf[offset + 3] = sumB & 0xFF;
+    size_t sumIdx = 12 + payloadLen;
+    outBuf[sumIdx]     = (sumC >> 24) & 0xFF;
+    outBuf[sumIdx + 1] = (sumC >> 16) & 0xFF;
+    outBuf[sumIdx + 2] = (sumC >> 8)  & 0xFF;
+    outBuf[sumIdx + 3] = sumC & 0xFF;
 
-    outBuf[offset + 4] = (sumC >> 24) & 0xFF;
-    outBuf[offset + 5] = (sumC >> 16) & 0xFF;
-    outBuf[offset + 6] = (sumC >> 8) & 0xFF;
-    outBuf[offset + 7] = sumC & 0xFF;
+    outBuf[sumIdx + 4] = 0x0D;
+    outBuf[sumIdx + 5] = 0x0A;
+    outBuf[sumIdx + 6] = 0x0D;
+    outBuf[sumIdx + 7] = 0x0A;
 
     return totalLen;
 }
 
-uint8_t calculateChecksum(const uint8_t* data, size_t len) {
-    uint8_t sum = 0;
-    for (size_t i = 0; i < len; i++) sum += data[i];
-    return sum;
-}
-
-void sendBtPacket(const uint8_t* data, size_t len) {
-    if (!SerialBT.hasClient()) return;
-    SerialBT.write(data, len);
+void sendRawPacket(const uint8_t* data, size_t len) {
+    if (sppConnected) {
+        SerialBT.write(data, len);
+    }
+    if (bleConnected && pTxCharacteristic != nullptr) {
+        pTxCharacteristic->setValue((uint8_t*)data, len);
+        pTxCharacteristic->notify();
+    }
     totalPacketsTx++;
 }
 
-void sendV221VersionInfo(uint8_t reqSub = 0xC5, uint32_t ts = 0) {
-    const char* verStr = "MODEL:H1N,HW:1.0,FW:1.0,PROTOCOL:2.2.1,OBDV:1.0_0,SID:12345678";
-    size_t strLen = strlen(verStr);
-
-    uint8_t payload[1 + strLen];
-    payload[0] = 0x0E;
-    memcpy(&payload[1], verStr, strLen);
-
-    uint8_t outBuf[128];
-    size_t frameLen = buildV221Frame(0x37, reqSub, payload, sizeof(payload), ts, outBuf);
-    sendBtPacket(outBuf, frameLen);
-    Serial.printf("[TX V221] >>> Version Info (%s) <<<\n", verStr);
-}
-
-void sendV221HudStatus(uint8_t statusByte = 0x01, uint32_t ts = 0) {
-    uint8_t payload[4] = {0x53, 0x15, statusByte, 0x00};
-    uint8_t outBuf[64];
-    size_t frameLen = buildV221Frame(0x37, 0x53, payload, sizeof(payload), ts, outBuf);
-    sendBtPacket(outBuf, frameLen);
-}
-
-void sendV221ObdTelemetry(uint8_t speed, uint16_t rpm, uint8_t coolant, float voltage, uint32_t ts = 0) {
-    uint8_t payload[6];
-    payload[0] = 0x16;
-    payload[1] = speed;
-    payload[2] = (rpm >> 8) & 0xFF;
-    payload[3] = rpm & 0xFF;
-    payload[4] = coolant;
-    payload[5] = (uint8_t)(voltage * 10);
-
-    uint8_t outBuf[64];
-    size_t frameLen = buildV221Frame(0x37, 0x16, payload, sizeof(payload), ts, outBuf);
-    sendBtPacket(outBuf, frameLen);
-}
-
-void sendV221Ack(uint8_t cmd, uint8_t sub, uint32_t ts = 0) {
-    uint8_t payload[2] = {0x00, 0x00};
+void sendV221Ack(uint8_t cmd, uint8_t sub, uint32_t ts) {
+    uint8_t ackPayload[2] = { 0x00, 0x00 };
     uint8_t outBuf[32];
-    size_t frameLen = buildV221Frame(cmd, sub, payload, sizeof(payload), ts, outBuf);
-    sendBtPacket(outBuf, frameLen);
+    size_t len = buildV221Frame(cmd, sub, ackPayload, 2, ts, outBuf);
+    sendRawPacket(outBuf, len);
 }
 
-void sendLegacyHudInfoPacket() {
-    uint8_t pkt[16] = {FRAME_HEADER_1, FRAME_HEADER_2, CMD_HUD_INFO, 0x0A, 'H', '1', 'N', 0x01, 0x02, 0x00, 0x00, 138, 0x07, 0x00, 0x00};
-    pkt[14] = calculateChecksum(pkt, 14);
-    sendBtPacket(pkt, 15);
+void sendV221VersionInfo(uint8_t sub, uint32_t ts) {
+    uint8_t payload[8] = { 0x01, 0x02, 0x02, 0x01, 0x00, 0x01, 0x00, 0x00 };
+    uint8_t outBuf[40];
+    size_t len = buildV221Frame(0x01, sub, payload, sizeof(payload), ts, outBuf);
+    sendRawPacket(outBuf, len);
+    Serial.printf("[TX] Gui V2.2.1 Version Info (0x01, sub: 0x%02X)\n", sub);
+}
+
+void sendV221HudStatus(uint8_t status, uint32_t ts) {
+    uint8_t payload[2] = { status, 0x00 };
+    uint8_t outBuf[32];
+    size_t len = buildV221Frame(0x01, 0x53, payload, sizeof(payload), ts, outBuf);
+    sendRawPacket(outBuf, len);
+    Serial.printf("[TX] Gui V2.2.1 HUD Status (0x53, status: %u)\n", status);
+}
+
+void sendV221ObdTelemetry(uint8_t spd, uint16_t rpm, uint8_t coolant, float volt) {
+    uint8_t payload[8];
+    payload[0] = spd;
+    payload[1] = (rpm >> 8) & 0xFF;
+    payload[2] = rpm & 0xFF;
+    payload[3] = coolant;
+    uint16_t vInt = (uint16_t)(volt * 10.0f);
+    payload[4] = (vInt >> 8) & 0xFF;
+    payload[5] = vInt & 0xFF;
+    payload[6] = 0x00;
+    payload[7] = 0x00;
+
+    uint8_t outBuf[40];
+    uint32_t ts = (uint32_t)(millis() / 1000);
+    size_t len = buildV221Frame(0x02, 0x16, payload, sizeof(payload), ts, outBuf);
+    sendRawPacket(outBuf, len);
 }
 
 void sendLegacyHeartbeatPacket() {
-    uint8_t pkt[8] = {FRAME_HEADER_1, FRAME_HEADER_2, CMD_HEARTBEAT, 0x02, currentSpeed, 0x01, 0x00};
-    pkt[6] = calculateChecksum(pkt, 6);
-    sendBtPacket(pkt, 7);
+    uint8_t packet[8] = { 0x55, 0xAA, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00 };
+    uint8_t checksum = 0;
+    for (int i = 0; i < 7; i++) checksum ^= packet[i];
+    packet[7] = checksum;
+    sendRawPacket(packet, sizeof(packet));
 }
 
-void parsePacket(const uint8_t* data, size_t len) {
-    if (len < 2) return;
+void sendLegacyHudInfoPacket() {
+    uint8_t packet[16] = {
+        0x55, 0xAA, 0x02, 0x09,
+        currentSpeed,
+        currentSpeedLimit,
+        (uint8_t)((currentRpm >> 8) & 0xFF),
+        (uint8_t)(currentRpm & 0xFF),
+        currentCoolantTemp,
+        (uint8_t)((uint16_t)(batteryVoltage * 10) & 0xFF),
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    uint8_t checksum = 0;
+    for (int i = 0; i < 15; i++) checksum ^= packet[i];
+    packet[15] = checksum;
+    sendRawPacket(packet, sizeof(packet));
+}
 
-    if (data[0] == 0xA5 && data[1] == 0x5A) {
-        uint8_t cmd = (len >= 3) ? data[2] : 0x00;
-        uint8_t sub = (len >= 4) ? data[3] : 0x00;
-        uint32_t ts = 0;
-        if (len >= 12) {
-            ts = ((uint32_t)data[8] << 24) | ((uint32_t)data[9] << 16) | ((uint32_t)data[10] << 8) | data[11];
+void processIncomingPacket(const uint8_t* data, size_t len) {
+    totalPacketsRx++;
+
+    if (len >= 20 && data[0] == 0xA5 && data[1] == 0x5A) {
+        uint8_t cmd = data[2];
+        uint8_t sub = data[3];
+        uint32_t dataLen = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) | ((uint32_t)data[6] << 8) | data[7];
+        uint32_t ts = ((uint32_t)data[8] << 24) | ((uint32_t)data[9] << 16) | ((uint32_t)data[10] << 8) | data[11];
+
+        Serial.printf("[RX V2.2.1] Cmd: 0x%02X, Sub: 0x%02X, DataLen: %u, TS: %u\n", cmd, sub, dataLen, ts);
+
+        if (cmd == 0x01) {
+            if (sub == 0xC5 || sub == 0x01) {
+                sendV221VersionInfo(sub, ts);
+                sendV221HudStatus(0x01, ts);
+            }
+            else if (sub == 0xC3) {
+                Serial.println("  [V2.2.1] App dong bo thoi gian (Time Sync 0xC3) -> OK");
+                sendV221Ack(cmd, sub, ts);
+            }
         }
-
-        Serial.printf("[RX V221] CMD: 0x%02X, SUB: 0x%02X, TS: %u (Len: %d)\n", cmd, sub, ts, len);
-
-        if (cmd == 0x37 && sub == 0xC5) {
-            Serial.println("  [HANDSHAKE 0xC5] App yeu cau Version Info -> Gui Version Info H1N");
-            sendV221VersionInfo(0xC5, ts);
-            delay(20);
-            sendV221HudStatus(0x01, ts);
-            return;
-        }
-
-        if (cmd == 0x37 && sub == 0xC3) {
-            sendV221Ack(0x37, 0xC3, ts);
-            delay(15);
-            sendV221HudStatus(0x01, ts);
-            return;
-        }
-
-        if (len >= 13 && data[12] == 0x02) {
-            sendV221HudStatus(0x01, ts);
-            return;
-        }
-
-        if (len >= 13) {
-            uint8_t subType = data[12];
+        else if (cmd == 0x03) {
+            uint8_t subType = sub;
             if (subType == 0x04 && len >= 14) {
-                currentSpeedLimit = data[13];
-                Serial.printf("  *** [CANH BAO] TOC DO GIOI HAN: %u km/h ***\n", currentSpeedLimit);
+                currentSpeedLimit = data[12];
+                currentSpeed = data[13];
+                Serial.printf("  *** [CANH BAO TOC DO] Gioi han: %u km/h | Hien tai: %u km/h ***\n", currentSpeedLimit, currentSpeed);
             }
             else if (subType == 0x05 && len >= 16) {
                 uint8_t camType = data[13];
@@ -259,17 +249,18 @@ void parsePacket(const uint8_t* data, size_t len) {
         return;
     }
 
-    if (data[0] == FRAME_HEADER_1 && data[1] == FRAME_HEADER_2) {
+    if (data[0] == 0x55 && data[1] == 0xAA) {
         uint8_t cmd = data[2];
-        if (cmd == CMD_HEARTBEAT) sendLegacyHeartbeatPacket();
-        else if (cmd == CMD_HUD_INFO) sendLegacyHudInfoPacket();
+        if (cmd == 0x01) sendLegacyHeartbeatPacket();
+        else if (cmd == 0x02) sendLegacyHudInfoPacket();
     }
 }
 
-void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
+// Bluetooth Classic SPP Callback
+void sppCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
     switch (event) {
         case ESP_SPP_SRV_OPEN_EVT:
-            clientConnected = true;
+            sppConnected = true;
             digitalWrite(LED_BUILTIN, HIGH);
             Serial.println("\n========================================================");
             Serial.println(">>> DIEN THOAI / MAY TINH BANG DA KET NOI SPP CLASSIC! <<<");
@@ -281,13 +272,11 @@ void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
             sendV221HudStatus(0x01, (uint32_t)(millis() / 1000));
             delay(30);
             sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage);
-            delay(30);
-            sendLegacyHudInfoPacket();
             break;
 
         case ESP_SPP_CLOSE_EVT:
-            clientConnected = false;
-            digitalWrite(LED_BUILTIN, LOW);
+            sppConnected = false;
+            if (!bleConnected) digitalWrite(LED_BUILTIN, LOW);
             Serial.println("\n[SPP] Dien thoai da ngat ket noi Bluetooth SPP!");
             break;
 
@@ -295,6 +284,41 @@ void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
             break;
     }
 }
+
+// BLE Callbacks
+class MyBleServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        bleConnected = true;
+        digitalWrite(LED_BUILTIN, HIGH);
+        Serial.println("\n========================================================");
+        Serial.println(">>> DIEN THOAI / IPHONE DA KET NOI BLE GATT (0xFFF0)! <<<");
+        Serial.println(">>> VIETMAP LIVE APP PRO DUOC KICH HOAT THANH CONG! <<<");
+        Serial.println("========================================================\n");
+        delay(100);
+        sendV221VersionInfo(0xC5, (uint32_t)(millis() / 1000));
+        delay(30);
+        sendV221HudStatus(0x01, (uint32_t)(millis() / 1000));
+        delay(30);
+        sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage);
+    }
+
+    void onDisconnect(BLEServer* pServer) {
+        bleConnected = false;
+        if (!sppConnected) digitalWrite(LED_BUILTIN, LOW);
+        Serial.println("\n[BLE] Thiet bi da ngat ket noi BLE!");
+        BLEDevice::startAdvertising();
+        Serial.println("[BLE] Dang phat lai quang ba BLE...");
+    }
+};
+
+class MyBleRxCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        std::string rxVal = pCharacteristic->getValue();
+        if (rxVal.length() > 0) {
+            processIncomingPacket((const uint8_t*)rxVal.data(), rxVal.length());
+        }
+    }
+};
 
 void setup() {
     Serial.begin(115200);
@@ -304,100 +328,111 @@ void setup() {
 
     Serial.println("\n");
     Serial.println("*****************************************************************");
-    Serial.println("*    VIETMAP HUD CLONE FOR ESP32 CLASSIC (BLUETOOTH SPP RFCOMM)*");
-    Serial.println("*    Model: VIETMAP_HUD (H1N) | Giai ma hoan toan VietMap Live  *");
-    Serial.println("*    Chuan Bluetooth Classic BR/EDR SPP 0x1101 cho Android       *");
+    Serial.println("*    VIETMAP HUD CLONE FOR ESP32 CLASSIC (DUAL-MODE BT + BLE)   *");
+    Serial.println("*    Model: VIETMAP_HUD (H1N) | Tuong thich ca Android va iPhone*");
+    Serial.println("*    1. Bluetooth Classic RFCOMM SPP (0x1101) cho Android        *");
+    Serial.println("*    2. Bluetooth Low Energy GATT (0xFFF0) cho iOS & App Scan   *");
     Serial.println("*****************************************************************");
 
-    SerialBT.register_callback(btCallback);
-
+    // 1. Khoi tao Bluetooth Classic SPP
+    SerialBT.register_callback(sppCallback);
     if (!SerialBT.begin(DEVICE_NAME)) {
         Serial.println("[LOI] Khoi tao Bluetooth Classic SPP that bai!");
-        while (1) {
-            digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-            delay(100);
-        }
+    } else {
+        Serial.printf("[SETUP] Bluetooth Classic SPP da san sang voi ten: \"%s\"\n", DEVICE_NAME);
     }
 
-    Serial.printf("[SETUP] Bluetooth Classic SPP da san sang voi ten: \"%s\"\n", DEVICE_NAME);
-    Serial.println("[SETUP] Hay mo Bluetooth tren dien thoai / may tinh bang va ket noi!");
+    // Set Classic discoverable & connectable
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+
+    // 2. Khoi tao Bluetooth Low Energy (BLE)
+    BLEDevice::init(DEVICE_NAME);
+    BLEDevice::setPower(ESP_PWR_LVL_P9);
+
+    pBleServer = BLEDevice::createServer();
+    pBleServer->setCallbacks(new MyBleServerCallbacks());
+
+    BLEService *pService = pBleServer->createService(SERVICE_UUID);
+
+    pTxCharacteristic = pService->createCharacteristic(
+        CHAR_TX_NOTIFY_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pTxCharacteristic->addDescriptor(new BLE2902());
+
+    pRxCharacteristic = pService->createCharacteristic(
+        CHAR_RX_WRITE_UUID,
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+    );
+    pRxCharacteristic->setCallbacks(new MyBleRxCallbacks());
+
+    pService->start();
+
+    // Setup BLE Advertising
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->setMinPreferred(0x06);
+    pAdvertising->setMaxPreferred(0x12);
+
+    BLEAdvertisementData advData;
+    advData.setName(DEVICE_NAME);
+    advData.setCompleteServices(BLEUUID(SERVICE_UUID));
+    pAdvertising->setAdvertisementData(advData);
+
+    BLEAdvertisementData scanData;
+    scanData.setName(DEVICE_NAME);
+    pAdvertising->setScanResponseData(scanData);
+
+    BLEDevice::startAdvertising();
+
+    Serial.printf("[SETUP] BLE GATT (0xFFF0) da phat song quang ba voi ten: \"%s\"\n", DEVICE_NAME);
+    Serial.println("[SETUP] Tat ca kenh da san sang! Hay mo Bluetooth tren dien thoai de tim kiem.");
 }
+
+static uint8_t sppRxBuf[512];
+static size_t sppRxLen = 0;
 
 void loop() {
     uint32_t now = millis();
 
+    // Read from Classic SPP
     while (SerialBT.available()) {
         uint8_t b = SerialBT.read();
-        rxBuffer[rxBufferLen++] = b;
-        if (rxBufferLen >= sizeof(rxBuffer)) rxBufferLen = 0;
-    }
+        if (sppRxLen < sizeof(sppRxBuf)) {
+            sppRxBuf[sppRxLen++] = b;
+        }
 
-    if (rxBufferLen >= 2) {
-        if (rxBuffer[0] == 0xA5 && rxBuffer[1] == 0x5A) {
-            if (rxBufferLen >= 8) {
-                uint32_t dataLen = ((uint32_t)rxBuffer[4] << 24) | ((uint32_t)rxBuffer[5] << 16) | ((uint32_t)rxBuffer[6] << 8) | rxBuffer[7];
-                size_t frameTotal = dataLen + 8;
-                if (rxBufferLen >= frameTotal) {
-                    totalPacketsRx++;
-                    parsePacket(rxBuffer, frameTotal);
-                    size_t rem = rxBufferLen - frameTotal;
-                    memmove(rxBuffer, &rxBuffer[frameTotal], rem);
-                    rxBufferLen = rem;
-                }
+        if (sppRxLen >= 20 && sppRxBuf[0] == 0xA5 && sppRxBuf[1] == 0x5A) {
+            uint32_t dataLen = ((uint32_t)sppRxBuf[4] << 24) | ((uint32_t)sppRxBuf[5] << 16) | ((uint32_t)sppRxBuf[6] << 8) | sppRxBuf[7];
+            size_t expectedTotal = 8 + dataLen;
+            if (sppRxLen >= expectedTotal) {
+                processIncomingPacket(sppRxBuf, expectedTotal);
+                sppRxLen = 0;
             }
-        } else if (rxBuffer[0] == FRAME_HEADER_1 && rxBuffer[1] == FRAME_HEADER_2) {
-            if (rxBufferLen >= 4) {
-                uint8_t pLen = rxBuffer[3];
-                size_t total = pLen + 5;
-                if (rxBufferLen >= total) {
-                    totalPacketsRx++;
-                    parsePacket(rxBuffer, total);
-                    size_t rem = rxBufferLen - total;
-                    memmove(rxBuffer, &rxBuffer[total], rem);
-                    rxBufferLen = rem;
-                }
+        }
+        else if (sppRxLen >= 8 && sppRxBuf[0] == 0x55 && sppRxBuf[1] == 0xAA) {
+            uint8_t len = sppRxBuf[3];
+            size_t expectedTotal = len + 5;
+            if (sppRxLen >= expectedTotal) {
+                processIncomingPacket(sppRxBuf, expectedTotal);
+                sppRxLen = 0;
             }
-        } else {
-            memmove(rxBuffer, &rxBuffer[1], rxBufferLen - 1);
-            rxBufferLen--;
         }
     }
 
-    if (SerialBT.hasClient()) {
-        if (now - lastHeartbeatMs >= 1000) {
-            lastHeartbeatMs = now;
-            sendV221HudStatus(0x01, (uint32_t)(now / 1000));
-            sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage);
-            sendLegacyHeartbeatPacket();
-        }
+    // Periodic Keepalive / Telemetry
+    if ((sppConnected || bleConnected) && (now - lastHeartbeatMs >= 1000)) {
+        lastHeartbeatMs = now;
+        sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage);
     }
 
-    if (!SerialBT.hasClient()) {
-        static uint32_t lastBlinkMs = 0;
-        if (now - lastBlinkMs >= 500) {
-            lastBlinkMs = now;
+    // LED status indicator
+    if (!sppConnected && !bleConnected) {
+        static uint32_t lastBlink = 0;
+        if (now - lastBlink > 400) {
+            lastBlink = now;
             digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-        }
-
-        static uint32_t lastLogMs = 0;
-        if (now - lastLogMs >= 3000) {
-            lastLogMs = now;
-            Serial.printf("[SPP] Dang phat song Bluetooth Classic cho ket noi... | Ten: %s\n", DEVICE_NAME);
-        }
-    }
-
-    if (Serial.available()) {
-        String line = Serial.readStringUntil('\n');
-        line.trim();
-        if (line.equalsIgnoreCase("status")) {
-            Serial.printf("Status: %s | Rx: %u | Tx: %u | Speed: %u km/h\n", 
-                          SerialBT.hasClient() ? "CONNECTED" : "WAITING", 
-                          totalPacketsRx, totalPacketsTx, currentSpeed);
-        }
-        else if (line.startsWith("speed ")) {
-            currentSpeed = line.substring(6).toInt();
-            Serial.printf("Van toc: %u km/h\n", currentSpeed);
-            sendV221ObdTelemetry(currentSpeed, 800 + currentSpeed * 25, currentCoolantTemp, batteryVoltage);
         }
     }
 
