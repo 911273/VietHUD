@@ -1,6 +1,7 @@
 #include "DisplayManager.h"
 #include "WiFiOTAManager.h"
 #include "SettingsManager.h"
+#include "VnFonts.h"
 #include <math.h>
 
 // Curated Automotive Palette (RGB565)
@@ -19,9 +20,22 @@
 #define COLOR_SIGN_RED    0xD800 // Official Vietnam Traffic Sign Red
 #define COLOR_TOAST_BG    0x18E3
 
+#define TOP_BAR_H         27     // road-name bar height (separator line drawn at this y)
+
+// strncpy for UTF-8: never cuts a multi-byte character in half.
+static void copyUtf8(char* dst, size_t cap, const char* src) {
+    size_t n = strlen(src);
+    if (n >= cap) {
+        n = cap - 1;
+        while (n > 0 && ((uint8_t)src[n] & 0xC0) == 0x80) n--;
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 DisplayManager::DisplayManager()
     : m_bus(nullptr), m_tft(nullptr), m_canvas(nullptr),
-      m_speed(0), m_speedLimit(60), m_sats(0), m_fix(false), m_demo(true), m_muted(false),
+      m_speed(0), m_speedLimit(60), m_sats(0), m_fix(false), m_muted(false),
       m_marqueeStartTime(0),
       m_wifiEnabled(false), m_wifiConnected(false),
       m_otaWorkflowState(0), m_wifiRssi(0), m_otaProgress(0), m_otaCountdownSec(0),
@@ -33,8 +47,7 @@ DisplayManager::DisplayManager()
     m_wifiIp[0] = '\0';
     m_wifiSsid[0] = '\0';
     m_otaWorkflowMsg[0] = '\0';
-    strncpy(m_roadName, "DUONG CAO TOC NOI BAI - LAO CAI", sizeof(m_roadName) - 1);
-    m_roadName[sizeof(m_roadName) - 1] = '\0';
+    copyUtf8(m_roadName, sizeof(m_roadName), "VietHUD");
 }
 
 bool DisplayManager::begin() {
@@ -105,17 +118,17 @@ void DisplayManager::setBrightness(uint8_t pct) {
 }
 
 void DisplayManager::showToast(const char* text, uint16_t color) {
-    strncpy(m_toastText, text, sizeof(m_toastText) - 1);
-    m_toastText[sizeof(m_toastText) - 1] = '\0';
+    copyUtf8(m_toastText, sizeof(m_toastText), text);
     m_toastColor = color;
     m_toastExpiry = millis() + 1800;
 }
 
 void DisplayManager::setRoadName(const char* name) {
     if (name && name[0] != '\0') {
-        if (strcmp(m_roadName, name) != 0) {
-            strncpy(m_roadName, name, sizeof(m_roadName) - 1);
-            m_roadName[sizeof(m_roadName) - 1] = '\0';
+        char buf[sizeof(m_roadName)];
+        copyUtf8(buf, sizeof(buf), name);
+        if (strcmp(m_roadName, buf) != 0) {
+            memcpy(m_roadName, buf, sizeof(m_roadName));
             m_marqueeStartTime = millis();
         }
     }
@@ -126,7 +139,6 @@ void DisplayManager::updateData(
     int speedLimit,
     int satellites,
     bool gpsFix,
-    bool isDemoMode,
     bool isMuted,
     const char* roadName,
     bool wifiEnabled,
@@ -142,7 +154,6 @@ void DisplayManager::updateData(
     m_speedLimit = speedLimit;
     m_sats = satellites;
     m_fix = gpsFix;
-    m_demo = isDemoMode;
     m_muted = isMuted;
 
     m_wifiEnabled = wifiEnabled;
@@ -201,87 +212,60 @@ void DisplayManager::updateWiFiState(
 }
 
 void DisplayManager::drawTopBar() {
-    m_canvas->fillRect(0, 0, LCD_WIDTH, 22, COLOR_BG);
+    m_canvas->fillRect(0, 0, LCD_WIDTH, TOP_BAR_H, COLOR_BG);
+    const int midY = TOP_BAR_H / 2;
 
-    // Left: GPS / Demo Indicator
-    if (m_demo) {
-        m_canvas->fillCircle(8, 10, 3, COLOR_WARN);
-        m_canvas->setFont(NULL);
-        m_canvas->setTextSize(1);
-        m_canvas->setTextColor(COLOR_WARN);
-        m_canvas->setCursor(15, 7);
-        m_canvas->print("D");
-    } else {
-        uint16_t gpsDotColor = m_fix ? COLOR_SAFE : COLOR_ALERT;
-        m_canvas->fillCircle(8, 10, 3, gpsDotColor);
-        m_canvas->setFont(NULL);
-        m_canvas->setTextSize(1);
-        m_canvas->setTextColor(COLOR_SILVER);
-        m_canvas->setCursor(15, 7);
-        m_canvas->printf("%d", m_sats);
-    }
+    // Left: GPS fix dot + satellite count
+    m_canvas->fillCircle(8, midY, 3, m_fix ? COLOR_SAFE : COLOR_ALERT);
+    m_canvas->setFont(NULL);
+    m_canvas->setTextSize(1);
+    m_canvas->setTextColor(COLOR_SILVER);
+    m_canvas->setCursor(15, midY - 3);
+    m_canvas->printf("%d", m_sats);
 
     // Right: WiFi & Mute Indicators
     if (m_wifiEnabled) {
         if (m_wifiConnected) {
-            m_canvas->fillCircle(228, 10, 3, COLOR_SAFE);
-            m_canvas->drawCircle(228, 10, 6, COLOR_SAFE);
+            m_canvas->fillCircle(228, midY, 3, COLOR_SAFE);
+            m_canvas->drawCircle(228, midY, 6, COLOR_SAFE);
         } else {
             bool blink = (millis() / 400) % 2;
-            m_canvas->fillCircle(228, 10, 3, blink ? COLOR_CYAN : COLOR_TRACK);
+            m_canvas->fillCircle(228, midY, 3, blink ? COLOR_CYAN : COLOR_TRACK);
         }
     } else if (m_muted) {
-        m_canvas->fillRoundRect(218, 4, 18, 13, 2, COLOR_ALERT);
+        m_canvas->fillRoundRect(218, midY - 6, 18, 13, 2, COLOR_ALERT);
         m_canvas->setFont(NULL);
         m_canvas->setTextSize(1);
         m_canvas->setTextColor(COLOR_WHITE);
-        m_canvas->setCursor(224, 7);
+        m_canvas->setCursor(224, midY - 3);
         m_canvas->print("X");
     }
 
-    // Center: Road Name ticker
-    const char* displayName = (m_roadName[0] != '\0') ? m_roadName : "VIETHUD HANOI";
-    int nameLen = strlen(displayName);
-    const int MAX_VIEW_CHARS = 28;
+    // Center: road name (anti-aliased Vietnamese font), pixel-smooth marquee when too long
+    const char* displayName = (m_roadName[0] != '\0') ? m_roadName : "VietHUD";
+    const int boxX0 = 30, boxX1 = 214;
+    const int boxW = boxX1 - boxX0;
+    const int baseline = 20;
+    int textW = VnText::width(VN_FONT_MD, displayName);
 
-    m_canvas->setFont(NULL);
-    m_canvas->setTextSize(1);
-    m_canvas->setTextColor(COLOR_ROAD_TEXT);
-
-    if (nameLen <= MAX_VIEW_CHARS) {
-        int textW = nameLen * 6;
-        int startX = 28 + (186 - textW) / 2;
-        m_canvas->setCursor(startX, 7);
-        m_canvas->print(displayName);
+    if (textW <= boxW) {
+        VnText::draw(m_canvas, VN_FONT_MD, boxX0 + (boxW - textW) / 2, baseline, displayName, COLOR_ROAD_TEXT);
     } else {
-        int maxOffset = nameLen - MAX_VIEW_CHARS;
-        uint32_t now = millis();
-        uint32_t pauseStartMs = 1500;
-        uint32_t stepMs = 280;
-        uint32_t scrollDurationMs = maxOffset * stepMs;
-        uint32_t pauseEndMs = 1200;
-        uint32_t totalCycleMs = pauseStartMs + scrollDurationMs + pauseEndMs;
-
-        uint32_t elapsed = (now - m_marqueeStartTime) % totalCycleMs;
-        int charOffset = 0;
-        if (elapsed < pauseStartMs) {
-            charOffset = 0;
-        } else if (elapsed < pauseStartMs + scrollDurationMs) {
-            charOffset = (elapsed - pauseStartMs) / stepMs;
-            if (charOffset > maxOffset) charOffset = maxOffset;
-        } else {
-            charOffset = maxOffset;
+        const uint32_t pauseStartMs = 1500, pauseEndMs = 1200;
+        const uint32_t msPerPx = 28;   // ~35 px/s
+        int maxOffset = textW - boxW;
+        uint32_t scrollMs = (uint32_t)maxOffset * msPerPx;
+        uint32_t elapsed = (millis() - m_marqueeStartTime) % (pauseStartMs + scrollMs + pauseEndMs);
+        int offset = 0;
+        if (elapsed >= pauseStartMs + scrollMs) {
+            offset = maxOffset;
+        } else if (elapsed > pauseStartMs) {
+            offset = (elapsed - pauseStartMs) / msPerPx;
         }
-
-        char viewBuf[MAX_VIEW_CHARS + 2];
-        strncpy(viewBuf, displayName + charOffset, MAX_VIEW_CHARS);
-        viewBuf[MAX_VIEW_CHARS] = '\0';
-
-        m_canvas->setCursor(31, 7);
-        m_canvas->print(viewBuf);
+        VnText::draw(m_canvas, VN_FONT_MD, boxX0 - offset, baseline, displayName, COLOR_ROAD_TEXT, boxX0, boxX1);
     }
 
-    m_canvas->drawFastHLine(8, 22, 224, 0x18E3);
+    m_canvas->drawFastHLine(8, TOP_BAR_H, 224, 0x18E3);
 }
 
 // ---------------------------------------------------------------------------
@@ -420,32 +404,32 @@ void DisplayManager::drawAlertLeftCard() {
     switch (m_alertType) {
         case 1:
             alertColor = COLOR_ALERT;
-            alertTitle = "CAM TOC DO";
+            alertTitle = L("Bắn tốc độ", "Speed cam");
             break;
         case 4:
             alertColor = COLOR_ALERT;
-            alertTitle = "PHAT NGUOI";
+            alertTitle = L("Phạt nguội", "Camera");
             break;
         case 6:
             alertColor = COLOR_WARN;
-            alertTitle = "DEN DO";
+            alertTitle = L("Đèn đỏ", "Red light");
             break;
         case 2:
             alertColor = COLOR_CYAN;
-            alertTitle = "DAN CU";
+            alertTitle = L("Dân cư", "Residential");
             break;
         case 3:
             alertColor = COLOR_ALERT;
-            alertTitle = "CAM VUOT";
+            alertTitle = L("Cấm vượt", "No passing");
             break;
         case 5:
             alertColor = COLOR_WARN;
-            alertTitle = "TRAM BOT";
+            alertTitle = L("Trạm BOT", "Toll");
             break;
         case 10:
         default:
             alertColor = COLOR_WARN;
-            alertTitle = "NGUY HIEM";
+            alertTitle = L("Nguy hiểm", "Danger");
             break;
     }
 
@@ -479,12 +463,7 @@ void DisplayManager::drawAlertLeftCard() {
     }
 
     // 2. Alert Title Tag
-    m_canvas->setFont(NULL);
-    m_canvas->setTextSize(1);
-    m_canvas->setTextColor(alertColor);
-    int titleW = strlen(alertTitle) * 6;
-    m_canvas->setCursor(cx - titleW / 2, 86);
-    m_canvas->print(alertTitle);
+    VnText::drawCentered(m_canvas, VN_FONT_SM, cx, 97, alertTitle, alertColor);
 
     // 3. Phía dưới: Khoảng cách đếm lùi to rõ (FreeSansBold18pt7b)
     char distStr[12];
@@ -695,24 +674,34 @@ void DisplayManager::drawCurrentSpeedSection(int cx, int cy, int speed, int limi
     }
     int tickX = barX + (int)round(barW * 0.8f);
     m_canvas->drawFastVLine(tickX, barY - 2, barH + 4, COLOR_WHITE);
+
+    // CPU temperature, bottom right (sampled every 2 s)
+    static uint32_t lastTempMs = 0;
+    static float cpuTemp = 0;
+    if (lastTempMs == 0 || millis() - lastTempMs >= 2000) {
+        lastTempMs = millis();
+        cpuTemp = temperatureRead();
+    }
+    char tempStr[12];
+    snprintf(tempStr, sizeof(tempStr), "%d°C", (int)lroundf(cpuTemp));
+    VnText::drawRight(m_canvas, VN_FONT_SM, cardX + cardW - 12, barY - 5, tempStr,
+                      cpuTemp >= 75.0f ? COLOR_ALERT : COLOR_SILVER);
 }
 
 void DisplayManager::drawToast() {
     if (millis() < m_toastExpiry && m_toastText[0] != '\0') {
-        int textLen = strlen(m_toastText);
-        int boxW = textLen * 9 + 24;
-        int boxH = 26;
+        int textW = VnText::width(VN_FONT_LG, m_toastText);
+        int boxW = textW + 32;
+        if (boxW > 232) boxW = 232;
+        int boxH = 38;
         int boxX = 120 - boxW / 2;
-        int boxY = 82;
+        int boxY = 78;
 
-        m_canvas->fillRoundRect(boxX, boxY, boxW, boxH, 6, COLOR_TOAST_BG);
-        m_canvas->drawRoundRect(boxX, boxY, boxW, boxH, 6, m_toastColor);
+        m_canvas->fillRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_TOAST_BG);
+        m_canvas->drawRoundRect(boxX, boxY, boxW, boxH, 8, m_toastColor);
+        m_canvas->drawRoundRect(boxX + 1, boxY + 1, boxW - 2, boxH - 2, 7, m_toastColor);
 
-        m_canvas->setFont(NULL);
-        m_canvas->setTextSize(1);
-        m_canvas->setTextColor(m_toastColor);
-        m_canvas->setCursor(boxX + 12, boxY + 9);
-        m_canvas->print(m_toastText);
+        VnText::drawCentered(m_canvas, VN_FONT_LG, 120, boxY + 26, m_toastText, m_toastColor);
     }
 }
 
@@ -798,7 +787,7 @@ void DisplayManager::drawWiFiOTAPage() {
     m_canvas->setTextSize(1);
     m_canvas->setTextColor(cardBorderColor);
 
-    const char* titleMsg = m_otaWorkflowMsg[0] != '\0' ? m_otaWorkflowMsg : "DANG XU LY...";
+    const char* titleMsg = m_otaWorkflowMsg[0] != '\0' ? m_otaWorkflowMsg : L("DANG XU LY...", "PROCESSING...");
     int textW = strlen(titleMsg) * 6;
     int textX = cx - textW / 2;
     if (textX < boxX + 6) textX = boxX + 6;
@@ -813,7 +802,7 @@ void DisplayManager::drawWiFiOTAPage() {
         m_canvas->print("2. VuPQ");
         m_canvas->setTextColor(COLOR_CYAN);
         m_canvas->setCursor(boxX + 16, 158);
-        m_canvas->print("Dang do tim tin hieu...");
+        m_canvas->print(L("Dang do tim tin hieu...", "Searching for signal..."));
     } else if (m_otaWorkflowState == 2 || m_otaWorkflowState == 3) { // CONNECTED / CHECKING
         m_canvas->setTextColor(COLOR_WHITE);
         m_canvas->setCursor(boxX + 16, 114);
@@ -821,7 +810,7 @@ void DisplayManager::drawWiFiOTAPage() {
 
         m_canvas->setTextColor(COLOR_SAFE);
         m_canvas->setCursor(boxX + 16, 128);
-        m_canvas->printf("Song: %d dBm (Tot)", m_wifiRssi);
+        m_canvas->printf(L("Song: %d dBm (Tot)", "Signal: %d dBm (Good)"), m_wifiRssi);
 
         m_canvas->setTextColor(COLOR_CYAN);
         m_canvas->setCursor(boxX + 16, 144);
@@ -859,11 +848,11 @@ void DisplayManager::drawWiFiOTAPage() {
         m_canvas->setTextSize(1);
         m_canvas->setTextColor(COLOR_ALERT);
         m_canvas->setCursor(boxX + 32, 172);
-        m_canvas->print("KHONG NGAT NGUON !");
+        m_canvas->print(L("KHONG NGAT NGUON !", "DO NOT POWER OFF !"));
     } else if (m_otaWorkflowState == 5) { // UP_TO_DATE
         m_canvas->setTextColor(COLOR_SAFE);
         m_canvas->setCursor(boxX + 16, 114);
-        m_canvas->print("Phien ban: v" FW_VERSION);
+        m_canvas->print(L("Phien ban: v" FW_VERSION "", "Version: v" FW_VERSION ""));
 
         m_canvas->setTextColor(COLOR_CYAN);
         m_canvas->setCursor(boxX + 16, 128);
@@ -875,20 +864,20 @@ void DisplayManager::drawWiFiOTAPage() {
 
         m_canvas->setTextColor(COLOR_WARN);
         m_canvas->setCursor(boxX + 16, 162);
-        m_canvas->printf("Tu dong ve HUD sau: %ds", m_otaCountdownSec);
+        m_canvas->printf(L("Tu dong ve HUD sau: %ds", "Back to HUD in: %ds"), m_otaCountdownSec);
     } else { // FAILED
         m_canvas->setTextColor(COLOR_SILVER);
         m_canvas->setCursor(boxX + 16, 114);
-        m_canvas->print("Khong tim thay AP / Pi 4");
+        m_canvas->print(L("Khong tim thay AP / Pi 4", "No AP / Pi 4 found"));
         m_canvas->setCursor(boxX + 16, 128);
-        m_canvas->print("Thu ca LAN & Tailscale");
+        m_canvas->print(L("Thu ca LAN & Tailscale", "Tried LAN & Tailscale"));
         m_canvas->setTextColor(COLOR_ROAD_TEXT);
         m_canvas->setCursor(boxX + 16, 144);
         m_canvas->print("TS IP: " PI4_TAILSCALE_IP);
 
         m_canvas->setTextColor(COLOR_WARN);
         m_canvas->setCursor(boxX + 16, 162);
-        m_canvas->printf("Tu dong ve HUD sau: %ds", m_otaCountdownSec);
+        m_canvas->printf(L("Tu dong ve HUD sau: %ds", "Back to HUD in: %ds"), m_otaCountdownSec);
     }
 
     m_canvas->fillRoundRect(16, 202, 208, 28, 6, COLOR_CARD_BG);
@@ -898,7 +887,7 @@ void DisplayManager::drawWiFiOTAPage() {
     m_canvas->setTextSize(1);
     m_canvas->setTextColor(COLOR_WHITE);
     m_canvas->setCursor(32, 211);
-    m_canvas->print("[ NUT GIUA: VE TRANG HUD ]");
+    m_canvas->print(L("[ NUT GIUA: VE TRANG HUD ]", "[ MID BUTTON: BACK TO HUD ]"));
 }
 
 void DisplayManager::render() {
@@ -943,133 +932,160 @@ void DisplayManager::renderSettings(uint8_t selectedIdx, bool isEditing) {
 
     m_canvas->fillScreen(COLOR_BG);
 
-    // 1. Header Bar (y: 0 to 28)
-    m_canvas->fillRect(0, 0, LCD_WIDTH, 28, 0x0842);
-    m_canvas->setFont(NULL);
-    m_canvas->setTextSize(1);
-    m_canvas->setTextColor(COLOR_CYAN);
-    m_canvas->setCursor(12, 10);
-    m_canvas->print("CAI DAT HE THONG");
-
-    // Page indicator [selectedIdx + 1 / SETTING_COUNT]
+    // 1. Header bar: title + position
+    const int headerH = 34;
+    m_canvas->fillRect(0, 0, LCD_WIDTH, headerH, COLOR_CARD_BG);
+    m_canvas->drawFastHLine(0, headerH, LCD_WIDTH, COLOR_CARD_BORDER);
+    VnText::draw(m_canvas, VN_FONT_LG, 12, 25, L("Cài đặt", "Settings"), COLOR_CYAN);
     char idxBuf[16];
-    snprintf(idxBuf, sizeof(idxBuf), "[%d/%d]", selectedIdx + 1, SETTING_COUNT);
-    m_canvas->setTextColor(COLOR_WHITE);
-    int idxW = strlen(idxBuf) * 6;
-    m_canvas->setCursor(228 - idxW, 10);
-    m_canvas->print(idxBuf);
+    snprintf(idxBuf, sizeof(idxBuf), "%d / %d", selectedIdx + 1, SETTING_COUNT);
+    VnText::drawRight(m_canvas, VN_FONT_SM, 226, 23, idxBuf, COLOR_SILVER);
 
-    m_canvas->drawFastHLine(0, 28, 240, COLOR_CARD_BORDER);
-
-    // 2. Scrollable List calculation (4 items visible at a time)
-    const int VISIBLE_ITEMS = 4;
-    int topIdx = 0;
-    if (selectedIdx >= VISIBLE_ITEMS) {
-        topIdx = selectedIdx - (VISIBLE_ITEMS - 1);
-    }
-    if (topIdx + VISIBLE_ITEMS > SETTING_COUNT) {
-        topIdx = SETTING_COUNT - VISIBLE_ITEMS;
-    }
+    // 2. List: 3 large two-line rows (name on top, value below on the right)
+    const int VISIBLE_ITEMS = 3;
+    int topIdx = selectedIdx - (VISIBLE_ITEMS - 1) / 2;
+    if (topIdx + VISIBLE_ITEMS > SETTING_COUNT) topIdx = SETTING_COUNT - VISIBLE_ITEMS;
     if (topIdx < 0) topIdx = 0;
 
-    int rowY = 32;
-    const int rowH = 41;
-    const int rowW = 218;
-    const int rowX = 8;
+    const int listY = 39;
+    const int rowH = 54;
+    const int rowGap = 4;
+    const int rowX = 6;
+    const int rowW = 222;
 
     for (int i = 0; i < VISIBLE_ITEMS; i++) {
         int itemIdx = topIdx + i;
         if (itemIdx >= SETTING_COUNT) break;
 
         bool isSel = (itemIdx == selectedIdx);
-        int curY = rowY + i * (rowH + 2);
+        bool isAction = settings.isActionItem(itemIdx);
+        int y = listY + i * (rowH + rowGap);
+        uint16_t accent = isSel ? (isEditing ? COLOR_WARN : COLOR_CYAN) : COLOR_CARD_BORDER;
 
-        uint16_t cardBg = isSel ? 0x10A2 : COLOR_CARD_BG;
-        uint16_t cardBorder = isSel ? (isEditing ? COLOR_WARN : COLOR_CYAN) : COLOR_CARD_BORDER;
-
-        m_canvas->fillRoundRect(rowX, curY, rowW, rowH, 6, cardBg);
-        m_canvas->drawRoundRect(rowX, curY, rowW, rowH, 6, cardBorder);
+        m_canvas->fillRoundRect(rowX, y, rowW, rowH, 8, isSel ? 0x10A2 : COLOR_CARD_BG);
+        m_canvas->drawRoundRect(rowX, y, rowW, rowH, 8, accent);
         if (isSel) {
-            m_canvas->drawRoundRect(rowX + 1, curY + 1, rowW - 2, rowH - 2, 5, cardBorder);
+            m_canvas->drawRoundRect(rowX + 1, y + 1, rowW - 2, rowH - 2, 7, accent);
+            m_canvas->fillRoundRect(rowX + 5, y + 9, 4, rowH - 18, 2, accent);   // selection bar
         }
 
-        // Selection pointer arrow or Edit marker
-        m_canvas->setFont(NULL);
-        m_canvas->setTextSize(1);
-        if (isSel) {
-            m_canvas->setTextColor(isEditing ? COLOR_WARN : COLOR_CYAN);
-            m_canvas->setCursor(rowX + 6, curY + 8);
-            m_canvas->print(isEditing ? "*" : ">");
-        }
+        // Setting name
+        VnText::draw(m_canvas, VN_FONT_MD, rowX + 16, y + 22, settings.getItemName(itemIdx),
+                     isSel ? COLOR_WHITE : COLOR_SILVER);
 
-        // Setting Name
-        const char* name = settings.getItemName(itemIdx);
-        m_canvas->setTextColor(isSel ? COLOR_WHITE : COLOR_SILVER);
-        m_canvas->setCursor(rowX + 16, curY + 8);
-        m_canvas->print(name);
-
-        // Setting Value Badge (Bottom right of card)
+        // Value badge
         char valBuf[32];
         settings.getItemValueStr(itemIdx, valBuf, sizeof(valBuf));
-
         char displayVal[40];
-        if (isSel && isEditing && !settings.isActionItem(itemIdx)) {
-            snprintf(displayVal, sizeof(displayVal), "< %s >", valBuf);
+        if (isSel && isEditing && !isAction) {
+            snprintf(displayVal, sizeof(displayVal), "‹ %s ›", valBuf);
         } else {
             snprintf(displayVal, sizeof(displayVal), "%s", valBuf);
         }
 
-        int valW = strlen(displayVal) * 6;
-        int badgeW = valW + 12;
-        int badgeH = 18;
+        // Selected value in the large font, unless it would not fit the row
+        bool large = isSel && VnText::width(VN_FONT_LG, displayVal) + 18 <= rowW - 16;
+        const VnFont& valFont = large ? VN_FONT_LG : VN_FONT_MD;
+        int valW = VnText::width(valFont, displayVal);
+        int badgeW = valW + 18;
+        int badgeH = 24;
         int badgeX = rowX + rowW - badgeW - 8;
-        int badgeY = curY + 18;
+        int badgeY = y + rowH - badgeH - 5;
 
-        uint16_t badgeBg = isSel ? (isEditing ? 0x4200 : 0x027B) : 0x18C3;
-        uint16_t badgeTextColor = isSel ? (isEditing ? COLOR_WARN : COLOR_WHITE) : COLOR_CYAN;
-
-        m_canvas->fillRoundRect(badgeX, badgeY, badgeW, badgeH, 4, badgeBg);
-        m_canvas->drawRoundRect(badgeX, badgeY, badgeW, badgeH, 4, isSel ? cardBorder : COLOR_CARD_BORDER);
-
-        m_canvas->setTextColor(badgeTextColor);
-        m_canvas->setCursor(badgeX + 6, badgeY + 5);
-        m_canvas->print(displayVal);
+        uint16_t badgeBg = isSel ? (isEditing ? 0x4200 : (isAction ? 0x0320 : 0x027B)) : 0x18C3;
+        uint16_t valColor = isSel ? (isEditing ? COLOR_WARN : COLOR_WHITE) : COLOR_CYAN;
+        m_canvas->fillRoundRect(badgeX, badgeY, badgeW, badgeH, 6, badgeBg);
+        if (isSel) m_canvas->drawRoundRect(badgeX, badgeY, badgeW, badgeH, 6, accent);
+        VnText::draw(m_canvas, valFont, badgeX + 9, badgeY + (large ? 19 : 18), displayVal, valColor);
     }
 
-    // Scrollbar track & thumb on far right (x = 232)
-    int trackX = 232;
-    int trackY = 32;
-    int trackH = 170;
+    // Scrollbar
+    const int trackX = 234, trackY = listY, trackH = VISIBLE_ITEMS * (rowH + rowGap) - rowGap;
     m_canvas->drawFastVLine(trackX, trackY, trackH, COLOR_TRACK);
-
-    int thumbH = 34;
+    int thumbH = (trackH * VISIBLE_ITEMS) / SETTING_COUNT;
     int thumbY = trackY + (selectedIdx * (trackH - thumbH)) / (SETTING_COUNT - 1);
-    m_canvas->fillRect(trackX - 1, thumbY, 3, thumbH, isEditing ? COLOR_WARN : COLOR_CYAN);
+    m_canvas->fillRoundRect(trackX - 1, thumbY, 3, thumbH, 1, isEditing ? COLOR_WARN : COLOR_CYAN);
 
-    // 3. Footer Bar (y: 206 to 240)
-    m_canvas->fillRect(0, 206, LCD_WIDTH, 34, 0x0842);
-    m_canvas->drawFastHLine(0, 206, 240, COLOR_CARD_BORDER);
-
-    m_canvas->setFont(NULL);
-    m_canvas->setTextSize(1);
-
+    // 3. Footer hint
+    const int footerY = 214;
+    m_canvas->fillRect(0, footerY, LCD_WIDTH, LCD_HEIGHT - footerY, COLOR_CARD_BG);
+    m_canvas->drawFastHLine(0, footerY, LCD_WIDTH, COLOR_CARD_BORDER);
     if (isEditing) {
-        m_canvas->setTextColor(COLOR_WARN);
-        m_canvas->setCursor(20, 212);
-        m_canvas->print("TRAI/PHAI: CHINH GIA TRI");
-
-        m_canvas->setTextColor(COLOR_SAFE);
-        m_canvas->setCursor(20, 226);
-        m_canvas->print("NUT GIUA: XAC NHAN");
+        VnText::drawCentered(m_canvas, VN_FONT_SM, 120, 232, L("Trái/Phải: chỉnh  •  Giữa: xong", "Left/Right: adjust  •  Mid: done"), COLOR_WARN);
     } else {
-        m_canvas->setTextColor(COLOR_CYAN);
-        m_canvas->setCursor(18, 212);
-        m_canvas->print("TRAI/PHAI: CHON MUC");
-
-        m_canvas->setTextColor(COLOR_SILVER);
-        m_canvas->setCursor(18, 226);
-        m_canvas->print("GIUA: CHON | GIU: LUU & THOAT");
+        VnText::drawCentered(m_canvas, VN_FONT_SM, 120, 232, L("Giữa: chọn  •  Giữ: lưu & thoát", "Mid: select  •  Hold: save & exit"), COLOR_SILVER);
     }
+
+    m_canvas->flush();
+}
+
+void DisplayManager::renderSystemInfo(const SystemInfoData& info) {
+    if (!m_canvas) return;
+
+    // Static facts are read once; live values refresh every 500 ms.
+    static uint32_t sketchSize = 0, appSlot = 0;
+    if (sketchSize == 0) {
+        sketchSize = ESP.getSketchSize();
+        appSlot = ESP.getFreeSketchSpace();   // size of the OTA slot the app must fit in
+    }
+
+    const int ROWS = 10;
+    static char values[ROWS][40];
+    static uint32_t lastUpdate = 0;
+    static uint8_t lastLang = 0xFF;
+    if (lastUpdate == 0 || millis() - lastUpdate >= 500 || lastLang != settings.data.language) {
+        lastUpdate = millis();
+        lastLang = settings.data.language;
+        uint32_t up = millis() / 1000;
+        float t = temperatureRead();
+
+        snprintf(values[0], 40, "v%s (%.8s)", FW_VERSION, FW_BUILD);
+        snprintf(values[1], 40, L("%s rev%d · %d nhân", "%s rev%d · %d cores"), ESP.getChipModel(),
+                 ESP.getChipRevision(), ESP.getChipCores());
+        snprintf(values[2], 40, "%lu MHz · %d°C", (unsigned long)ESP.getCpuFreqMHz(), (int)lroundf(t));
+        snprintf(values[3], 40, L("Trống %lu / %lu KB", "Free %lu / %lu KB"),
+                 (unsigned long)(ESP.getFreeHeap() / 1024), (unsigned long)(ESP.getHeapSize() / 1024));
+        snprintf(values[4], 40, L("Trống %.1f / %.1f MB", "Free %.1f / %.1f MB"),
+                 ESP.getFreePsram() / 1048576.0f, ESP.getPsramSize() / 1048576.0f);
+        snprintf(values[5], 40, "%lu MB · app %.1f / %.1f MB", (unsigned long)(ESP.getFlashChipSize() / 1048576),
+                 sketchSize / 1048576.0f, appSlot / 1048576.0f);
+        if (info.gpsFix) {
+            snprintf(values[6], 40, L("%s · %d vệ tinh · ±%dm", "%s · %d sats · ±%dm"), info.gpsProtocol,
+                     info.gpsSats, (int)lroundf(info.gpsHAccM));
+        } else {
+            snprintf(values[6], 40, L("%s %lu · chưa định vị", "%s %lu · no fix"), info.gpsProtocol,
+                     (unsigned long)info.gpsBaud);
+        }
+        snprintf(values[7], 40, L("%lu điểm", "%lu points"), (unsigned long)info.alertCount);
+        snprintf(values[8], 40, L("%lu tên", "%lu names"), (unsigned long)info.roadNameCount);
+        snprintf(values[9], 40, "%02lu:%02lu:%02lu", (unsigned long)(up / 3600), (unsigned long)(up / 60 % 60),
+                 (unsigned long)(up % 60));
+    }
+    const char* labels[ROWS] = {
+        L("Phần mềm", "Firmware"), "Chip", "CPU", "RAM", "PSRAM", "Flash", "GPS",
+        L("Cảnh báo", "Alerts"), L("Tên đường", "Road names"), L("Hoạt động", "Uptime"),
+    };
+
+    m_canvas->fillScreen(COLOR_BG);
+
+    const int headerH = 34;
+    m_canvas->fillRect(0, 0, LCD_WIDTH, headerH, COLOR_CARD_BG);
+    m_canvas->drawFastHLine(0, headerH, LCD_WIDTH, COLOR_CARD_BORDER);
+    VnText::draw(m_canvas, VN_FONT_LG, 12, 25, L("Thông tin hệ thống", "System info"), COLOR_CYAN);
+
+    const int firstBase = 53, step = 17;
+    for (int i = 0; i < ROWS; i++) {
+        int base = firstBase + i * step;
+        if (i % 2 == 0) m_canvas->fillRect(4, base - 13, LCD_WIDTH - 8, step, 0x0841);
+        VnText::draw(m_canvas, VN_FONT_SM, 10, base, labels[i], COLOR_SILVER);
+        VnText::drawRight(m_canvas, VN_FONT_SM, LCD_WIDTH - 10, base, values[i], COLOR_WHITE);
+    }
+
+    const int footerY = 214;
+    m_canvas->fillRect(0, footerY, LCD_WIDTH, LCD_HEIGHT - footerY, COLOR_CARD_BG);
+    m_canvas->drawFastHLine(0, footerY, LCD_WIDTH, COLOR_CARD_BORDER);
+    VnText::drawCentered(m_canvas, VN_FONT_SM, 120, 232, L("Bấm nút bất kỳ để quay lại", "Press any button to go back"),
+                         COLOR_SILVER);
 
     m_canvas->flush();
 }
@@ -1088,7 +1104,7 @@ void DisplayManager::showOtaProgress(const char* title, int progress, const char
     m_canvas->setTextSize(2);
     m_canvas->setTextColor(COLOR_CYAN);
     m_canvas->setCursor(34, 8);
-    m_canvas->print("DANG CAP NHAT");
+    m_canvas->print(L("DANG CAP NHAT", "UPDATING"));
     m_canvas->drawFastHLine(0, 32, 240, COLOR_CARD_BORDER);
 
     // Main Card (y: 42 to 226)
@@ -1147,11 +1163,11 @@ void DisplayManager::showOtaProgress(const char* title, int progress, const char
     // Warning
     m_canvas->setTextColor(COLOR_ALERT);
     m_canvas->setCursor(34, boxY + 142);
-    m_canvas->print("! KHONG DUOC TAT NGUON !");
+    m_canvas->print(L("! KHONG DUOC TAT NGUON !", "!  DO NOT POWER OFF  !"));
 
     m_canvas->setTextColor(COLOR_SILVER);
     m_canvas->setCursor(44, boxY + 160);
-    m_canvas->print("Dang ghi bo nho Flash...");
+    m_canvas->print(L("Dang ghi bo nho Flash...", "Writing flash memory..."));
 
     m_canvas->flush();
 }
@@ -1167,7 +1183,7 @@ void DisplayManager::showOtaSuccess(const char* version, int countdownSec) {
     m_canvas->setTextSize(2);
     m_canvas->setTextColor(COLOR_SAFE);
     m_canvas->setCursor(28, 8);
-    m_canvas->print("CAP NHAT XONG !");
+    m_canvas->print(L("CAP NHAT XONG !", "UPDATE DONE !"));
     m_canvas->drawFastHLine(0, 32, 240, COLOR_SAFE);
 
     // Main Card
@@ -1197,13 +1213,13 @@ void DisplayManager::showOtaSuccess(const char* version, int countdownSec) {
     m_canvas->setTextColor(COLOR_SAFE);
     int titleW = 11 * 12;
     m_canvas->setCursor(120 - titleW / 2, boxY + 80);
-    m_canvas->print("THANH CONG!");
+    m_canvas->print(L("THANH CONG!", "SUCCESS!"));
 
     // New version string
     m_canvas->setTextSize(1);
     m_canvas->setTextColor(COLOR_WHITE);
     char verBuf[48];
-    snprintf(verBuf, sizeof(verBuf), "Phien ban moi: v%s", (version ? version : FW_VERSION));
+    snprintf(verBuf, sizeof(verBuf), L("Phien ban moi: v%s", "New version: v%s"), (version ? version : FW_VERSION));
     int verW = strlen(verBuf) * 6;
     m_canvas->setCursor(120 - verW / 2, boxY + 110);
     m_canvas->print(verBuf);
@@ -1211,14 +1227,14 @@ void DisplayManager::showOtaSuccess(const char* version, int countdownSec) {
     // Subtext
     m_canvas->setTextColor(COLOR_CYAN);
     m_canvas->setCursor(34, boxY + 128);
-    m_canvas->print("Da cap nhat tinh nang moi");
+    m_canvas->print(L("Da cap nhat tinh nang moi", "New features installed"));
 
     // Countdown before reboot
     char countBuf[48];
     if (countdownSec > 0) {
-        snprintf(countBuf, sizeof(countBuf), "Khoi dong lai sau: %ds...", countdownSec);
+        snprintf(countBuf, sizeof(countBuf), L("Khoi dong lai sau: %ds...", "Restarting in: %ds..."), countdownSec);
     } else {
-        snprintf(countBuf, sizeof(countBuf), "Dang khoi dong lai...");
+        snprintf(countBuf, sizeof(countBuf), "%s", L("Dang khoi dong lai...", "Restarting..."));
     }
     m_canvas->setTextColor(COLOR_WARN);
     int cW = strlen(countBuf) * 6;
@@ -1239,7 +1255,7 @@ void DisplayManager::showOtaFailure(const char* reason) {
     m_canvas->setTextSize(2);
     m_canvas->setTextColor(COLOR_ALERT);
     m_canvas->setCursor(24, 8);
-    m_canvas->print("CAP NHAT LOI !");
+    m_canvas->print(L("CAP NHAT LOI !", "UPDATE ERROR !"));
     m_canvas->drawFastHLine(0, 32, 240, COLOR_ALERT);
 
     // Main Card
@@ -1266,7 +1282,7 @@ void DisplayManager::showOtaFailure(const char* reason) {
     m_canvas->setTextColor(COLOR_ALERT);
     int titleW = 8 * 12;
     m_canvas->setCursor(120 - titleW / 2, boxY + 80);
-    m_canvas->print("THAT BAI");
+    m_canvas->print(L("THAT BAI", "FAILED"));
 
     m_canvas->setTextSize(1);
     m_canvas->setTextColor(COLOR_WHITE);
@@ -1278,11 +1294,11 @@ void DisplayManager::showOtaFailure(const char* reason) {
 
     m_canvas->setTextColor(COLOR_SILVER);
     m_canvas->setCursor(34, boxY + 134);
-    m_canvas->print("Kiem tra lai Pi 4 / WiFi");
+    m_canvas->print(L("Kiem tra lai Pi 4 / WiFi", "Check Pi 4 / WiFi"));
 
     m_canvas->setTextColor(COLOR_WARN);
     m_canvas->setCursor(44, boxY + 158);
-    m_canvas->print("Tu dong quay lai HUD...");
+    m_canvas->print(L("Tu dong quay lai HUD...", "Returning to HUD..."));
 
     m_canvas->flush();
 }

@@ -35,4 +35,4 @@
 // Connect GPS Module RX -> ESP32-S3 TX (GPIO 43)
 #define PIN_GPS_RX      44
 #define PIN_GPS_TX      43
-#define GPS_BAUD_DEFAULT 9600
+#define GPS_BAUD_DEFAULT 115200 // P18 Pro; GPSManager auto-detects 9600/38400/57600 too
