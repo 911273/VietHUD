@@ -88,6 +88,14 @@ void sendHudInfoPacketA5();
 void sendObdTelemetryPacketA5();
 void sendHeartbeatPacketA5();
 void sendObdTelemetryPacket();
+// Helper gui notify an toan, tranh tran bo dem BLE stack
+void sendSafeNotify(BLECharacteristic* pChar, const uint8_t* data, size_t len) {
+    if (!pChar || !deviceConnected) return;
+    pChar->setValue((uint8_t*)data, len);
+    pChar->notify();
+    delay(25); // Cho BLE controller phat song on dinh
+}
+
 void parseIncomingPacket(const uint8_t* data, size_t len);
 void startRawAdvertising(const char* name = nullptr);
 static volatile bool advertising = false;
@@ -165,7 +173,7 @@ void parseIncomingPacket(const uint8_t* data, size_t len) {
             }
             Serial.printf("  [HANDSHAKE] Nhan ma dong bo gio iPhone: %u\n", ts);
 
-            // 1. Phan hoi ACK Echo day du Timestamp
+            // 1. Phan hoi ACK Echo C3
             uint8_t respC3[22];
             memset(respC3, 0, sizeof(respC3));
             respC3[0] = 0xA5;
@@ -175,29 +183,20 @@ void parseIncomingPacket(const uint8_t* data, size_t len) {
             respC3[4] = 0x00;
             respC3[5] = 0x00;
             respC3[6] = 0x00;
-            respC3[7] = 0x0E; // 14 bytes
+            respC3[7] = 0x0E; // 14 bytes payload
             if (len >= 12) memcpy(&respC3[8], &data[8], 4);
             respC3[12] = 0x00; // Status OK
             respC3[13] = 0x00;
             if (len >= 22) memcpy(&respC3[14], &data[14], 8);
 
-            pTxCharacteristic->setValue(respC3, sizeof(respC3));
-            pTxCharacteristic->notify();
-            totalPacketsTx++;
+            sendSafeNotify(pTxCharacteristic, respC3, sizeof(respC3));
+            sendSafeNotify(pRxCharacteristic, respC3, sizeof(respC3));
 
-            // 2. Gui kem SubCMD 0xC4 (Status Response cap nhat)
+            // 2. Gui kem SubCMD 0xC4
             respC3[3] = 0xC4;
-            pTxCharacteristic->setValue(respC3, sizeof(respC3));
-            pTxCharacteristic->notify();
-            totalPacketsTx++;
+            sendSafeNotify(pTxCharacteristic, respC3, sizeof(respC3));
 
-            // 3. Gui goi ACK tieu chuan
-            uint8_t ackStd[] = {0xA5, 0x5A, 0x37, 0xC3, 0x00, 0x00, 0x00, 0x01, 0x00};
-            pTxCharacteristic->setValue(ackStd, sizeof(ackStd));
-            pTxCharacteristic->notify();
-            totalPacketsTx++;
-
-            Serial.println("  [TX A5 5A] >>> Da phan hoi HANDSHAKE & TIME SYNC (C3/C4) <<<");
+            Serial.println("  [TX A5 5A] >>> Da phan hoi HANDSHAKE TIME SYNC (C3/C4) <<<");
             return;
         }
 
@@ -205,8 +204,8 @@ void parseIncomingPacket(const uint8_t* data, size_t len) {
         if (cmd == 0x37 && sub == 0xC5) {
             Serial.println("  [QUERY] Vietmap Live yeu cau thong tin Model & Hardware Profile (0xC5)...");
 
-            // Goi tin phan hoi Device Info Profile day du
-            uint8_t devProfile[28];
+            // Goi tin phan hoi Device Info Profile (18 bytes, fit 100% vao BLE MTU)
+            uint8_t devProfile[18];
             memset(devProfile, 0, sizeof(devProfile));
             devProfile[0] = 0xA5;
             devProfile[1] = 0x5A;
@@ -215,56 +214,41 @@ void parseIncomingPacket(const uint8_t* data, size_t len) {
             devProfile[4] = 0x00;
             devProfile[5] = 0x00;
             devProfile[6] = 0x00;
-            devProfile[7] = 0x14; // 20 bytes payload
+            devProfile[7] = 0x0A; // 10 bytes payload
 
             devProfile[8]  = 0x02; // Query ID: 0x02 (Device Info)
             devProfile[9]  = 0x00; // Status: 0 = OK / SUCCESS
             devProfile[10] = 'H';  // Model: H1N
             devProfile[11] = '1';
             devProfile[12] = 'N';
-            devProfile[13] = 0x00;
-            devProfile[14] = 0x01; // HW Version 1.0
+            devProfile[13] = 0x01; // FW Version 1.2.0
+            devProfile[14] = 0x02;
             devProfile[15] = 0x00;
-            devProfile[16] = 0x01; // FW Version 1.2.0
-            devProfile[17] = 0x02;
-            devProfile[18] = 0x00;
-            devProfile[19] = 0x07; // Status: OBD Active, GPS Ready, Pro Active
-            devProfile[20] = 0x00;
-            devProfile[21] = 0x00; // Battery 13.8V
-            devProfile[22] = 138;
-            devProfile[23] = 0x01; // Protocol Version 1
-            // Echo request tag
-            devProfile[24] = (len >= 12) ? data[10] : 0x3A;
-            devProfile[25] = (len >= 12) ? data[11] : 0xA1;
-            devProfile[26] = 0x00;
-            devProfile[27] = 0x00;
+            // Echo request tag tu data[10], data[11]
+            devProfile[16] = (len >= 12) ? data[10] : 0x3A;
+            devProfile[17] = (len >= 12) ? data[11] : 0xA1;
 
-            // Gui voi SubCMD C5
-            pTxCharacteristic->setValue(devProfile, sizeof(devProfile));
-            pTxCharacteristic->notify();
-            totalPacketsTx++;
+            // Gui voi SubCMD C5 tren ca 2 kenh TX va RX
+            sendSafeNotify(pTxCharacteristic, devProfile, sizeof(devProfile));
+            sendSafeNotify(pRxCharacteristic, devProfile, sizeof(devProfile));
 
-            // Gui kem voi SubCMD C6 (cap phan hoi cua C5)
+            // Gui voi SubCMD C6 tren ca 2 kenh
             devProfile[3] = 0xC6;
-            pTxCharacteristic->setValue(devProfile, sizeof(devProfile));
-            pTxCharacteristic->notify();
-            totalPacketsTx++;
+            sendSafeNotify(pTxCharacteristic, devProfile, sizeof(devProfile));
+            sendSafeNotify(pRxCharacteristic, devProfile, sizeof(devProfile));
 
             // Dong thoi phan hoi goi HUD_INFO A5 va Telemetry
-            delay(10);
             sendHudInfoPacketA5();
-            delay(10);
+            delay(25);
             sendObdTelemetryPacketA5();
 
-            Serial.println("  [TX A5 5A] >>> Da phan hoi MODEL H1N PROFILE cho C5 & C6 <<<");
+            Serial.println("  [TX A5 5A] >>> Da phan hoi MODEL H1N PROFILE cho C5 & C6 thanh cong! <<<");
             return;
         }
 
         // PHAN HOI MAC DINH CHO CAC GOI TIN A5 5A KHAC
         uint8_t genericAck[9] = {0xA5, 0x5A, cmd, sub, 0x00, 0x00, 0x00, 0x01, 0x00};
-        pTxCharacteristic->setValue(genericAck, sizeof(genericAck));
-        pTxCharacteristic->notify();
-        totalPacketsTx++;
+        sendSafeNotify(pTxCharacteristic, genericAck, sizeof(genericAck));
         Serial.printf("  [TX A5 5A] >>> Generic ACK cho CMD 0x%02X, SUB 0x%02X <<<\n", cmd, sub);
         return;
     }
@@ -667,32 +651,36 @@ void setup() {
     Serial.printf("[SETUP] Khởi tạo Bluetooth BLE với tên: %s\n", DEVICE_NAME);
 
     BLEDevice::init(DEVICE_NAME);
+    BLEDevice::setMTU(517);
 
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new VietMapServerCallbacks());
 
     BLEService* pService = pServer->createService(BLEUUID(SERVICE_UUID));
 
+    // Enable FULL Read, Write, Notify, Indicate tren tat ca dac tinh de iOS ket noi tron tru
     pTxCharacteristic = pService->createCharacteristic(
         BLEUUID(CHAR_TX_UUID),
-        BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
     );
     pTxCharacteristic->addDescriptor(new BLE2902());
 
     pRxCharacteristic = pService->createCharacteristic(
         BLEUUID(CHAR_RX_UUID),
-        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
     );
+    pRxCharacteristic->addDescriptor(new BLE2902());
     pRxCharacteristic->setCallbacks(new VietMapRxCallbacks());
 
     pCfgCharacteristic = pService->createCharacteristic(
         BLEUUID(CHAR_CFG_UUID),
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
     );
+    pCfgCharacteristic->addDescriptor(new BLE2902());
 
     pAuxCharacteristic = pService->createCharacteristic(
         BLEUUID(CHAR_AUX_UUID),
-        BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
     );
     pAuxCharacteristic->addDescriptor(new BLE2902());
 
