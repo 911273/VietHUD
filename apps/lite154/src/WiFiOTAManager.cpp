@@ -1,6 +1,7 @@
 #include "WiFiOTAManager.h"
 #include "DisplayManager.h"
 #include "AudioManager.h"
+#include "SettingsManager.h"
 
 extern DisplayManager display;
 extern AudioManager audio;
@@ -48,7 +49,7 @@ bool WiFiOTAManager::toggleWiFi() {
         m_progress = 0;
         m_ipStr[0] = '\0';
         m_remoteVersion[0] = '\0';
-        snprintf(m_workflowMsg, sizeof(m_workflowMsg), "DANG KET NOI WIFI...");
+        snprintf(m_workflowMsg, sizeof(m_workflowMsg), L("DANG KET NOI WIFI...", "CONNECTING WIFI..."));
         m_wifiMulti.run();
         m_lastWiFiPollTime = millis();
     } else {
@@ -97,8 +98,8 @@ void WiFiOTAManager::startArduinoOTA() {
         m_workflowState = OTA_STEP_DOWNLOADING;
         m_isUpdating = true;
         m_progress = 0;
-        snprintf(m_workflowMsg, sizeof(m_workflowMsg), "DANG NAP ARDUINO OTA...");
-        display.showOtaProgress("Arduino OTA", 0, "Dang khoi tao ket noi...");
+        snprintf(m_workflowMsg, sizeof(m_workflowMsg), L("DANG NAP ARDUINO OTA...", "FLASHING ARDUINO OTA..."));
+        display.showOtaProgress("Arduino OTA", 0, L("Dang khoi tao ket noi...", "Starting connection..."));
         Serial.println("[OTA] Bat dau qua trinh cap nhat ArduinoOTA...");
     });
 
@@ -123,7 +124,7 @@ void WiFiOTAManager::startArduinoOTA() {
         static uint32_t lastOtaDisp = 0;
         if (millis() - lastOtaDisp >= 100) {
             lastOtaDisp = millis();
-            display.showOtaProgress("Arduino OTA", m_progress, "Dang nap qua LAN IDE...");
+            display.showOtaProgress("Arduino OTA", m_progress, L("Dang nap qua LAN IDE...", "Flashing via LAN IDE..."));
         }
     });
 
@@ -131,7 +132,7 @@ void WiFiOTAManager::startArduinoOTA() {
         m_workflowState = OTA_STEP_FAILED;
         m_stateChangeTime = millis();
         m_autoReturnDurationMs = 8000;
-        snprintf(m_workflowMsg, sizeof(m_workflowMsg), "LOI ARDUINO OTA (%u)", error);
+        snprintf(m_workflowMsg, sizeof(m_workflowMsg), L("LOI ARDUINO OTA (%u)", "ARDUINO OTA ERROR (%u)"), error);
         char errBuf[32];
         snprintf(errBuf, sizeof(errBuf), "Loi ArduinoOTA: %u", error);
         display.showOtaFailure(errBuf);
@@ -192,7 +193,7 @@ void WiFiOTAManager::setupWebServer() {
                 m_workflowState = OTA_STEP_FAILED;
                 m_stateChangeTime = millis();
                 m_autoReturnDurationMs = 8000;
-                display.showOtaFailure("Loi ghi Flash Web OTA");
+                display.showOtaFailure(L("Loi ghi Flash Web OTA", "Web OTA flash write error"));
             }
             m_isUpdating = false;
         }
@@ -200,6 +201,20 @@ void WiFiOTAManager::setupWebServer() {
 
     m_server.begin();
     Serial.printf("[WEB OTA] Web server OTA da chay tai: http://%s/\n", m_ipStr);
+}
+
+// Compare dotted versions numerically ("3.10.0" > "3.9.2"). Returns <0, 0, >0.
+static int compareVersions(const char* a, const char* b) {
+    while (*a || *b) {
+        long va = strtol(a, (char**)&a, 10);
+        long vb = strtol(b, (char**)&b, 10);
+        if (va != vb) return va < vb ? -1 : 1;
+        if (*a == '.') a++;
+        if (*b == '.') b++;
+        if (!*a && !*b) break;
+        if ((*a && *a != '.' && !isdigit((unsigned char)*a)) || (*b && *b != '.' && !isdigit((unsigned char)*b))) break;
+    }
+    return 0;
 }
 
 void WiFiOTAManager::executeHttpCheck() {
@@ -282,7 +297,9 @@ void WiFiOTAManager::executeHttpCheck() {
 
     if (remoteVer.length() > 0) {
         strncpy(m_remoteVersion, remoteVer.c_str(), sizeof(m_remoteVersion) - 1);
-        if (remoteVer != FW_VERSION || remoteBuild != FW_BUILD) {
+        // Only move forward: an older version.json on the Pi must never downgrade the board.
+        int cmp = compareVersions(remoteVer.c_str(), FW_VERSION);
+        if (cmp > 0 || (cmp == 0 && remoteBuild.length() > 0 && remoteBuild > String(FW_BUILD))) {
             hasUpdate = true;
         }
     }
@@ -299,7 +316,7 @@ void WiFiOTAManager::executeHttpCheck() {
         display.showOtaProgress(
             title,
             0,
-            connectedViaTailscale ? "Nguon: Pi 4 Tailscale" : "Nguon: Pi 4 LAN"
+            connectedViaTailscale ? L("Nguon: Pi 4 Tailscale", "Source: Pi 4 Tailscale") : L("Nguon: Pi 4 LAN", "Source: Pi 4 LAN")
         );
 
         httpUpdate.setLedPin(-1);
@@ -315,7 +332,7 @@ void WiFiOTAManager::executeHttpCheck() {
                 display.showOtaProgress(
                     title,
                     m_progress,
-                    connectedViaTailscale ? "Nguon: Pi 4 Tailscale (100.107.34.92)" : "Nguon: Pi 4 LAN (192.168.1.65)"
+                    connectedViaTailscale ? L("Nguon: Pi 4 Tailscale (100.107.34.92)", "Source: Pi 4 Tailscale (100.107.34.92)") : L("Nguon: Pi 4 LAN (192.168.1.65)", "Source: Pi 4 LAN (192.168.1.65)")
                 );
             }
         });
@@ -325,7 +342,7 @@ void WiFiOTAManager::executeHttpCheck() {
 
         if (ret != HTTP_UPDATE_OK && backupUrl.length() > 0) {
             Serial.printf("[OTA] Thu lai voi backup URL: %s\n", backupUrl.c_str());
-            display.showOtaProgress(title, m_progress, "Dang thu lai qua URL du phong...");
+            display.showOtaProgress(title, m_progress, L("Dang thu lai qua URL du phong...", "Retrying backup URL..."));
             ret = httpUpdate.update(client, backupUrl);
         }
 
@@ -350,7 +367,7 @@ void WiFiOTAManager::executeHttpCheck() {
             m_stateChangeTime = millis();
             m_autoReturnDurationMs = 8000;
             char errBuf[48];
-            snprintf(errBuf, sizeof(errBuf), "Loi HTTP: %d", httpUpdate.getLastError());
+            snprintf(errBuf, sizeof(errBuf), L("Loi HTTP: %d", "HTTP error: %d"), httpUpdate.getLastError());
             display.showOtaFailure(errBuf);
             delay(2500);
         }
@@ -359,14 +376,14 @@ void WiFiOTAManager::executeHttpCheck() {
         m_workflowState = OTA_STEP_UP_TO_DATE;
         m_stateChangeTime = millis();
         m_autoReturnDurationMs = 6000;
-        snprintf(m_workflowMsg, sizeof(m_workflowMsg), "HE THONG MOI NHAT (%s)", FW_VERSION);
+        snprintf(m_workflowMsg, sizeof(m_workflowMsg), L("HE THONG MOI NHAT (%s)", "UP TO DATE (%s)"), FW_VERSION);
         Serial.println("[OTA] Thiet bi dang o phien ban moi nhat!");
     } else {
         // Could not reach server
         m_workflowState = OTA_STEP_FAILED;
         m_stateChangeTime = millis();
         m_autoReturnDurationMs = 8000;
-        snprintf(m_workflowMsg, sizeof(m_workflowMsg), "KHONG KET NOI DUOC PI 4");
+        snprintf(m_workflowMsg, sizeof(m_workflowMsg), "%s", L("KHONG KET NOI DUOC PI 4", "CANNOT REACH PI 4"));
         Serial.println("[OTA] Khong the tai version.json tu Pi 4 qua ca LAN va Tailscale.");
     }
 }
@@ -390,7 +407,7 @@ void WiFiOTAManager::update() {
                 snprintf(m_ipStr, sizeof(m_ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
                 m_workflowState = OTA_STEP_WIFI_CONNECTED;
                 m_stateChangeTime = now;
-                snprintf(m_workflowMsg, sizeof(m_workflowMsg), "DA KET NOI: %s", WiFi.SSID().c_str());
+                snprintf(m_workflowMsg, sizeof(m_workflowMsg), L("DA KET NOI: %s", "CONNECTED: %s"), WiFi.SSID().c_str());
                 Serial.printf("[WIFI] %s, IP: %s\n", m_workflowMsg, m_ipStr);
                 startArduinoOTA();
                 setupWebServer();
@@ -404,7 +421,7 @@ void WiFiOTAManager::update() {
                     m_workflowState = OTA_STEP_FAILED;
                     m_stateChangeTime = now;
                     m_autoReturnDurationMs = 8000;
-                    snprintf(m_workflowMsg, sizeof(m_workflowMsg), "KHONG TIM THAY WIFI");
+                    snprintf(m_workflowMsg, sizeof(m_workflowMsg), "%s", L("KHONG TIM THAY WIFI", "NO WIFI FOUND"));
                     Serial.println("[WIFI] Ket noi WiFi that bai sau 20s.");
                 }
             }
@@ -419,7 +436,7 @@ void WiFiOTAManager::update() {
             if (now - m_stateChangeTime >= 1500) {
                 m_workflowState = OTA_STEP_CHECKING_UPDATE;
                 m_stateChangeTime = now;
-                snprintf(m_workflowMsg, sizeof(m_workflowMsg), "DANG KIEM TRA PHIEN BAN...");
+                snprintf(m_workflowMsg, sizeof(m_workflowMsg), "%s", L("DANG KIEM TRA PHIEN BAN...", "CHECKING VERSION..."));
                 Serial.println("[WIFI] Dang kiem tra version.json...");
             }
             break;

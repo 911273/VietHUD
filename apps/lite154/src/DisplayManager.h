@@ -6,6 +6,18 @@
 #include "FreeSansBold24pt7b.h"
 #include "FreeSansBold18pt7b.h"
 #include "SpeedSignFonts.h"
+#include "VnText.h"
+
+// Live values for the system info page that DisplayManager cannot read itself.
+struct SystemInfoData {
+    const char* gpsProtocol;   // "UBX", "NMEA" or "--"
+    uint32_t gpsBaud;
+    int gpsSats;
+    bool gpsFix;
+    float gpsHAccM;
+    uint32_t alertCount;
+    uint32_t roadNameCount;
+};
 
 class DisplayManager {
 public:
@@ -18,7 +30,6 @@ public:
         int speedLimit,
         int satellites,
         bool gpsFix,
-        bool isDemoMode,
         bool isMuted,
         const char* roadName = nullptr,
         bool wifiEnabled = false,
@@ -60,6 +71,9 @@ public:
     // Dedicated Full-Screen Settings Page
     void renderSettings(uint8_t selectedIdx, bool isEditing);
 
+    // Full-screen hardware / firmware info (Settings > System info)
+    void renderSystemInfo(const SystemInfoData& info);
+
     // Dedicated Full-Screen OTA Progress and Result Visualizers
     void showOtaProgress(const char* title, int progress, const char* detail = nullptr);
     void showOtaSuccess(const char* version, int countdownSec = 3);
@@ -74,9 +88,8 @@ private:
     int m_speedLimit;
     int m_sats;
     bool m_fix;
-    bool m_demo;
     bool m_muted;
-    char m_roadName[64];
+    char m_roadName[128];   // UTF-8
 
     // Marquee scrolling state
     uint32_t m_marqueeStartTime;
@@ -103,7 +116,7 @@ private:
     uint32_t m_lastFlashTime;
     bool m_flashState;
 
-    char m_toastText[32];
+    char m_toastText[48];   // UTF-8
     uint16_t m_toastColor;
     uint32_t m_toastExpiry;
 
