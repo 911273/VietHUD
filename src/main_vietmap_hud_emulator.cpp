@@ -24,7 +24,7 @@
 // =============================================================================
 // BLUETOOTH BLE DEFINITIONS & GATT UUIDS
 // =============================================================================
-#define DEVICE_NAME         "VIETMAP_HUD"
+#define DEVICE_NAME         "VIETMAP_H1AS"
 
 #define SERVICE_UUID        "0000fff0-0000-1000-8000-00805f9b34fb"
 #define CHAR_TX_UUID        "0000fff1-0000-1000-8000-00805f9b34fb" // Notify / Read to App
@@ -192,32 +192,58 @@ static volatile bool advertising = false;
 // =============================================================================
 // BLE SERVER CALLBACKS
 // =============================================================================
+
+static volatile bool pendingHandshake = false;
+static uint32_t connectTimestamp = 0;
+
+class VietMapSecurityCallbacks : public BLESecurityCallbacks {
+    uint32_t onPassKeyRequest() override {
+        Serial.println("[BLE-SEC] Yeu cau PassKey -> Tra ve 0");
+        return 0;
+    }
+    void onPassKeyNotify(uint32_t pass_key) override {
+        Serial.printf("[BLE-SEC] Thong bao PassKey: %d\n", pass_key);
+    }
+    bool onConfirmPIN(uint32_t pass_key) override {
+        Serial.printf("[BLE-SEC] Xac nhan PIN: %d -> Auto Chap nhan\n", pass_key);
+        return true;
+    }
+    bool onSecurityRequest() override {
+        Serial.println("[BLE-SEC] Yeu cau bao mat tu dien thoai -> Auto Chap nhan");
+        return true;
+    }
+    void onAuthenticationComplete(esp_ble_auth_cmpl_t auth_cmpl) override {
+        if (auth_cmpl.success) {
+            Serial.println("[BLE-SEC] === XAC THUC & GHEP DOI (BONDING) THANH CONG! ===");
+        } else {
+            Serial.printf("[BLE-SEC] Xac thuc that bai: 0x%02X\n", auth_cmpl.fail_reason);
+        }
+    }
+};
 class VietMapServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) override {
         deviceConnected = true;
         advertising = false;
+        pendingHandshake = true;
+        connectTimestamp = millis();
         Serial.println("\n[BLE] ==================================================");
-        Serial.println("[BLE] >>> VIETMAP LIVE APP DA KET NOI THANH CONG! <<<");
-        Serial.println("[BLE] Kich hoat bat tay & duy tri ket noi VietMap Pro...");
+        Serial.println("[BLE] >>> IPHONE / THIET BI DA KET NOI BLE GATT! <<<");
+        Serial.println("[BLE] Cho thiet bi doc Service & Characteristic...");
         Serial.println("[BLE] ==================================================\n");
-        
-        delay(80);
-        // Gui goi tin Version Info chuan V221
-        sendV221VersionInfo(0xC5, (uint32_t)(millis() / 1000));
-        delay(40);
-        // Gui trang thai HUD binh thuong
-        sendV221HudStatus(0x01, (uint32_t)(millis() / 1000));
-        delay(40);
-        // Gui thong so OBD de kich hoat telemetry
-        sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage);
-        delay(40);
-        // Dong thoi gui legacy info
-        sendLegacyHudInfoPacket();
+    }
+
+    void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) override {
+        Serial.printf("[BLE] Ket noi tu Client MAC: %02x:%02x:%02x:%02x:%02x:%02x (conn_id: %d)\n",
+                      param->connect.remote_bda[0], param->connect.remote_bda[1],
+                      param->connect.remote_bda[2], param->connect.remote_bda[3],
+                      param->connect.remote_bda[4], param->connect.remote_bda[5],
+                      param->connect.conn_id);
     }
 
     void onDisconnect(BLEServer* pServer) override {
         deviceConnected = false;
-        Serial.println("\n[BLE] !!! VIETMAP LIVE APP DA NGAT KET NOI !!!");
+        pendingHandshake = false;
+        Serial.println("\n[BLE] !!! THIET BI DA NGAT KET NOI !!!");
         Serial.println("[BLE] Tu dong quang ba lai cho ket noi tiep theo...");
     }
 };
@@ -357,7 +383,7 @@ void sendV221VersionInfo(uint8_t reqSub, uint32_t ts) {
     if (!deviceConnected || !pTxCharacteristic) return;
 
     // Chuoi Version Info chuan theo giai ma Dalvik LP7/a.x
-    const char* verStr = "MODEL:H1N,HW:1.0,FW:1.0,PROTOCOL:2.2.1,OBDV:1.0_0,SID:12345678";
+    const char* verStr = "MODEL:H1AS,HW:1.0,FW:1.0,PROTOCOL:2.2.1,OBDV:1.0_0,SID:12345678";
     size_t strLen = strlen(verStr);
 
     uint8_t payload[1 + strLen];
@@ -427,8 +453,8 @@ void sendLegacyHudInfoPacket() {
     pkt[3] = 0x0A;
     pkt[4] = 'H';
     pkt[5] = '1';
-    pkt[6] = 'N';
-    pkt[7] = 0x01;
+    pkt[6] = 'A';
+    pkt[7] = 'S';
     pkt[8] = 0x02;
     pkt[9] = 0x00;
     pkt[10] = 0x00;
@@ -574,6 +600,14 @@ void startRawAdvertising(const char* name) {
     rawAdvData[rawAdvDataLen++] = 0xF0;
     rawAdvData[rawAdvDataLen++] = 0xFF; // Complete 16-bit Service UUID: 0xFFF0
 
+    // Apple PPCP (Slave Connection Interval Range: min 10ms, max 30ms)
+    rawAdvData[rawAdvDataLen++] = 0x05;
+    rawAdvData[rawAdvDataLen++] = 0x12; // 0x12 = Slave Connection Interval Range
+    rawAdvData[rawAdvDataLen++] = 0x08; // 0x0008 = 10ms
+    rawAdvData[rawAdvDataLen++] = 0x00;
+    rawAdvData[rawAdvDataLen++] = 0x18; // 0x0018 = 30ms
+    rawAdvData[rawAdvDataLen++] = 0x00;
+
     uint8_t nlen = strlen(currentDevName);
     if (rawAdvDataLen + 2 + nlen <= 31) {
         rawAdvData[rawAdvDataLen++] = nlen + 1;
@@ -582,7 +616,7 @@ void startRawAdvertising(const char* name) {
         rawAdvDataLen += nlen;
     }
 
-    // 2. rawScanRespData (128-bit UUID + Name)
+    // 2. rawScanRespData (128-bit UUID + TX Power = 21 bytes <= 31 bytes)
     rawScanRespDataLen = 0;
     rawScanRespData[rawScanRespDataLen++] = 0x11;
     rawScanRespData[rawScanRespDataLen++] = 0x07; // Complete 128-bit Service UUID
@@ -590,12 +624,10 @@ void startRawAdvertising(const char* name) {
     memcpy(&rawScanRespData[rawScanRespDataLen], u128, 16);
     rawScanRespDataLen += 16;
 
-    if (rawScanRespDataLen + 2 + nlen <= 31) {
-        rawScanRespData[rawScanRespDataLen++] = nlen + 1;
-        rawScanRespData[rawScanRespDataLen++] = 0x09; // Complete Local Name
-        memcpy(&rawScanRespData[rawScanRespDataLen], currentDevName, nlen);
-        rawScanRespDataLen += nlen;
-    }
+    // Tx Power Level (+9 dBm)
+    rawScanRespData[rawScanRespDataLen++] = 0x02;
+    rawScanRespData[rawScanRespDataLen++] = 0x0A; // TX Power Level
+    rawScanRespData[rawScanRespDataLen++] = 0x09; // +9 dBm
 
     esp_ble_gap_set_device_name(currentDevName);
     esp_ble_gap_config_adv_data_raw(rawAdvData, rawAdvDataLen);
@@ -619,6 +651,24 @@ void onGapEvent(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
         case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
             advertising = false;
             break;
+        case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+            Serial.printf("[BLE-GAP] Update Conn Params: status=%d, min=%d, max=%d, conn_int=%d, latency=%d, timeout=%d\n",
+                          param->update_conn_params.status,
+                          param->update_conn_params.min_int,
+                          param->update_conn_params.max_int,
+                          param->update_conn_params.conn_int,
+                          param->update_conn_params.latency,
+                          param->update_conn_params.timeout);
+            break;
+        case ESP_GAP_BLE_AUTH_CMPL_EVT:
+            Serial.printf("[BLE-GAP] Auth Complete: success=%d, fail_reason=0x%02x\n",
+                          param->ble_security.auth_cmpl.success,
+                          param->ble_security.auth_cmpl.fail_reason);
+            break;
+        case ESP_GAP_BLE_SEC_REQ_EVT:
+            Serial.println("[BLE-GAP] Security Request tu Peer -> Chap nhan!");
+            esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
+            break;
         default:
             break;
     }
@@ -641,6 +691,16 @@ void setup() {
 
     BLEDevice::init(DEVICE_NAME);
     BLEDevice::setMTU(517);
+
+    // Cau hinh BLE Security / Pairing (ho tro Just Works auto-pairing cho Apple iOS)
+    BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
+    BLEDevice::setSecurityCallbacks(new VietMapSecurityCallbacks());
+
+    BLESecurity* pSecurity = new BLESecurity();
+    pSecurity->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
+    pSecurity->setCapability(ESP_IO_CAP_NONE);
+    pSecurity->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+    pSecurity->setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
 
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new VietMapServerCallbacks());
@@ -687,7 +747,23 @@ void loop() {
 
     // DUY TRI KET NOI KHONG NGAT (CONNECTION SUPERVISOR):
     // Gui nhan nhip tim va du lieu xe moi 1000ms
-    if (deviceConnected) {
+    // Bat tay khoi tao khi iPhone vua ket noi (doi 300ms cho iOS Service Discovery hoan tat)
+    if (deviceConnected && pendingHandshake) {
+        if (now - connectTimestamp >= 300) {
+            pendingHandshake = false;
+            Serial.println("[BLE] Bat dau gui goi tin bat tay V221 Version & HUD Info sang VietMap Live...");
+            sendV221VersionInfo(0xC5, (uint32_t)(now / 1000));
+            delay(30);
+            sendV221HudStatus(0x01, (uint32_t)(now / 1000));
+            delay(30);
+            sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage, (uint32_t)(now / 1000));
+            delay(30);
+            sendLegacyHudInfoPacket();
+            Serial.println("[BLE] Da gui xong bat tay! Cho phan hoi tu App.");
+        }
+    }
+
+    if (deviceConnected && !pendingHandshake) {
         if (now - lastHeartbeatMs >= 1000) {
             lastHeartbeatMs = now;
             sendV221HudStatus(0x01, (uint32_t)(now / 1000));
