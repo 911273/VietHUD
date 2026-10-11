@@ -2,11 +2,11 @@
  * @file main_vietmap_hud_emulator.cpp
  * @brief VietMap Hardware HUD Clone & BLE Emulator for ESP32-S3
  * 
- * Clones VietMap HUD (Models: H1N, H2AS, H1X, VIETMAP_HUD) to unlock and maintain
- * VietMap Live Pro features on Android tablet without needing to sit in a car.
+ * Clones VietMap HUD (Models: H1N / H2AS, Protocol V221 / V2.2.1) to activate and maintain
+ * continuous connection with VietMap Live (iOS & Android) and unlock HUD Pro features.
  * 
- * Hardware: ESP32-S3 (JC3248W535 / Generic ESP32-S3 N16R8)
- * BLE Service: 0xFFF0 (Custom VietMap HUD Protocol)
+ * Hardware: ESP32-S3 (Generic / JC3248W535)
+ * BLE Service: 0xFFF0 (Custom VietMap HUD GATT Protocol)
  * TX Char (Notify): 0xFFF1
  * RX Char (Write):  0xFFF2
  * Config Char:      0xFFF3
@@ -19,14 +19,13 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <esp_gap_ble_api.h>
+#include "mbedtls/md5.h"
 
 // =============================================================================
-// BLUETOOTH BLE DEFINITIONS & UUIDS
+// BLUETOOTH BLE DEFINITIONS & GATT UUIDS
 // =============================================================================
-#define DEVICE_NAME         "VIETMAP_HUD"          // Prefix 'H1N' triggers hudH1N / H1NewProtocol
-#define DEVICE_NAME_ALT     "VIETMAP_HUD"
+#define DEVICE_NAME         "VIETMAP_HUD"
 
-// Custom VietMap GATT UUIDs (16-bit mapped to 128-bit Bluetooth Base)
 #define SERVICE_UUID        "0000fff0-0000-1000-8000-00805f9b34fb"
 #define CHAR_TX_UUID        "0000fff1-0000-1000-8000-00805f9b34fb" // Notify / Read to App
 #define CHAR_RX_UUID        "0000fff2-0000-1000-8000-00805f9b34fb" // Write from App
@@ -37,17 +36,26 @@
 #define FRAME_HEADER_1      0x55
 #define FRAME_HEADER_2      0xAA
 
-// Command IDs
-#define CMD_HEARTBEAT       0x01  // Heartbeat / Status keepalive
-#define CMD_HUD_INFO        0x02  // HUD Device Info / Auth Handshake
-#define CMD_OBD_TELEMETRY   0x03  // Vehicle speed, RPM, Voltage, Coolant
-#define CMD_SPEED_LIMIT     0x04  // Speed limit & Road sign alerts
-#define CMD_CAMERA_ALERT    0x05  // Camera warning (Speed, Penalty, Red Light)
-#define CMD_NAVIGATION      0x06  // Turn-by-turn direction & distance
-#define CMD_TPMS_INFO       0x07  // Tire pressure data
-#define CMD_ACK             0xFF  // Acknowledge response
+// Legacy 55 AA Command IDs
+#define CMD_HEARTBEAT       0x01
+#define CMD_HUD_INFO        0x02
+#define CMD_OBD_TELEMETRY   0x03
+#define CMD_SPEED_LIMIT     0x04
+#define CMD_CAMERA_ALERT    0x05
+#define CMD_NAVIGATION      0x06
+#define CMD_TPMS_INFO       0x07
+#define CMD_ACK             0xFF
 
-// Global State
+// =============================================================================
+// VIETMAP V221 OEM PROTOCOL CONSTANTS & SECURITY KEY
+// =============================================================================
+// 16-byte fixed Key C extracted from decompiled VietMap Live SDK (LV7/c.c)
+static const uint8_t KEY_C[16] = {
+    0xF7, 0xFD, 0x15, 0x75, 0x02, 0xDA, 0x52, 0x8E, 
+    0xF0, 0xFC, 0x31, 0x39, 0x72, 0x2C, 0xE9, 0xE2
+};
+
+// Global BLE State
 BLEServer* pServer = nullptr;
 BLECharacteristic* pTxCharacteristic = nullptr;
 BLECharacteristic* pRxCharacteristic = nullptr;
@@ -65,14 +73,100 @@ uint32_t totalPacketsTx = 0;
 uint8_t currentSpeed = 0;
 uint8_t currentSpeedLimit = 50;
 uint16_t currentRpm = 850;
-uint8_t currentCoolantTemp = 86; // 86°C
+uint8_t currentCoolantTemp = 86; // 86 deg C
 float batteryVoltage = 13.8f;    // 13.8V
 String lastCameraAlert = "None";
 uint16_t lastCameraDistance = 0;
 String lastNavDirection = "Straight";
 uint16_t lastNavDistance = 0;
 
-// Helper: Calculate Checksum (Sum of bytes & 0xFF)
+// =============================================================================
+// V221 FRAME BUILDER WITH REVERSE-ENGINEERED MD5 CHECKSUM
+// =============================================================================
+uint32_t calculateV221HashSum(const uint8_t* rawData, size_t rawLen, const uint8_t* key16) {
+    size_t totalHashLen = rawLen + 16;
+    uint8_t* hashBuffer = (uint8_t*)malloc(totalHashLen);
+    if (!hashBuffer) return 0;
+
+    memcpy(hashBuffer, rawData, rawLen);
+    memcpy(hashBuffer + rawLen, key16, 16);
+
+    uint8_t digest[16];
+    mbedtls_md5(hashBuffer, totalHashLen, digest);
+    free(hashBuffer);
+
+    char md5Hex[33];
+    for (int i = 0; i < 16; i++) {
+        sprintf(&md5Hex[i * 2], "%02X", digest[i]);
+    }
+    md5Hex[32] = '\0';
+
+    uint32_t totalSum = 0;
+    for (int i = 0; i < 4; i++) {
+        char chunk[9];
+        memcpy(chunk, &md5Hex[i * 8], 8);
+        chunk[8] = '\0';
+        uint32_t val = (uint32_t)strtoul(chunk, NULL, 16);
+        totalSum += val;
+    }
+    return totalSum;
+}
+
+size_t buildV221Frame(uint8_t cmd, uint8_t sub, const uint8_t* payload, size_t payloadLen, uint32_t ts, uint8_t* outBuf) {
+    size_t totalLen = payloadLen + 20; // 12 header + payload + 8 checksums
+    uint32_t dataLen = payloadLen + 12;
+
+    outBuf[0] = 0xA5;
+    outBuf[1] = 0x5A;
+    outBuf[2] = cmd;
+    outBuf[3] = sub;
+
+    // 4-byte Big-Endian Length
+    outBuf[4] = (dataLen >> 24) & 0xFF;
+    outBuf[5] = (dataLen >> 16) & 0xFF;
+    outBuf[6] = (dataLen >> 8) & 0xFF;
+    outBuf[7] = dataLen & 0xFF;
+
+    // 4-byte Big-Endian Timestamp
+    outBuf[8]  = (ts >> 24) & 0xFF;
+    outBuf[9]  = (ts >> 16) & 0xFF;
+    outBuf[10] = (ts >> 8) & 0xFF;
+    outBuf[11] = ts & 0xFF;
+
+    // Payload
+    if (payloadLen > 0 && payload != nullptr) {
+        memcpy(&outBuf[12], payload, payloadLen);
+    }
+
+    // Checksums
+    uint32_t sumC = calculateV221HashSum(outBuf, 12 + payloadLen, KEY_C);
+    uint32_t sumB = sumC; // Default session key matches Key C
+
+    size_t offset = 12 + payloadLen;
+    // 4 bytes sumB
+    outBuf[offset + 0] = (sumB >> 24) & 0xFF;
+    outBuf[offset + 1] = (sumB >> 16) & 0xFF;
+    outBuf[offset + 2] = (sumB >> 8) & 0xFF;
+    outBuf[offset + 3] = sumB & 0xFF;
+
+    // 4 bytes sumC
+    outBuf[offset + 4] = (sumC >> 24) & 0xFF;
+    outBuf[offset + 5] = (sumC >> 16) & 0xFF;
+    outBuf[offset + 6] = (sumC >> 8) & 0xFF;
+    outBuf[offset + 7] = sumC & 0xFF;
+
+    return totalLen;
+}
+
+void sendSafeNotify(BLECharacteristic* pChar, const uint8_t* data, size_t len) {
+    if (!pChar || !deviceConnected) return;
+    pChar->setValue((uint8_t*)data, len);
+    pChar->notify();
+    totalPacketsTx++;
+    delay(20);
+}
+
+// Helper: Calculate 55 AA Checksum
 uint8_t calculateChecksum(const uint8_t* data, size_t len) {
     uint8_t sum = 0;
     for (size_t i = 0; i < len; i++) {
@@ -82,22 +176,17 @@ uint8_t calculateChecksum(const uint8_t* data, size_t len) {
 }
 
 // Forward Declarations
-void sendHeartbeatPacket();
-void sendHudInfoPacket();
-void sendHudInfoPacketA5();
-void sendObdTelemetryPacketA5();
-void sendHeartbeatPacketA5();
-void sendObdTelemetryPacket();
-// Helper gui notify an toan, tranh tran bo dem BLE stack
-void sendSafeNotify(BLECharacteristic* pChar, const uint8_t* data, size_t len) {
-    if (!pChar || !deviceConnected) return;
-    pChar->setValue((uint8_t*)data, len);
-    pChar->notify();
-    delay(25); // Cho BLE controller phat song on dinh
-}
+void sendV221VersionInfo(uint8_t reqSub = 0xC5, uint32_t ts = 0);
+void sendV221HudStatus(uint8_t statusByte = 0x01, uint32_t ts = 0);
+void sendV221ObdTelemetry(uint8_t speed, uint16_t rpm, uint8_t coolant, float voltage, uint32_t ts = 0);
+void sendV221Ack(uint8_t cmd, uint8_t sub, uint32_t ts = 0);
+void sendLegacyHudInfoPacket();
+void sendLegacyHeartbeatPacket();
+void sendLegacyObdTelemetryPacket();
 
 void parseIncomingPacket(const uint8_t* data, size_t len);
 void startRawAdvertising(const char* name = nullptr);
+
 static volatile bool advertising = false;
 
 // =============================================================================
@@ -106,31 +195,35 @@ static volatile bool advertising = false;
 class VietMapServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) override {
         deviceConnected = true;
-        advertising = false; // the stack stops advertising once a central connects
+        advertising = false;
         Serial.println("\n[BLE] ==================================================");
-        Serial.println("[BLE] >>> VIETMAP LIVE APP ĐÃ KẾT NỐI THÀNH CÔNG! <<<");
-        Serial.println("[BLE] Đang kích hoạt chế độ VIETMAP PRO...");
+        Serial.println("[BLE] >>> VIETMAP LIVE APP DA KET NOI THANH CONG! <<<");
+        Serial.println("[BLE] Kich hoat bat tay & duy tri ket noi VietMap Pro...");
         Serial.println("[BLE] ==================================================\n");
         
-        delay(100);
-        sendHudInfoPacketA5();
-        delay(30);
-        sendHudInfoPacket();
-        delay(30);
-        sendObdTelemetryPacketA5();
-        delay(30);
-        sendObdTelemetryPacket();
+        delay(80);
+        // Gui goi tin Version Info chuan V221
+        sendV221VersionInfo(0xC5, (uint32_t)(millis() / 1000));
+        delay(40);
+        // Gui trang thai HUD binh thuong
+        sendV221HudStatus(0x01, (uint32_t)(millis() / 1000));
+        delay(40);
+        // Gui thong so OBD de kich hoat telemetry
+        sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage);
+        delay(40);
+        // Dong thoi gui legacy info
+        sendLegacyHudInfoPacket();
     }
 
     void onDisconnect(BLEServer* pServer) override {
         deviceConnected = false;
-        Serial.println("\n[BLE] !!! VIETMAP LIVE APP ĐÃ NGẮT KẾT NỐI !!!");
-        Serial.println("[BLE] Khởi động lại BLE Advertising để chờ kết nối mới...");
+        Serial.println("\n[BLE] !!! VIETMAP LIVE APP DA NGAT KET NOI !!!");
+        Serial.println("[BLE] Tu dong quang ba lai cho ket noi tiep theo...");
     }
 };
 
 // =============================================================================
-// BLE RX CHARACTERISTIC CALLBACKS (Incoming commands from VietMap Live)
+// BLE RX CHARACTERISTIC CALLBACKS
 // =============================================================================
 class VietMapRxCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* pCharacteristic) override {
@@ -157,242 +250,232 @@ class VietMapRxCallbacks : public BLECharacteristicCallbacks {
 void parseIncomingPacket(const uint8_t* data, size_t len) {
     if (len < 2) return;
 
-    // 1. VIETMAP LIVE A5 5A PROTOCOL
+    // 1. VIETMAP LIVE A5 5A PROTOCOL (V221 / V222 / V22S)
     if (data[0] == 0xA5 && data[1] == 0x5A) {
         uint8_t cmd = (len >= 3) ? data[2] : 0x00;
         uint8_t sub = (len >= 4) ? data[3] : 0x00;
-        Serial.printf("  -> [VIETMAP LIVE A5 5A] CMD: 0x%02X, SUB: 0x%02X (Total %d bytes)\n", cmd, sub, len);
+        uint32_t ts = 0;
+        if (len >= 12) {
+            ts = ((uint32_t)data[8] << 24) | ((uint32_t)data[9] << 16) | ((uint32_t)data[10] << 8) | data[11];
+        }
+
+        Serial.printf("  -> [V221 A5 5A] CMD: 0x%02X, SUB: 0x%02X, TS: %u (Total %d bytes)\n", cmd, sub, ts, len);
 
         if (!pTxCharacteristic) return;
 
-        // XU LY BAT TAY & DONG BO THOI GIAN: CMD 0x37, SUB 0xC3
-        if (cmd == 0x37 && sub == 0xC3) {
-            uint32_t ts = 0;
-            if (len >= 12) {
-                ts = ((uint32_t)data[8] << 24) | ((uint32_t)data[9] << 16) | ((uint32_t)data[10] << 8) | data[11];
-            }
-            Serial.printf("  [HANDSHAKE] Nhan ma dong bo gio iPhone: %u\n", ts);
-
-            // 1. Phan hoi ACK Echo C3
-            uint8_t respC3[22];
-            memset(respC3, 0, sizeof(respC3));
-            respC3[0] = 0xA5;
-            respC3[1] = 0x5A;
-            respC3[2] = 0x37;
-            respC3[3] = 0xC3; // SubCMD C3
-            respC3[4] = 0x00;
-            respC3[5] = 0x00;
-            respC3[6] = 0x00;
-            respC3[7] = 0x0E; // 14 bytes payload
-            if (len >= 12) memcpy(&respC3[8], &data[8], 4);
-            respC3[12] = 0x00; // Status OK
-            respC3[13] = 0x00;
-            if (len >= 22) memcpy(&respC3[14], &data[14], 8);
-
-            sendSafeNotify(pTxCharacteristic, respC3, sizeof(respC3));
-            sendSafeNotify(pRxCharacteristic, respC3, sizeof(respC3));
-
-            // 2. Gui kem SubCMD 0xC4
-            respC3[3] = 0xC4;
-            sendSafeNotify(pTxCharacteristic, respC3, sizeof(respC3));
-
-            Serial.println("  [TX A5 5A] >>> Da phan hoi HANDSHAKE TIME SYNC (C3/C4) <<<");
-            return;
-        }
-
-        // XU LY TRUY VAN THONG SO THIET BI: CMD 0x37, SUB 0xC5 (Info Query 0x02)
+        // XU LY TRUY VAN THONG TIN MAY (QUERY HUD MACHINE INFO): CMD 0x37, SUB 0xC5
         if (cmd == 0x37 && sub == 0xC5) {
-            Serial.println("  [QUERY] Vietmap Live yeu cau thong tin Model & Hardware Profile (0xC5)...");
-
-            // Goi tin phan hoi Device Info Profile (18 bytes, fit 100% vao BLE MTU)
-            uint8_t devProfile[18];
-            memset(devProfile, 0, sizeof(devProfile));
-            devProfile[0] = 0xA5;
-            devProfile[1] = 0x5A;
-            devProfile[2] = 0x37;
-            devProfile[3] = 0xC5; // SubCMD C5
-            devProfile[4] = 0x00;
-            devProfile[5] = 0x00;
-            devProfile[6] = 0x00;
-            devProfile[7] = 0x0A; // 10 bytes payload
-
-            devProfile[8]  = 0x02; // Query ID: 0x02 (Device Info)
-            devProfile[9]  = 0x00; // Status: 0 = OK / SUCCESS
-            devProfile[10] = 'H';  // Model: H1N
-            devProfile[11] = '1';
-            devProfile[12] = 'N';
-            devProfile[13] = 0x01; // FW Version 1.2.0
-            devProfile[14] = 0x02;
-            devProfile[15] = 0x00;
-            // Echo request tag tu data[10], data[11]
-            devProfile[16] = (len >= 12) ? data[10] : 0x3A;
-            devProfile[17] = (len >= 12) ? data[11] : 0xA1;
-
-            // Gui voi SubCMD C5 tren ca 2 kenh TX va RX
-            sendSafeNotify(pTxCharacteristic, devProfile, sizeof(devProfile));
-            sendSafeNotify(pRxCharacteristic, devProfile, sizeof(devProfile));
-
-            // Gui voi SubCMD C6 tren ca 2 kenh
-            devProfile[3] = 0xC6;
-            sendSafeNotify(pTxCharacteristic, devProfile, sizeof(devProfile));
-            sendSafeNotify(pRxCharacteristic, devProfile, sizeof(devProfile));
-
-            // Dong thoi phan hoi goi HUD_INFO A5 va Telemetry
-            sendHudInfoPacketA5();
+            Serial.println("  [HANDSHAKE 0xC5] App yeu cau Version Info -> Gui MODEL:H1N PROTOCOL:2.2.1");
+            sendV221VersionInfo(0xC5, ts);
             delay(25);
-            sendObdTelemetryPacketA5();
-
-            Serial.println("  [TX A5 5A] >>> Da phan hoi MODEL H1N PROFILE cho C5 & C6 thanh cong! <<<");
+            sendV221HudStatus(0x01, ts);
             return;
         }
 
-        // PHAN HOI MAC DINH CHO CAC GOI TIN A5 5A KHAC
-        uint8_t genericAck[9] = {0xA5, 0x5A, cmd, sub, 0x00, 0x00, 0x00, 0x01, 0x00};
-        sendSafeNotify(pTxCharacteristic, genericAck, sizeof(genericAck));
-        Serial.printf("  [TX A5 5A] >>> Generic ACK cho CMD 0x%02X, SUB 0x%02X <<<\n", cmd, sub);
+        // XU LY DONG BO THOI GIAN (TIME SYNC / 1Hz HEARTBEAT): CMD 0x37, SUB 0xC3
+        if (cmd == 0x37 && sub == 0xC3) {
+            Serial.printf("  [TIME SYNC 0xC3] Nhan timestamp tu app: %u -> Phan hoi ACK\n", ts);
+            sendV221Ack(0x37, 0xC3, ts);
+            delay(15);
+            sendV221HudStatus(0x01, ts);
+            return;
+        }
+
+        // XU LY HEARTBEAT KEEPALIVE: CMD 0x02
+        if (len >= 13 && data[12] == 0x02) {
+            Serial.println("  [HEARTBEAT 0x02] VietMap Ping Keepalive -> Phan hoi HUD Status 0x53");
+            sendV221HudStatus(0x01, ts);
+            return;
+        }
+
+        // XU LY CANH BAO CAMERA / TOC DO / DAN DUONG
+        if (len >= 13) {
+            uint8_t subType = data[12];
+            // 0x04 = Speed Limit, 0x05 = Camera, 0x06 = Navigation
+            if (subType == 0x04 && len >= 14) {
+                currentSpeedLimit = data[13];
+                Serial.printf("  *** [CANH BAO] TOC DO GIOI HAN: %u km/h ***\n", currentSpeedLimit);
+            }
+            else if (subType == 0x05 && len >= 16) {
+                uint8_t camType = data[13];
+                lastCameraDistance = ((uint16_t)data[14] << 8) | data[15];
+                const char* cName = "Camera Phat Nguoi";
+                if (camType == 1) cName = "Camera Ban Toc Do";
+                else if (camType == 2) cName = "Camera Vuot Den Do";
+                else if (camType == 3) cName = "Camera Giam Sat Lan";
+                lastCameraAlert = String(cName);
+                Serial.printf("  *** [CANH BAO CAMERA] %s | Con: %u m ***\n", cName, lastCameraDistance);
+            }
+            else if (subType == 0x06 && len >= 16) {
+                uint8_t navAction = data[13];
+                lastNavDistance = ((uint16_t)data[14] << 8) | data[15];
+                Serial.printf("  *** [DAN DUONG] Huong: 0x%02X | Con: %u m ***\n", navAction, lastNavDistance);
+            }
+        }
+
+        // Phan hoi Generic ACK de app khong bao gio bi timeout treo ket noi
+        sendV221Ack(cmd, sub, ts);
         return;
     }
 
-    // 2. LEGACY 55 AA PROTOCOL
+    // 2. LEGACY 55 AA PROTOCOL (Fallback)
     if (data[0] == FRAME_HEADER_1 && data[1] == FRAME_HEADER_2) {
         uint8_t cmd = data[2];
-        Serial.printf("  -> [CMD 0x%02X] ", cmd);
-
         switch (cmd) {
             case CMD_HEARTBEAT:
-                Serial.println("App Heartbeat Ping -> Phan hoi ACK");
-                sendHeartbeatPacket();
+                sendLegacyHeartbeatPacket();
                 break;
             case CMD_HUD_INFO:
-                Serial.println("App yeu cau xac thuc -> Phan hoi HUD_INFO");
-                sendHudInfoPacket();
+                sendLegacyHudInfoPacket();
                 break;
             case CMD_SPEED_LIMIT:
-                if (len >= 4) {
-                    currentSpeedLimit = data[3];
-                    Serial.printf("CAP NHAT TOC DO GIOI HAN: %u km/h\n", currentSpeedLimit);
-                }
+                if (len >= 4) currentSpeedLimit = data[3];
                 break;
             case CMD_CAMERA_ALERT:
                 if (len >= 6) {
-                    uint8_t camType = data[3];
                     lastCameraDistance = (data[4] << 8) | data[5];
-                    const char* typeName = "Camera Phat Nguoi";
-                    if (camType == 1) typeName = "Camera Ban Toc Do";
-                    else if (camType == 2) typeName = "Camera Vuot Den Do";
-                    else if (camType == 3) typeName = "Camera Giam Sat Phan Lan";
-                    lastCameraAlert = String(typeName);
-                    Serial.printf("CANH BAO CAMERA: %s | Khoang cach: %u m\n", typeName, lastCameraDistance);
                 }
                 break;
             case CMD_NAVIGATION:
                 if (len >= 6) {
-                    uint8_t navAction = data[3];
                     lastNavDistance = (data[4] << 8) | data[5];
-                    Serial.printf("DIEU HUONG: Huong 0x%02X | Con %u m\n", navAction, lastNavDistance);
                 }
                 break;
             default:
-                Serial.println("Lenh VietMap khac -> Tra ve ACK");
                 uint8_t ackPkt[] = {FRAME_HEADER_1, FRAME_HEADER_2, CMD_ACK, 0x01, cmd, 0x00};
                 ackPkt[5] = calculateChecksum(ackPkt, 5);
-                if (pTxCharacteristic) {
-                    pTxCharacteristic->setValue(ackPkt, sizeof(ackPkt));
-                    pTxCharacteristic->notify();
-                    totalPacketsTx++;
-                }
+                sendSafeNotify(pTxCharacteristic, ackPkt, sizeof(ackPkt));
                 break;
-        }
-    } else {
-        uint8_t ack[] = {0xA5, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00};
-        if (pTxCharacteristic) {
-            pTxCharacteristic->setValue(ack, sizeof(ack));
-            pTxCharacteristic->notify();
-            totalPacketsTx++;
         }
     }
 }
 
 // =============================================================================
-// PACKET TRANSMITTERS (H1NewProtocol Emulator)
+// TRANSMITTER IMPLEMENTATIONS
 // =============================================================================
-void sendHudInfoPacket() {
+void sendV221VersionInfo(uint8_t reqSub, uint32_t ts) {
+    if (!deviceConnected || !pTxCharacteristic) return;
+
+    // Chuoi Version Info chuan theo giai ma Dalvik LP7/a.x
+    const char* verStr = "MODEL:H1N,HW:1.0,FW:1.0,PROTOCOL:2.2.1,OBDV:1.0_0,SID:12345678";
+    size_t strLen = strlen(verStr);
+
+    uint8_t payload[1 + strLen];
+    payload[0] = 0x0E; // Subcommand 14 (Version Info)
+    memcpy(&payload[1], verStr, strLen);
+
+    uint8_t outBuf[128];
+    size_t frameLen = buildV221Frame(0x37, reqSub, payload, sizeof(payload), ts, outBuf);
+
+    sendSafeNotify(pTxCharacteristic, outBuf, frameLen);
+    sendSafeNotify(pRxCharacteristic, outBuf, frameLen); // Gui them tren RX cho chac chan
+
+    Serial.printf("[TX V221] >>> Da gui Version Info (Len: %u, PROTOCOL: 2.2.1) <<<\n", frameLen);
+}
+
+void sendV221HudStatus(uint8_t statusByte, uint32_t ts) {
+    if (!deviceConnected || !pTxCharacteristic) return;
+
+    // Subcommand 0x53 (83): HUD Status
+    uint8_t payload[4];
+    payload[0] = 0x53; // 83
+    payload[1] = 0x15; // 21
+    payload[2] = statusByte; // 0x01 = Active/Ready
+    payload[3] = 0x00;
+
+    uint8_t outBuf[64];
+    size_t frameLen = buildV221Frame(0x37, 0x53, payload, sizeof(payload), ts, outBuf);
+
+    sendSafeNotify(pTxCharacteristic, outBuf, frameLen);
+}
+
+void sendV221ObdTelemetry(uint8_t speed, uint16_t rpm, uint8_t coolant, float voltage, uint32_t ts) {
+    if (!deviceConnected || !pTxCharacteristic) return;
+
+    // Subcommand 0x16 (22): OBD Info
+    uint8_t payload[6];
+    payload[0] = 0x16;
+    payload[1] = speed;
+    payload[2] = (rpm >> 8) & 0xFF;
+    payload[3] = rpm & 0xFF;
+    payload[4] = coolant;
+    payload[5] = (uint8_t)(voltage * 10);
+
+    uint8_t outBuf[64];
+    size_t frameLen = buildV221Frame(0x37, 0x16, payload, sizeof(payload), ts, outBuf);
+
+    sendSafeNotify(pTxCharacteristic, outBuf, frameLen);
+}
+
+void sendV221Ack(uint8_t cmd, uint8_t sub, uint32_t ts) {
+    if (!deviceConnected || !pTxCharacteristic) return;
+
+    uint8_t payload[2] = {0x00, 0x00}; // Status OK
+    uint8_t outBuf[32];
+    size_t frameLen = buildV221Frame(cmd, sub, payload, sizeof(payload), ts, outBuf);
+
+    sendSafeNotify(pTxCharacteristic, outBuf, frameLen);
+}
+
+void sendLegacyHudInfoPacket() {
     if (!deviceConnected || !pTxCharacteristic) return;
 
     uint8_t pkt[16];
     pkt[0] = FRAME_HEADER_1;
     pkt[1] = FRAME_HEADER_2;
     pkt[2] = CMD_HUD_INFO;
-    pkt[3] = 0x0A; // Payload Length: 10 bytes
-    
-    // Model "H1N"
+    pkt[3] = 0x0A;
     pkt[4] = 'H';
     pkt[5] = '1';
     pkt[6] = 'N';
-    
-    // Firmware v1.2.0
     pkt[7] = 0x01;
     pkt[8] = 0x02;
     pkt[9] = 0x00;
-    
-    // Battery Voltage: 13.8V (138 in deci-volts)
     pkt[10] = 0x00;
     pkt[11] = 138;
-    
-    // Device Status Flags: Bit 0 = OBD Connected, Bit 1 = GPS Ready, Bit 2 = Pro Licensed
     pkt[12] = 0x07;
     pkt[13] = 0x00;
-    
-    // Checksum
     pkt[14] = calculateChecksum(pkt, 14);
 
-    pTxCharacteristic->setValue(pkt, 15);
-    pTxCharacteristic->notify();
-    totalPacketsTx++;
-
-    Serial.println("[TX] >>> Đã gửi gói tin HUD_INFO (Model: H1N, FW: 1.2.0, OBD: Ready) <<<");
+    sendSafeNotify(pTxCharacteristic, pkt, 15);
 }
 
-void sendHeartbeatPacket() {
+void sendLegacyHeartbeatPacket() {
     if (!deviceConnected || !pTxCharacteristic) return;
 
     uint8_t pkt[8];
     pkt[0] = FRAME_HEADER_1;
     pkt[1] = FRAME_HEADER_2;
     pkt[2] = CMD_HEARTBEAT;
-    pkt[3] = 0x02; // Len
+    pkt[3] = 0x02;
     pkt[4] = currentSpeed;
-    pkt[5] = 0x01; // Link alive flag
+    pkt[5] = 0x01;
     pkt[6] = calculateChecksum(pkt, 6);
 
-    pTxCharacteristic->setValue(pkt, 7);
-    pTxCharacteristic->notify();
-    totalPacketsTx++;
+    sendSafeNotify(pTxCharacteristic, pkt, 7);
 }
 
-void sendObdTelemetryPacket() {
+void sendLegacyObdTelemetryPacket() {
     if (!deviceConnected || !pTxCharacteristic) return;
 
     uint8_t pkt[12];
     pkt[0] = FRAME_HEADER_1;
     pkt[1] = FRAME_HEADER_2;
     pkt[2] = CMD_OBD_TELEMETRY;
-    pkt[3] = 0x06; // Len
+    pkt[3] = 0x06;
     pkt[4] = currentSpeed;
     pkt[5] = (currentRpm >> 8) & 0xFF;
     pkt[6] = currentRpm & 0xFF;
     pkt[7] = currentCoolantTemp;
     pkt[8] = (uint8_t)(batteryVoltage * 10);
-    pkt[9] = 0x00; // Reserved
+    pkt[9] = 0x00;
     pkt[10] = calculateChecksum(pkt, 10);
 
-    pTxCharacteristic->setValue(pkt, 11);
-    pTxCharacteristic->notify();
-    totalPacketsTx++;
+    sendSafeNotify(pTxCharacteristic, pkt, 11);
 }
 
 // =============================================================================
-// SERIAL CLI (Tương tác trực tiếp trên PC qua COM11)
+// SERIAL CLI
 // =============================================================================
 void handleSerialCLI() {
     if (!Serial.available()) return;
@@ -401,26 +484,26 @@ void handleSerialCLI() {
     if (line.length() == 0) return;
 
     if (line.equalsIgnoreCase("help")) {
-        Serial.println("\n========== VIETMAP HUD CLONE - DANH SÁCH LỆNH ==========");
-        Serial.println("  status       : Xem trạng thái kết nối BLE & thông số hiện tại");
-        Serial.println("  speed <kmh>  : Giả lập vận tốc xe (Ví dụ: speed 60)");
-        Serial.println("  info         : Phát lại gói tin HUD_INFO để kích hoạt Pro");
-        Serial.println("  ping         : Gửi ngay nhịp tim Heartbeat");
-        Serial.println("  obd          : Gửi thông số OBD (RPM, Nhiệt độ, Bình ắc quy)");
-        Serial.println("  limit <kmh>  : Thiết lập giới hạn tốc độ (Ví dụ: limit 80)");
+        Serial.println("\n========== VIETMAP HUD CLONE - DANH SACH LENH ==========");
+        Serial.println("  status       : Xem trang thai ket noi BLE & thong so");
+        Serial.println("  speed <kmh>  : Gia lap van toc xe (Vi du: speed 60)");
+        Serial.println("  info         : Phat lai goi tin V221 Version Info");
+        Serial.println("  ping         : Gui goi tin HUD Status 0x53 Keepalive");
+        Serial.println("  obd          : Gui thong so OBD (RPM, Nuoc, Binh ac quy)");
+        Serial.println("  limit <kmh>  : Thiet lap gioi han toc do (Vi du: limit 80)");
         Serial.println("========================================================\n");
     }
     else if (line.equalsIgnoreCase("status")) {
-        Serial.println("\n----------------- TRẠNG THÁI HIỆN TẠI -----------------");
-        Serial.printf("  Kết nối BLE       : %s\n", deviceConnected ? "ĐÃ KẾT NỐI (CONNECTED)" : "ĐANG CHỜ KẾT NỐI (ADVERTISING)");
-        Serial.printf("  Tên thiết bị      : %s\n", DEVICE_NAME);
-        Serial.printf("  Gói tin nhận (RX) : %u\n", totalPacketsRx);
-        Serial.printf("  Gói tin gửi (TX)  : %u\n", totalPacketsTx);
-        Serial.printf("  Vận tốc giả lập   : %u km/h\n", currentSpeed);
-        Serial.printf("  Tốc độ giới hạn   : %u km/h\n", currentSpeedLimit);
-        Serial.printf("  Cảnh báo Camera   : %s (%u m)\n", lastCameraAlert.c_str(), lastCameraDistance);
-        Serial.printf("  Điều hướng ngã rẽ : %s (%u m)\n", lastNavDirection.c_str(), lastNavDistance);
-        Serial.printf("  Điện áp ắc quy    : %.1f V | Nhiệt độ nước: %d °C\n", batteryVoltage, currentCoolantTemp);
+        Serial.println("\n----------------- TRANG THAI HIEN TAI -----------------");
+        Serial.printf("  Ket noi BLE       : %s\n", deviceConnected ? "DA KET NOI (CONNECTED)" : "DANG CHO KET NOI (ADVERTISING)");
+        Serial.printf("  Ten thiet bi      : %s\n", DEVICE_NAME);
+        Serial.printf("  Goi tin nhan (RX) : %u\n", totalPacketsRx);
+        Serial.printf("  Goi tin gui (TX)  : %u\n", totalPacketsTx);
+        Serial.printf("  Van toc gia lap   : %u km/h\n", currentSpeed);
+        Serial.printf("  Toc do gioi han   : %u km/h\n", currentSpeedLimit);
+        Serial.printf("  Canh bao Camera   : %s (%u m)\n", lastCameraAlert.c_str(), lastCameraDistance);
+        Serial.printf("  Dieu huong nga re : %s (%u m)\n", lastNavDirection.c_str(), lastNavDistance);
+        Serial.printf("  Dien ap ac quy    : %.1f V | Nhiet do nuoc: %d deg C\n", batteryVoltage, currentCoolantTemp);
         Serial.println("-------------------------------------------------------\n");
     }
     else if (line.startsWith("speed ")) {
@@ -428,40 +511,30 @@ void handleSerialCLI() {
         if (sp >= 0 && sp <= 250) {
             currentSpeed = sp;
             currentRpm = (sp == 0) ? 800 : (1200 + sp * 25);
-            Serial.printf("✅ Đã cập nhật vận tốc xe: %u km/h (RPM: %u)\n", currentSpeed, currentRpm);
-            sendObdTelemetryPacket();
+            Serial.printf("Da cap nhat van toc xe: %u km/h (RPM: %u)\n", currentSpeed, currentRpm);
+            sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage);
         }
     }
     else if (line.equalsIgnoreCase("info")) {
-        sendHudInfoPacket();
+        sendV221VersionInfo(0xC5);
+        Serial.println("Da phat lai goi tin V221 Version Info.");
     }
     else if (line.equalsIgnoreCase("ping")) {
-        sendHeartbeatPacket();
-        Serial.println("✅ Đã gửi nhịp tim Keepalive.");
+        sendV221HudStatus();
+        Serial.println("Da gui nhip tim HUD Status Keepalive.");
     }
     else if (line.equalsIgnoreCase("obd")) {
-        sendObdTelemetryPacket();
-        Serial.println("✅ Đã phát gói tin OBD Telemetry.");
-    }
-        else if (line.startsWith("name ")) {
-        String newName = line.substring(5);
-        newName.trim();
-        if (newName.length() > 0 && newName.length() <= 16) {
-            Serial.printf("✅ Đổi tên Bluetooth thành: \"%s\"\n", newName.c_str());
-            startRawAdvertising(newName.c_str());
-        }
+        sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage);
+        Serial.println("Da phat goi tin OBD Telemetry.");
     }
     else if (line.startsWith("limit ")) {
         currentSpeedLimit = line.substring(6).toInt();
-        Serial.printf("✅ Đã cập nhật giới hạn tốc độ: %u km/h\n", currentSpeedLimit);
-    }
-    else {
-        Serial.printf("Lệnh không hợp lệ: \"%s\". Gõ 'help' để xem danh sách lệnh.\n", line.c_str());
+        Serial.printf("Da cap nhat gioi han toc do: %u km/h\n", currentSpeedLimit);
     }
 }
 
 // =============================================================================
-// RAW ADVERTISING (adv data -> scan rsp -> start, sequenced by GAP events)
+// RAW ADVERTISING
 // =============================================================================
 static uint8_t rawAdvData[31];
 static uint8_t rawAdvDataLen = 0;
@@ -490,7 +563,7 @@ void startRawAdvertising(const char* name) {
     }
     advDataSet = scanRspSet = false;
 
-    // 1. Build rawAdvData (Flags + 16-bit UUID + Name)
+    // 1. rawAdvData (Flags + 16-bit UUID 0xFFF0 + Name)
     rawAdvDataLen = 0;
     rawAdvData[rawAdvDataLen++] = 0x02;
     rawAdvData[rawAdvDataLen++] = 0x01;
@@ -509,7 +582,7 @@ void startRawAdvertising(const char* name) {
         rawAdvDataLen += nlen;
     }
 
-    // 2. Build rawScanRespData (128-bit UUID + Name)
+    // 2. rawScanRespData (128-bit UUID + Name)
     rawScanRespDataLen = 0;
     rawScanRespData[rawScanRespDataLen++] = 0x11;
     rawScanRespData[rawScanRespDataLen++] = 0x07; // Complete 128-bit Service UUID
@@ -525,29 +598,23 @@ void startRawAdvertising(const char* name) {
     }
 
     esp_ble_gap_set_device_name(currentDevName);
-    esp_err_t err = esp_ble_gap_config_adv_data_raw(rawAdvData, rawAdvDataLen);
-    if (err != ESP_OK) Serial.printf("[BLE] LOI config_adv_data_raw: %s\n", esp_err_to_name(err));
-    err = esp_ble_gap_config_scan_rsp_data_raw(rawScanRespData, rawScanRespDataLen);
-    if (err != ESP_OK) Serial.printf("[BLE] LOI config_scan_rsp_data_raw: %s\n", esp_err_to_name(err));
+    esp_ble_gap_config_adv_data_raw(rawAdvData, rawAdvDataLen);
+    esp_ble_gap_config_scan_rsp_data_raw(rawScanRespData, rawScanRespDataLen);
 }
 
 void onGapEvent(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
     switch (event) {
         case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
-            if (param->adv_data_raw_cmpl.status != ESP_BT_STATUS_SUCCESS)
-                Serial.printf("[BLE] Adv data bi tu choi (status %d)\n", param->adv_data_raw_cmpl.status);
             advDataSet = true;
             if (scanRspSet) beginAdvertisingNow();
             break;
         case ESP_GAP_BLE_SCAN_RSP_DATA_RAW_SET_COMPLETE_EVT:
-            if (param->scan_rsp_data_raw_cmpl.status != ESP_BT_STATUS_SUCCESS)
-                Serial.printf("[BLE] Scan response bi tu choi (status %d)\n", param->scan_rsp_data_raw_cmpl.status);
             scanRspSet = true;
             if (advDataSet) beginAdvertisingNow();
             break;
         case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
             advertising = (param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS);
-            Serial.printf("[BLE] Advertising %s (status %d)\n", advertising ? "DA BAT" : "THAT BAI", param->adv_start_cmpl.status);
+            Serial.printf("[BLE] Advertising %s\n", advertising ? "DA BAT (READY)" : "THAT BAI");
             break;
         case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
             advertising = false;
@@ -555,84 +622,6 @@ void onGapEvent(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
         default:
             break;
     }
-}
-
-
-// =============================================================================
-// VIETMAP LIVE A5 5A PROTOCOL PACKET TRANSMITTERS
-// =============================================================================
-void sendHudInfoPacketA5() {
-    if (!deviceConnected || !pTxCharacteristic) return;
-
-    uint8_t pkt[20];
-    pkt[0] = 0xA5;
-    pkt[1] = 0x5A;
-    pkt[2] = 0x02; // CMD_HUD_INFO
-    pkt[3] = 0x00; // SEQ
-    pkt[4] = 0x00;
-    pkt[5] = 0x00;
-    pkt[6] = 0x00;
-    pkt[7] = 0x0A; // Payload len = 10 bytes
-
-    pkt[8]  = 'H';
-    pkt[9]  = '1';
-    pkt[10] = 'N';
-    pkt[11] = 0x01; // FW 1.2.0
-    pkt[12] = 0x02;
-    pkt[13] = 0x00;
-    pkt[14] = 0x00;
-    pkt[15] = 138;  // 13.8V
-    pkt[16] = 0x07; // Status: Bit0=OBD, Bit1=GPS, Bit2=Pro Active
-    pkt[17] = 0x00;
-
-    pTxCharacteristic->setValue(pkt, 18);
-    pTxCharacteristic->notify();
-    totalPacketsTx++;
-    Serial.println("[TX A5 5A] >>> Da phan hoi HUD_INFO A5 5A (Model: H1N, Pro Licensed) <<<");
-}
-
-void sendHeartbeatPacketA5() {
-    if (!deviceConnected || !pTxCharacteristic) return;
-
-    uint8_t pkt[12];
-    pkt[0] = 0xA5;
-    pkt[1] = 0x5A;
-    pkt[2] = 0x01; // CMD_HEARTBEAT
-    pkt[3] = 0x00;
-    pkt[4] = 0x00;
-    pkt[5] = 0x00;
-    pkt[6] = 0x00;
-    pkt[7] = 0x02;
-    pkt[8] = currentSpeed;
-    pkt[9] = 0x01; // Link alive
-
-    pTxCharacteristic->setValue(pkt, 10);
-    pTxCharacteristic->notify();
-    totalPacketsTx++;
-}
-
-void sendObdTelemetryPacketA5() {
-    if (!deviceConnected || !pTxCharacteristic) return;
-
-    uint8_t pkt[16];
-    pkt[0] = 0xA5;
-    pkt[1] = 0x5A;
-    pkt[2] = 0x03; // CMD_OBD_TELEMETRY
-    pkt[3] = 0x00;
-    pkt[4] = 0x00;
-    pkt[5] = 0x00;
-    pkt[6] = 0x00;
-    pkt[7] = 0x06;
-    pkt[8] = currentSpeed;
-    pkt[9] = (currentRpm >> 8) & 0xFF;
-    pkt[10] = currentRpm & 0xFF;
-    pkt[11] = currentCoolantTemp;
-    pkt[12] = (uint8_t)(batteryVoltage * 10);
-    pkt[13] = 0x00;
-
-    pTxCharacteristic->setValue(pkt, 14);
-    pTxCharacteristic->notify();
-    totalPacketsTx++;
 }
 
 // =============================================================================
@@ -644,11 +633,11 @@ void setup() {
 
     Serial.println("\n");
     Serial.println("*****************************************************************");
-    Serial.println("*      VIETMAP HUD HARDWARE CLONE & BLE EMULATOR (ESP32-S3)     *");
-    Serial.println("*          Giả lập thiết bị phần cứng VietMap H1N / H2AS        *");
-    Serial.println("*     Duy trì và Kích hoạt VietMap Live Pro khi test tại bàn     *");
+    Serial.println("*      VIETMAP HUD V221 CLONE & BLE EMULATOR (ESP32-S3)         *");
+    Serial.println("*      Model: H1N / H2AS | Protocol: 2.2.1 | Key C Security     *");
+    Serial.println("*      Duy tri lien tuc ket noi VietMap Live & Kich hoat Pro    *");
     Serial.println("*****************************************************************");
-    Serial.printf("[SETUP] Khởi tạo Bluetooth BLE với tên: %s\n", DEVICE_NAME);
+    Serial.printf("[SETUP] Khoi tao Bluetooth BLE voi ten: %s\n", DEVICE_NAME);
 
     BLEDevice::init(DEVICE_NAME);
     BLEDevice::setMTU(517);
@@ -658,7 +647,6 @@ void setup() {
 
     BLEService* pService = pServer->createService(BLEUUID(SERVICE_UUID));
 
-    // Enable FULL Read, Write, Notify, Indicate tren tat ca dac tinh de iOS ket noi tron tru
     pTxCharacteristic = pService->createCharacteristic(
         BLEUUID(CHAR_TX_UUID),
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
@@ -689,27 +677,30 @@ void setup() {
     BLEDevice::setCustomGapHandler(onGapEvent);
     Serial.printf("[SETUP] Dia chi MAC BLE: %s\n", BLEDevice::getAddress().toString().c_str());
     startRawAdvertising();
-    Serial.println("[SETUP] ✅ BLE GATT Server đã sẵn sàng và đang phát quảng bá (Advertising)!");
-    Serial.println("[SETUP] 👉 BẬT BLUETOOTH TRÊN MÁY TÍNH BẢNG VÀ MỞ VIETMAP LIVE ĐỂ KẾT NỐI!");
-    Serial.println("[SETUP] Gõ 'help' trên cổng COM11 để xem các lệnh điều khiển.\n");
+    Serial.println("[SETUP] BLE GATT Server da san sang va dang phat quang ba (Advertising)!");
+    Serial.println("[SETUP] MO APP VIETMAP LIVE TREN DIEN THOAI / MAY TINH BANG DE KET NOI!");
+    Serial.println("[SETUP] Go 'help' de xem danh sach lenh dieu khien.\n");
 }
 
 void loop() {
     uint32_t now = millis();
 
-        if (deviceConnected) {
-        if (now - lastHeartbeatMs >= 1500) {
+    // DUY TRI KET NOI KHONG NGAT (CONNECTION SUPERVISOR):
+    // Gui nhan nhip tim va du lieu xe moi 1000ms
+    if (deviceConnected) {
+        if (now - lastHeartbeatMs >= 1000) {
             lastHeartbeatMs = now;
-            sendHeartbeatPacket();
-            sendHeartbeatPacketA5();
-            sendObdTelemetryPacketA5();
+            sendV221HudStatus(0x01, (uint32_t)(now / 1000));
+            sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage, (uint32_t)(now / 1000));
+            sendLegacyHeartbeatPacket();
         }
     }
 
+    // Tu dong khoi phuc Advertising neu mat ket noi
     if (!deviceConnected && oldDeviceConnected) {
         delay(500);
         startRawAdvertising();
-        Serial.println("[BLE] Dang tiep tuc quang ba RAW (Advertising) cho thiet bi ket noi lai...");
+        Serial.println("[BLE] Dang tiep tuc quang ba (Advertising) cho ket noi moi...");
         oldDeviceConnected = deviceConnected;
     }
 
@@ -720,12 +711,12 @@ void loop() {
     static uint32_t lastAdvLogMs = 0;
     if (!deviceConnected && now - lastAdvLogMs >= 5000) {
         lastAdvLogMs = now;
-        Serial.printf("[BLE] %s | ten H1N | MAC %s\n",
+        Serial.printf("[BLE] %s | Ten %s | MAC %s\n",
                       advertising ? "Dang phat quang ba, cho ket noi..." : "KHONG phat quang ba!",
+                      DEVICE_NAME,
                       BLEDevice::getAddress().toString().c_str());
     }
 
     handleSerialCLI();
-
-    delay(20);
+    delay(15);
 }
