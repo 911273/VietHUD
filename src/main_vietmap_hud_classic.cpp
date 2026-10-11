@@ -1,15 +1,15 @@
 /**
  * @file main_vietmap_hud_classic.cpp
- * @brief VietMap Hardware HUD Clone for ESP32 Classic (Dedicated Pure BLE Mode)
+ * @brief VietMap Hardware HUD Clone for ESP32 Classic (NodeMCU-32S on COM14)
  * 
- * Target Hardware: ESP32 Classic (NodeMCU-32S, ESP32-WROOM-32 on COM14)
- * Solves "Dang ket noi..." on iPhone (iOS):
- *   1. Auto-Chunking for all BLE Notifications: Slices frames > 20 bytes into 20-byte chunks
- *      preventing ESP-IDF BLE stack from dropping/truncating packets on default iOS ATT MTU (23).
- *   2. Updates Peer MTU to 185 in onConnect.
- *   3. Accurate 8-byte token echo in Time Sync (Cmd 0x37 Sub 0xC3).
- *   4. Full V2.2.1 Version Info (Cmd 0x37 Sub 0xC5) + Legacy HUD_INFO (0x55 0xAA 0x02) with H1AS Pro License.
- *   5. Robust stream framing parser preventing desync.
+ * Target Hardware: ESP32 Classic (ESP32-WROOM-32 / NodeMCU-32S on COM14)
+ * Fully aligned with proven VietMap V221 Protocol:
+ *   1. Full V2.2.1 frame hashing with MD5 (buildV221Frame).
+ *   2. Responds to 0x37 0xC3 with sendV221Ack + sendV221HudStatus.
+ *   3. Responds to 0x37 0xC5 with sendV221VersionInfo + sendV221HudStatus.
+ *   4. Multi-Characteristic notify (FFF1 + FFF2) with BLE2902 on all chars.
+ *   5. BLESecurity Just Works auto-bonding for iOS CoreBluetooth.
+ *   6. Single unfragmented frame transmission.
  */
 
 #include <Arduino.h>
@@ -32,6 +32,10 @@
 #define CHAR_CFG_UUID       "0000fff3-0000-1000-8000-00805f9b34fb" // Config Read/Write
 #define CHAR_AUX_UUID       "0000fff4-0000-1000-8000-00805f9b34fb" // Aux Notify
 
+// Frame Header Constants
+#define FRAME_HEADER_1      0x55
+#define FRAME_HEADER_2      0xAA
+
 static const uint8_t KEY_C[16] = {
     0xF7, 0xF8, 0x15, 0x75, 0x02, 0xDA, 0x52, 0x8E, 
     0xF0, 0xFC, 0x31, 0x39, 0x72, 0x2C, 0xE9, 0xE2
@@ -47,7 +51,6 @@ bool bleConnected = false;
 bool handshakeCompleted = false;
 bool pendingBleHandshake = false;
 uint32_t bleConnectTime = 0;
-uint16_t activeConnId = 0;
 
 uint32_t lastHeartbeatMs = 0;
 uint32_t lastAdvLogMs = 0;
@@ -64,33 +67,46 @@ static uint8_t bleRxBuf[1024];
 static size_t bleRxLen = 0;
 
 // =============================================================================
-// SAFE CHUNKED NOTIFY (Solves iOS MTU=23 Drop Issue)
+// BLE SECURITY CALLBACKS (iOS Auto Just Works Pairing)
 // =============================================================================
-void sendNotify(const uint8_t* data, size_t len) {
-    if (!bleConnected || pTxCharacteristic == nullptr) return;
-
-    // iOS CoreBluetooth defaults to ATT MTU = 23 (max notification payload = 20 bytes).
-    // If packet > 20 bytes, slice into 20-byte chunks so ESP-IDF never truncates or drops!
-    size_t offset = 0;
-    while (offset < len) {
-        size_t chunkSize = len - offset;
-        if (chunkSize > 20) {
-            chunkSize = 20;
-        }
-
-        pTxCharacteristic->setValue((uint8_t*)(data + offset), chunkSize);
-        pTxCharacteristic->notify();
-
-        offset += chunkSize;
-        if (offset < len) {
-            delay(12); // Short delay to allow radio to push packet into BLE ring buffer
+class VietMapSecurityCallbacks : public BLESecurityCallbacks {
+    uint32_t onPassKeyRequest() override {
+        Serial.println("[BLE-SEC] PassKey request -> 0");
+        return 0;
+    }
+    void onPassKeyNotify(uint32_t pass_key) override {
+        Serial.printf("[BLE-SEC] PassKey: %d\n", pass_key);
+    }
+    bool onConfirmPIN(uint32_t pass_key) override {
+        Serial.println("[BLE-SEC] Confirm PIN -> Auto Accept");
+        return true;
+    }
+    bool onSecurityRequest() override {
+        Serial.println("[BLE-SEC] Security Request from iPhone -> Auto Accept");
+        return true;
+    }
+    void onAuthenticationComplete(esp_ble_auth_cmpl_t auth_cmpl) override {
+        if (auth_cmpl.success) {
+            Serial.println("[BLE-SEC] === PAIRING / BONDING WITH IPHONE THANH CONG! ===");
+        } else {
+            Serial.printf("[BLE-SEC] Auth failed: 0x%02X\n", auth_cmpl.fail_reason);
         }
     }
+};
+
+// =============================================================================
+// SAFE NOTIFY (Dual-Char Tx FFF1 + Rx FFF2)
+// =============================================================================
+void sendSafeNotify(BLECharacteristic* pChar, const uint8_t* data, size_t len) {
+    if (!pChar || !bleConnected) return;
+    pChar->setValue((uint8_t*)data, len);
+    pChar->notify();
     totalPacketsTx++;
+    delay(15);
 }
 
 // =============================================================================
-// V221 FRAME BUILDER
+// V221 FRAME BUILDER (MD5 HashSum)
 // =============================================================================
 uint32_t calculateV221HashSum(const uint8_t* rawData, size_t rawLen, const uint8_t* key16) {
     size_t totalHashLen = rawLen + 16;
@@ -162,71 +178,44 @@ size_t buildV221Frame(uint8_t cmd, uint8_t sub, const uint8_t* payload, size_t p
 }
 
 // =============================================================================
-// PROTOCOL RESPONDERS
+// PROTOCOL RESPONDERS (Dual-Notify on FFF1 and FFF2)
 // =============================================================================
 
-// 1. Time Sync ACK with matching token echo
-void sendTimeSyncAck(uint32_t ts, const uint8_t* reqTail) {
-    uint8_t outBuf[22];
-    outBuf[0] = 0xA5;
-    outBuf[1] = 0x5A;
-    outBuf[2] = 0x37;
-    outBuf[3] = 0xC3;
-    outBuf[4] = 0x00;
-    outBuf[5] = 0x00;
-    outBuf[6] = 0x00;
-    outBuf[7] = 0x0E; // DataLen = 14
-
-    outBuf[8]  = (ts >> 24) & 0xFF;
-    outBuf[9]  = (ts >> 16) & 0xFF;
-    outBuf[10] = (ts >> 8) & 0xFF;
-    outBuf[11] = ts & 0xFF;
-
-    outBuf[12] = 0x00; // Success
-    outBuf[13] = 0x00;
-
-    if (reqTail != nullptr) {
-        memcpy(&outBuf[14], reqTail, 8); // Echo exact 8-byte token
-    } else {
-        memset(&outBuf[14], 0, 8);
-    }
-
-    sendNotify(outBuf, 22);
-    Serial.printf("[TX V221] ACK Time Sync (TS: %u, Len: 22)\n", ts);
-}
-
-// 2. Generic V2.2.1 ACK
+// 1. Generic V2.2.1 ACK (for Time Sync 0x37 0xC3 and other commands)
 void sendV221Ack(uint8_t cmd, uint8_t sub, uint32_t ts) {
-    uint8_t ackPayload[2] = { 0x00, 0x00 };
+    uint8_t payload[2] = { 0x00, 0x00 };
     uint8_t outBuf[32];
-    size_t len = buildV221Frame(cmd, sub, ackPayload, 2, ts, outBuf);
-    sendNotify(outBuf, len);
+    size_t len = buildV221Frame(cmd, sub, payload, sizeof(payload), ts, outBuf);
+    sendSafeNotify(pTxCharacteristic, outBuf, len);
+    sendSafeNotify(pRxCharacteristic, outBuf, len);
+    Serial.printf("[TX V221] ACK (Cmd: 0x%02X, Sub: 0x%02X, TS: %u, Len: %d)\n", cmd, sub, ts, len);
 }
 
-// 3. Version Info V2.2.1
+// 2. Version Info V2.2.1 (for Version Query 0x37 0xC5)
 void sendV221VersionInfo(uint8_t reqSub, uint32_t ts) {
     const char* verStr = "MODEL:H1AS,HW:1.0,FW:1.0,PROTOCOL:2.2.1,OBDV:1.0_0,SID:12345678";
     size_t strLen = strlen(verStr);
 
     uint8_t payload[1 + strLen];
-    payload[0] = 0x0E;
+    payload[0] = 0x0E; // Subcommand 14 (Version Info)
     memcpy(&payload[1], verStr, strLen);
 
     uint8_t outBuf[128];
     size_t len = buildV221Frame(0x37, reqSub, payload, sizeof(payload), ts, outBuf);
-    sendNotify(outBuf, len);
-    Serial.printf("[TX V221] Version Info -> %s\n", verStr);
+    sendSafeNotify(pTxCharacteristic, outBuf, len);
+    sendSafeNotify(pRxCharacteristic, outBuf, len);
+    Serial.printf("[TX V221] Version Info -> %s (Len: %d)\n", verStr, len);
 }
 
-// 4. HUD Status V2.2.1
+// 3. HUD Status V2.2.1 (0x37 0x53 Keepalive)
 void sendV221HudStatus(uint8_t statusByte, uint32_t ts) {
     uint8_t payload[4] = { 0x53, 0x15, statusByte, 0x00 };
     uint8_t outBuf[64];
     size_t len = buildV221Frame(0x37, 0x53, payload, sizeof(payload), ts, outBuf);
-    sendNotify(outBuf, len);
+    sendSafeNotify(pTxCharacteristic, outBuf, len);
 }
 
-// 5. OBD Telemetry V2.2.1
+// 4. OBD Telemetry V2.2.1
 void sendV221ObdTelemetry(uint8_t spd, uint16_t rpm, uint8_t coolant, float volt, uint32_t ts = 0) {
     if (ts == 0) ts = (uint32_t)(millis() / 1000);
     uint8_t payload[6];
@@ -239,10 +228,10 @@ void sendV221ObdTelemetry(uint8_t spd, uint16_t rpm, uint8_t coolant, float volt
 
     uint8_t outBuf[64];
     size_t len = buildV221Frame(0x37, 0x16, payload, sizeof(payload), ts, outBuf);
-    sendNotify(outBuf, len);
+    sendSafeNotify(pTxCharacteristic, outBuf, len);
 }
 
-// 6. OEM Legacy HUD_INFO (0x55 0xAA 0x02 - Kich hoat VietMap Live Pro)
+// 5. OEM Legacy HUD_INFO (0x55 0xAA 0x02)
 void sendLegacyHudInfoPacket() {
     uint8_t pkt[15];
     pkt[0] = 0x55;
@@ -264,29 +253,13 @@ void sendLegacyHudInfoPacket() {
     for (int i = 0; i < 14; i++) sum += pkt[i];
     pkt[14] = sum;
 
-    sendNotify(pkt, 15);
-    Serial.println("[TX LEGACY] HUD_INFO (Model: H1AS, Pro License: ACTIVATED)");
+    sendSafeNotify(pTxCharacteristic, pkt, 15);
+    Serial.println("[TX LEGACY] HUD_INFO (H1AS Pro Active)");
 }
 
 void sendLegacyHeartbeatPacket() {
     uint8_t pkt[] = { 0x55, 0xAA, 0x01, 0x01, 0x01, 0x00, 0x03 };
-    sendNotify(pkt, sizeof(pkt));
-}
-
-void triggerHudHandshake() {
-    uint32_t ts = (uint32_t)(millis() / 1000);
-    Serial.println("\n[HANDSHAKE] >>> Kich hoat toan bo chuoi dinh danh HUD... <<<");
-    delay(30);
-    sendLegacyHudInfoPacket();
-    delay(25);
-    sendV221VersionInfo(0xC5, ts);
-    delay(25);
-    sendV221HudStatus(0x01, ts);
-    delay(25);
-    sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage, ts);
-    handshakeCompleted = true;
-    digitalWrite(LED_BUILTIN, HIGH);
-    Serial.println("[HANDSHAKE] >>> Hoan tat! VietMap Live sang trang thai DA KET NOI! <<<\n");
+    sendSafeNotify(pTxCharacteristic, pkt, sizeof(pkt));
 }
 
 // =============================================================================
@@ -306,29 +279,24 @@ void processIncomingPacket(const uint8_t* data, size_t len) {
         uint8_t sub = data[3];
         uint32_t ts = (len >= 12) ? (((uint32_t)data[8] << 24) | ((uint32_t)data[9] << 16) | ((uint32_t)data[10] << 8) | data[11]) : (uint32_t)(millis() / 1000);
 
-        // Sub 0xC3: Time Sync (App gui 22 bytes, chua token 8 byte o cuoi)
+        // Sub 0xC3: Time Sync -> Reply standard V221 ACK + HUD Status
         if (cmd == 0x37 && sub == 0xC3) {
-            const uint8_t* reqTail = (len >= 22) ? &data[14] : nullptr;
-            Serial.printf("  >>> [APP TIME SYNC 0xC3] Dong bo TS=%u -> Tra loi ACK Echo + HUD Info...\n", ts);
-            sendTimeSyncAck(ts, reqTail);
-            delay(15);
-            sendLegacyHudInfoPacket();
-            delay(15);
-            sendV221VersionInfo(0xC5, ts);
+            Serial.printf("  >>> [APP TIME SYNC 0xC3] TS=%u -> Tra loi V221 ACK + Status...\n", ts);
+            sendV221Ack(0x37, 0xC3, ts);
             delay(15);
             sendV221HudStatus(0x01, ts);
+            delay(15);
+            sendV221VersionInfo(0xC5, ts);
             handshakeCompleted = true;
             digitalWrite(LED_BUILTIN, HIGH);
             return;
         }
 
-        // Sub 0xC5: Version Query
+        // Sub 0xC5: Version Query -> Reply Version Info + Status
         if (cmd == 0x37 && sub == 0xC5) {
-            Serial.println("  >>> [APP HOI VERSION 0xC5] Tra loi Version Info + HUD Info...");
+            Serial.println("  >>> [APP HOI VERSION 0xC5] Tra loi Version Info + Status...");
             sendV221VersionInfo(0xC5, ts);
-            delay(20);
-            sendLegacyHudInfoPacket();
-            delay(20);
+            delay(15);
             sendV221HudStatus(0x01, ts);
             handshakeCompleted = true;
             digitalWrite(LED_BUILTIN, HIGH);
@@ -399,13 +367,8 @@ class MyBleServerCallbacks : public BLEServerCallbacks {
         bleConnected = true;
         pendingBleHandshake = true;
         bleConnectTime = millis();
-        activeConnId = pServer->getConnId();
-
-        // Update peer MTU to 185 so ESP-IDF allows large notifications without truncating
-        pServer->updatePeerMTU(activeConnId, 185);
-
         Serial.println("\n********************************************************");
-        Serial.printf(">>> [BLE] IPHONE DA KET NOI BLE GATT (ConnId: %u)! <<<\n", activeConnId);
+        Serial.println(">>> [BLE] IPHONE DA KET NOI BLE GATT THANH CONG! <<<");
         Serial.println("********************************************************");
     }
 
@@ -452,8 +415,8 @@ void startFastAdvertising() {
     scanData.setCompleteServices(BLEUUID(SERVICE_UUID));
     pAdvertising->setScanResponseData(scanData);
 
-    pAdvertising->setMinPreferred(0x06);
-    pAdvertising->setMaxPreferred(0x12);
+    pAdvertising->setMinPreferred(0x06); // 7.5ms
+    pAdvertising->setMaxPreferred(0x12); // 22.5ms
 
     pAdvertising->start();
 }
@@ -466,13 +429,23 @@ void setup() {
 
     Serial.println("\n");
     Serial.println("=================================================================");
-    Serial.println("*    VIETMAP HUD DEDICATED PURE BLE EMULATOR (ESP32 CLASSIC)    *");
-    Serial.println("*    Version 2.9: Chunked 20B Notify + MTU 185 + Auto-Handshake *");
+    Serial.println("*    VIETMAP HUD V221 CLONE FOR ESP32 CLASSIC (COM14)           *");
+    Serial.println("*    Version 3.0: Full V221 MD5 Frames + iOS BLE Security       *");
     Serial.println("=================================================================");
 
     BLEDevice::init(DEVICE_NAME);
     BLEDevice::setPower(ESP_PWR_LVL_P9);
     BLEDevice::setMTU(517);
+
+    // iOS Security / Pairing
+    BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
+    BLEDevice::setSecurityCallbacks(new VietMapSecurityCallbacks());
+
+    BLESecurity* pSecurity = new BLESecurity();
+    pSecurity->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
+    pSecurity->setCapability(ESP_IO_CAP_NONE);
+    pSecurity->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+    pSecurity->setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
 
     pBleServer = BLEDevice::createServer();
     pBleServer->setCallbacks(new MyBleServerCallbacks());
@@ -482,29 +455,31 @@ void setup() {
     // FFF1: TX Notify
     pTxCharacteristic = pService->createCharacteristic(
         CHAR_TX_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
     );
     pTxCharacteristic->addDescriptor(new BLE2902());
 
-    // FFF2: RX Write
+    // FFF2: RX Write & Notify
     pRxCharacteristic = pService->createCharacteristic(
         CHAR_RX_UUID,
-        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
     );
+    pRxCharacteristic->addDescriptor(new BLE2902());
     pRxCharacteristic->setCallbacks(new MyBleRxCallbacks());
 
     // FFF3: Config Read/Write
     pCfgCharacteristic = pService->createCharacteristic(
         CHAR_CFG_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
     );
+    pCfgCharacteristic->addDescriptor(new BLE2902());
     uint8_t cfgVal[] = { 0x01, 0x00, 0x00, 0x00 };
     pCfgCharacteristic->setValue(cfgVal, sizeof(cfgVal));
 
     // FFF4: Aux Notify
     pAuxCharacteristic = pService->createCharacteristic(
         CHAR_AUX_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
     );
     pAuxCharacteristic->addDescriptor(new BLE2902());
 
@@ -520,17 +495,22 @@ void setup() {
 void loop() {
     uint32_t now = millis();
 
-    // Auto trigger handshake sau 500ms khi vua ket noi
-    if (bleConnected && pendingBleHandshake && (now - bleConnectTime >= 500)) {
+    // Auto trigger handshake sau 400ms khi vua ket noi
+    if (bleConnected && pendingBleHandshake && (now - bleConnectTime >= 400)) {
         pendingBleHandshake = false;
-        triggerHudHandshake();
+        Serial.println("[HANDSHAKE] >>> Kich hoat dinh danh V221 HUD sang iPhone... <<<");
+        uint32_t ts = (uint32_t)(now / 1000);
+        sendV221VersionInfo(0xC5, ts);
+        delay(30);
+        sendV221HudStatus(0x01, ts);
+        delay(30);
+        sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage, ts);
     }
 
     // Telemetry & Keepalive dinh ky moi 1 giay khi da ket noi
     if (bleConnected && (now - lastHeartbeatMs >= 1000)) {
         lastHeartbeatMs = now;
         uint32_t ts = (uint32_t)(now / 1000);
-        sendLegacyHeartbeatPacket();
         sendV221HudStatus(0x01, ts);
         sendV221ObdTelemetry(currentSpeed, currentRpm, currentCoolantTemp, batteryVoltage, ts);
     }
