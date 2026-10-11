@@ -4,10 +4,12 @@
  * 
  * Target Hardware: ESP32 Classic (NodeMCU-32S, ESP32-WROOM-32 on COM14)
  * Solves "Dang ket noi..." on iPhone (iOS):
- *   1. Echo exact 8-byte authentication tail for Time Sync 0x37 0xC3.
- *   2. Send correct OEM HUD_INFO (0x55 0xAA 0x02 with 'H','1','A','S' and Pro flag 0x07).
- *   3. Clean notification pipeline: Notify strictly on FFF1 with verified CCCD.
- *   4. Dedicated Pure BLE radio (no Classic BT collision, fast 20ms SIG advertising).
+ *   1. Auto-Chunking for all BLE Notifications: Slices frames > 20 bytes into 20-byte chunks
+ *      preventing ESP-IDF BLE stack from dropping/truncating packets on default iOS ATT MTU (23).
+ *   2. Updates Peer MTU to 185 in onConnect.
+ *   3. Accurate 8-byte token echo in Time Sync (Cmd 0x37 Sub 0xC3).
+ *   4. Full V2.2.1 Version Info (Cmd 0x37 Sub 0xC5) + Legacy HUD_INFO (0x55 0xAA 0x02) with H1AS Pro License.
+ *   5. Robust stream framing parser preventing desync.
  */
 
 #include <Arduino.h>
@@ -45,6 +47,7 @@ bool bleConnected = false;
 bool handshakeCompleted = false;
 bool pendingBleHandshake = false;
 uint32_t bleConnectTime = 0;
+uint16_t activeConnId = 0;
 
 uint32_t lastHeartbeatMs = 0;
 uint32_t lastAdvLogMs = 0;
@@ -59,6 +62,32 @@ float batteryVoltage = 13.8f;
 
 static uint8_t bleRxBuf[1024];
 static size_t bleRxLen = 0;
+
+// =============================================================================
+// SAFE CHUNKED NOTIFY (Solves iOS MTU=23 Drop Issue)
+// =============================================================================
+void sendNotify(const uint8_t* data, size_t len) {
+    if (!bleConnected || pTxCharacteristic == nullptr) return;
+
+    // iOS CoreBluetooth defaults to ATT MTU = 23 (max notification payload = 20 bytes).
+    // If packet > 20 bytes, slice into 20-byte chunks so ESP-IDF never truncates or drops!
+    size_t offset = 0;
+    while (offset < len) {
+        size_t chunkSize = len - offset;
+        if (chunkSize > 20) {
+            chunkSize = 20;
+        }
+
+        pTxCharacteristic->setValue((uint8_t*)(data + offset), chunkSize);
+        pTxCharacteristic->notify();
+
+        offset += chunkSize;
+        if (offset < len) {
+            delay(12); // Short delay to allow radio to push packet into BLE ring buffer
+        }
+    }
+    totalPacketsTx++;
+}
 
 // =============================================================================
 // V221 FRAME BUILDER
@@ -130,13 +159,6 @@ size_t buildV221Frame(uint8_t cmd, uint8_t sub, const uint8_t* payload, size_t p
     outBuf[offset + 7] = sumC & 0xFF;
 
     return totalLen;
-}
-
-void sendNotify(const uint8_t* data, size_t len) {
-    if (!bleConnected || pTxCharacteristic == nullptr) return;
-    pTxCharacteristic->setValue((uint8_t*)data, len);
-    pTxCharacteristic->notify();
-    totalPacketsTx++;
 }
 
 // =============================================================================
@@ -282,7 +304,6 @@ void processIncomingPacket(const uint8_t* data, size_t len) {
     if (len >= 8 && data[0] == 0xA5 && data[1] == 0x5A) {
         uint8_t cmd = data[2];
         uint8_t sub = data[3];
-        uint32_t dataLen = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) | ((uint32_t)data[6] << 8) | data[7];
         uint32_t ts = (len >= 12) ? (((uint32_t)data[8] << 24) | ((uint32_t)data[9] << 16) | ((uint32_t)data[10] << 8) | data[11]) : (uint32_t)(millis() / 1000);
 
         // Sub 0xC3: Time Sync (App gui 22 bytes, chua token 8 byte o cuoi)
@@ -378,8 +399,13 @@ class MyBleServerCallbacks : public BLEServerCallbacks {
         bleConnected = true;
         pendingBleHandshake = true;
         bleConnectTime = millis();
+        activeConnId = pServer->getConnId();
+
+        // Update peer MTU to 185 so ESP-IDF allows large notifications without truncating
+        pServer->updatePeerMTU(activeConnId, 185);
+
         Serial.println("\n********************************************************");
-        Serial.println(">>> [BLE] IPHONE DA KET NOI BLE GATT THANH CONG! <<<");
+        Serial.printf(">>> [BLE] IPHONE DA KET NOI BLE GATT (ConnId: %u)! <<<\n", activeConnId);
         Serial.println("********************************************************");
     }
 
@@ -441,7 +467,7 @@ void setup() {
     Serial.println("\n");
     Serial.println("=================================================================");
     Serial.println("*    VIETMAP HUD DEDICATED PURE BLE EMULATOR (ESP32 CLASSIC)    *");
-    Serial.println("*    Version 2.8: Token Echo ACK + Real H1AS Pro License        *");
+    Serial.println("*    Version 2.9: Chunked 20B Notify + MTU 185 + Auto-Handshake *");
     Serial.println("=================================================================");
 
     BLEDevice::init(DEVICE_NAME);
@@ -494,8 +520,8 @@ void setup() {
 void loop() {
     uint32_t now = millis();
 
-    // Auto trigger handshake sau 300ms khi vua ket noi
-    if (bleConnected && pendingBleHandshake && (now - bleConnectTime >= 300)) {
+    // Auto trigger handshake sau 500ms khi vua ket noi
+    if (bleConnected && pendingBleHandshake && (now - bleConnectTime >= 500)) {
         pendingBleHandshake = false;
         triggerHudHandshake();
     }
