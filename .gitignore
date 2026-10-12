@@ -81,3 +81,15 @@ speedmap/signs.bin
 speedmap/manifest.txt
 speedmap/manifest.txt.sig
 __pycache__/
+
+# P4 flash data image staging (copy of speedmap/, built with -t buildfs)
+data_p4/
+data_p4_hn_major/
+
+# Frozen releases / archived stand-alone trees (large, not source)
+releases/
+# Flash-data images built by tools/build_flash_data.py
+data_lite154/
+!boards/*.csv
+!partitions_*.csv
+.pio_p4/

@@ -38,11 +38,11 @@
 
 // ---- Identity / OTA (core/Version.h) ----
 #define BOARD_MODEL       "VietHUD Lite"
-#define BOARD_MODEL_ID    "viethudlite154"
-// New channel for the core-based Lite. Units still on the old stand-alone Lite
-// firmware (3.4.x) read the bare /firmware/ root, which stays theirs.
-#define BOARD_FW_CHANNEL  "firmware/lite154"
-#define BOARD_FW_VERSION  "4.0.0" // 4.x = Lite on the shared VietHUD core
+#define BOARD_MODEL_ID    "viethud154"
+// Units still on the old stand-alone Lite firmware (3.x) read the bare
+// /firmware/ root, which stays theirs (different partition table: moving to
+// the core needs one USB flash, see docs/VIETHUD_PLATFORM.md).
+#define BOARD_FW_CHANNEL  "firmware/viethud154"
 
 // ---- Capabilities ----
 #define BOARD_PANEL_SPI_HZ        TFT_SPI_HZ
@@ -52,6 +52,7 @@
 #define BOARD_I2S_MCLK_PIN        -1       // plain I2S amp, no MCLK
 #define BOARD_AUDIO_NAME          "I2S amp"
 #define BOARD_HAS_SD_SLOT         0
+#define BOARD_DATA_PROFILE        "speedmap_lite154" // regional cut that fits the FFat
 #define BOARD_HAS_FLASH_DATA      1        // FFat partition "ffat"
 #define BOARD_HAS_TOUCH           0        // buttons instead (core/Board.h boardButtonsRaw)
 #define BOARD_GNSS_PQTM           1

@@ -1,4 +1,8 @@
 #include "GNSS.h"
+#include "RoadSim.h"
+#ifdef VIETHUD_P4
+#include "net/PhoneGpsBle.h"
+#endif
 #include "core/AppConfig.h"
 #include "core/SharedState.h"
 #include "pincfg.h"
@@ -559,6 +563,29 @@ static void gnssTaskFn(void *) {
             }
         }
         ubxConfigStep(millis() - taskStartMs);
+#ifdef VIETHUD_P4
+        // Phone GPS over BLE (net/PhoneGpsBle.h): same parser, but only while
+        // the UART module has been silent for 5 s — the module always wins,
+        // and the two NMEA streams are never interleaved in one parser.
+        static uint32_t sUartOkMs = 0, sUartPassed = 0, sPhoneOkMs = 0;
+        if (gps.passedChecksum() != sUartPassed) { // counted before the phone feed below
+            sUartPassed = gps.passedChecksum();
+            sUartOkMs = millis();
+        }
+        {
+            uint8_t pb[256];
+            size_t n;
+            bool uartSilent = sUartOkMs == 0 || millis() - sUartOkMs > 5000;
+            while ((n = phoneGpsRead(pb, sizeof(pb))) > 0) {
+                if (!uartSilent) continue; // drained and dropped
+                uint32_t before = gps.passedChecksum();
+                for (size_t i = 0; i < n; i++) gps.encode((char)pb[i]);
+                if (gps.passedChecksum() != before) sPhoneOkMs = millis();
+            }
+            sUartPassed = gps.passedChecksum(); // phone sentences are not UART activity
+        }
+        const bool fromPhone = sPhoneOkMs != 0 && millis() - sPhoneOkMs < 3000;
+#endif
 
         uint32_t passedChecksum = gps.passedChecksum();
         if (passedChecksum != lastPassedChecksum) {
@@ -582,6 +609,9 @@ static void gnssTaskFn(void *) {
         GnssSnapshot snap;
         snap.fix = haveRecentFix;
         snap.linkAlive = linkAlive;
+#ifdef VIETHUD_P4
+        snap.fromPhone = fromPhone;
+#endif
         // NAV-PVT receivers: the ~10 Hz Doppler speed (updateFastSpeed()) when
         // fresh, else the 1 Hz NMEA/bridged speed.
         bool fastFresh = sBridgeFastValid && millis() - sBridgeFastAtMs < 500;
@@ -731,6 +761,42 @@ static void gnssTaskFn(void *) {
                 snap.egoSpeedKmh = snap.rawSpeedKmh = gSimSpeedKmh;
                 snap.speedValid = true;
                 snap.headingDeg = gSimHeadingDeg;
+                snap.headingValid = true;
+                snap.headingPredicted = false;
+                snap.hdop = 0.9f;
+                snap.altitudeValid = false;
+                snap.fixSeq = 0x80000000u | gSimFixSeq;
+            }
+        }
+        // Road-following simulator (gnss/RoadSim.h): serial "R lat lon" starts
+        // it anywhere; with VIETHUD_ROADSIM_AUTOSTART (P4 bench board, no
+        // GNSS fitted yet) it also starts by itself when no valid NMEA
+        // sentence has arrived 8 s after boot. Yields once a real fix appears.
+        {
+#ifdef VIETHUD_ROADSIM_AUTOSTART
+            // Bench/demo boards only (env:viethud_p4). NEVER in the car build:
+            // an unplugged GPS there must read as "no GPS", not as a drive.
+            static bool sAutoTried = false;
+            if (!sAutoTried && !gSimActive && millis() > 8000 && gps.passedChecksum() == 0) {
+                sAutoTried = true;
+                Serial.println("[gnss] no GNSS module detected -> road simulation (real roads from the speed map)");
+                roadSimRequestStart(kRoadSimDefaultLat, kRoadSimDefaultLon, 1.0f);
+            }
+#endif
+            if (haveRecentFix && gps.passedChecksum() > 0 && roadSimActive()) {
+                Serial.println("[gnss] real GNSS fix -> road simulation off");
+                roadSimRequestStop();
+            }
+            float la, lo, hd, v;
+            if (!gSimActive && roadSimStep(&la, &lo, &hd, &v)) {
+                gSimFixSeq++;
+                snap.fix = true;
+                snap.linkAlive = true;
+                snap.satCount = 14;
+                snap.latDeg = la;
+                snap.lonDeg = lo;
+                snap.egoSpeedKmh = snap.rawSpeedKmh = v;
+                snap.headingDeg = hd;
                 snap.headingValid = true;
                 snap.headingPredicted = false;
                 snap.hdop = 0.9f;

@@ -83,10 +83,9 @@
 // ---- Identity / OTA (core/Version.h) ----
 #define BOARD_MODEL       "VietHUD 3.5"
 #define BOARD_MODEL_ID    "viethud35"
-// Own folder since 2026-10-10. The bare /firmware/ root stays VietHUD Lite's
-// until Lite moves onto the shared core (deployed Lite units read it).
+// Own folder since 2026-10-10. The bare /firmware/ root stays the old
+// stand-alone Lite firmware's (deployed Lite units read it).
 #define BOARD_FW_CHANNEL  "firmware/viethud35"
-#define BOARD_FW_VERSION  "3.1.0" // this model's own release line
 
 // ---- Capabilities (read by shared code instead of board names) ----
 #define BOARD_PANEL_SPI_HZ        GFX_NOT_DEFINED // QSPI driver picks its own clock

@@ -16,6 +16,7 @@ enum TrafficAlertType : uint8_t {
 
 struct ActiveTrafficAlert {
     bool active;
+    int32_t index;       // record index in HANOI_ALERTS (-1 = none), to announce each point once
     uint8_t type;        // TrafficAlertType
     uint8_t speedLimit;  // km/h (or 0)
     uint16_t distanceM;  // Distance in meters
@@ -29,15 +30,19 @@ public:
     TrafficAlertManager();
     void begin();
 
-    // Query active nearby alerts based on current GPS position
+    // Nearest alert AHEAD of the car on its direction of travel (within 550 m).
+    // Points beside/behind the car, facing the other way, or already passed are ignored.
+    // Below kMinMovingKmh the GPS course is unreliable, so no new alert is picked up then;
+    // only the one already being shown is kept (e.g. a red-light camera while waiting at the light).
     ActiveTrafficAlert queryNearby(float lat, float lon, float headingDeg, float speedKmh);
 
     // Get count of alerts in the database
     uint32_t getAlertCount() const { return HANOI_ALERT_COUNT; }
 
 private:
-    uint32_t m_lastSoundAlertTime;
-    uint8_t  m_lastSoundAlertType;
+    bool evaluate(int idx, int32_t targetLat, int32_t targetLon, float headingDeg, bool moving, float &distOut) const;
+
+    int32_t m_latchedIdx;
 };
 
 extern TrafficAlertManager trafficAlerts;
