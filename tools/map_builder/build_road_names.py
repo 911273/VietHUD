@@ -9,6 +9,8 @@ check while moving).
 
     python tools/map_builder/build_road_names.py                    # whole country
     python tools/map_builder/build_road_names.py --bbox 20.6 21.5 105.3 106.3 --out x.bin
+    # main roads of a region, every street (alleys too) only inside --full-bbox:
+    python tools/map_builder/build_road_names.py --bbox 19 23.5 102 108.5 --major-only --full-bbox 20.6 21.5 105.3 106.3
 
 Source: data/speedmap/roads.sqlite (OpenStreetMap, ODbL).
 
@@ -52,6 +54,8 @@ ROAD_CLASS = {
     'motorway_link': 7, 'trunk_link': 7, 'primary_link': 7, 'secondary_link': 7, 'tertiary_link': 7,
     'service': 8,  # many named ngõ are tagged service
 }
+# "Main roads" for --major-only: motorway .. tertiary and their links.
+MAJOR_CLASSES = {0, 1, 2, 3, 4, 7}
 
 
 def gpkg_geom(blob):
@@ -80,7 +84,7 @@ def densify(coords):
     return out
 
 
-def build(db, out_path, bbox):
+def build(db, out_path, bbox, major_only=False, full_bbox=None):
     con = sqlite3.connect(db)
     if bbox is None:
         bbox = con.execute('select min(min_lat), max(max_lat), min(min_lon), max(max_lon) from roads').fetchone()
@@ -98,6 +102,12 @@ def build(db, out_path, bbox):
         cls = ROAD_CLASS.get(hw)
         if cls is None:
             continue
+        if major_only and cls not in MAJOR_CLASSES:
+            if full_bbox is None:
+                continue
+            g = gpkg_geom(blob).bounds  # (minx, miny, maxx, maxy) = lon/lat
+            if g[3] < full_bbox[0] or g[1] > full_bbox[1] or g[2] < full_bbox[2] or g[0] > full_bbox[3]:
+                continue
         label = clean_name(name, ref)
         if not label:
             continue
@@ -179,8 +189,11 @@ def main():
     ap.add_argument('--db', default=DB)
     ap.add_argument('--out', default=OUT)
     ap.add_argument('--bbox', nargs=4, type=float, metavar=('MINLAT', 'MAXLAT', 'MINLON', 'MAXLON'))
+    ap.add_argument('--major-only', action='store_true', help='only main roads (motorway..tertiary + links) ...')
+    ap.add_argument('--full-bbox', nargs=4, type=float, metavar=('MINLAT', 'MAXLAT', 'MINLON', 'MAXLON'),
+                    help='... except inside this box, where every named road is kept')
     a = ap.parse_args()
-    build(a.db, a.out, a.bbox)
+    build(a.db, a.out, a.bbox, a.major_only, a.full_bbox)
 
 
 if __name__ == '__main__':

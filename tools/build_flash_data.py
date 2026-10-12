@@ -20,9 +20,11 @@ import argparse
 import hashlib
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 
 sys.path.insert(0, os.path.dirname(__file__))
 from models import ROOT  # noqa: E402
@@ -36,9 +38,34 @@ PROFILES = {
     'p4': dict(budget_mb=9.4, out='data_p4'),            # partitions_p4_data.csv: 9.9 MB
     'lite154': dict(budget_mb=11.1, out='data_lite154'),  # boards/partitions_lite154.csv: 11.6 MB
 }
-# Road-name layer for a flash cut: the region around HOME (the country-wide
-# speedmap/roadnames.bin is 14 MB). ~1.8 MB with every alley.
-NAMES_BBOX = (HOME[0] - 0.43, HOME[0] + 0.43, HOME[1] - 0.5, HOME[1] + 0.45)
+# A flash cut covers the NORTH: every main road of the speed map (which carries
+# those roads' names itself), the region's cameras and signs, plus the detailed
+# road-name layer (every street incl. alleys) around HOME — the country-wide
+# roadnames.bin is 14 MB.
+REGION = (19.0, 23.5, 102.0, 108.5)  # Bac Bo + Bac Trung Bo (to Thanh Hoa / Nghe An)
+NAMES_FULL_BBOX = (HOME[0] - 0.43, HOME[0] + 0.43, HOME[1] - 0.5, HOME[1] + 0.45)
+
+
+def in_region(lat, lon):
+    return REGION[0] <= lat <= REGION[1] and REGION[2] <= lon <= REGION[3]
+
+
+def cut_alerts(d):
+    """cameras.bin / signs.bin limited to REGION (same formats; signs header + CRC rewritten)."""
+    cam = open(os.path.join(d, 'cameras.bin'), 'rb').read()
+    rec = 24  # CameraPoint (u64 id, i32 lat, i32 lon, i16 limit, u16 dir) padded to 24
+    keep = [cam[i:i + rec] for i in range(0, len(cam) - len(cam) % rec, rec)
+            if in_region(*(v / 1e7 for v in struct.unpack_from('<ii', cam, i + 8)))]
+    open(os.path.join(d, 'cameras.bin'), 'wb').write(b''.join(keep))
+    sg = open(os.path.join(d, 'signs.bin'), 'rb').read()
+    magic, ver, cnt, res, _crc, ts = struct.unpack_from('<4sHIHII', sg, 0)
+    hdr = len(sg) - cnt * 20
+    pts = [sg[hdr + i * 20:hdr + i * 20 + 20] for i in range(cnt)
+           if in_region(*(v / 1e7 for v in struct.unpack_from('<ii', sg, hdr + i * 20 + 4)))]
+    body = b''.join(pts)
+    open(os.path.join(d, 'signs.bin'), 'wb').write(
+        struct.pack('<4sHIHII', magic, ver, len(pts), res, zlib.crc32(body) & 0xFFFFFFFF, ts) + sg[20:hdr] + body)
+    print('  region alerts: %d cameras, %d signs' % (len(keep), len(pts)))
 
 
 def tree_size(d):
@@ -73,11 +100,12 @@ def build(profile, publish):
     with tempfile.TemporaryDirectory() as tmp:
         names = os.path.join(tmp, 'roadnames_region.bin')
         subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'map_builder', 'build_road_names.py'),
-                        '--bbox'] + [str(v) for v in NAMES_BBOX] + ['--out', names], check=True)
+                        '--bbox'] + [str(v) for v in NAMES_FULL_BBOX] + ['--out', names], check=True)
         budget_mb = p['budget_mb'] - os.path.getsize(names) / 1e6  # what is left for the speed map
         src = os.path.join(tmp, 'src')
         os.makedirs(src)
         stage_source(src)
+        cut_alerts(src)
         if os.path.exists(out):
             shutil.rmtree(out)
         if tree_size(src) <= budget_mb * 1e6:
