@@ -14,6 +14,7 @@
 #include <math.h>
 #include <string.h> // memcpy (UBX MON-VER)
 #include <stdlib.h> // atoi (GSV counts)
+#include <Preferences.h> // remembered GPS baud (gnssDetectBaud)
 
 // Bench drive simulator state (see gnssSimStart in GNSS.h).
 static volatile bool gSimActive = false;
@@ -161,14 +162,80 @@ static void ubxSend(uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t len) {
     Serial2.write(ck, 2);
 }
 
-#if BOARD_GNSS_PQTM
 // Sends "$<body>*CS\r\n" to the module (vendor NMEA-style commands).
 static void gnssSendNmeaCmd(const char *body) {
     uint8_t cs = 0;
     for (const char *p = body; *p; p++) cs ^= (uint8_t)*p;
     Serial2.printf("$%s*%02X\r\n", body, cs);
 }
-#endif
+
+// ---- GPS module auto-detection (2026-10-13) ----
+// Every board takes either module: a u-blox M10 (NMEA, 38400 or 9600 baud,
+// configurable over UBX) or the "P18 Pro" (binary UBX NAV-PVT at 115200,
+// configured over Quectel-style PQTM). The parser below already takes both
+// streams, so only the baud has to be found: each candidate is listened to
+// for a moment and the first that yields checksum-valid NMEA or UBX frames
+// wins. The winner is remembered in NVS so the next boot locks on at once,
+// and the scan reruns if the link goes quiet (module swapped).
+static int countValidFrames(const uint8_t *b, int n) {
+    int frames = 0;
+    for (int i = 0; i < n; i++) {
+        if (b[i] == '$') { // NMEA: $....*HH
+            uint8_t cs = 0;
+            int j = i + 1;
+            for (; j < n && b[j] != '*' && b[j] != '$' && j - i < 100; j++) cs ^= b[j];
+            if (j + 2 < n && b[j] == '*') {
+                char hx[3] = {(char)b[j + 1], (char)b[j + 2], 0};
+                if (strtoul(hx, nullptr, 16) == cs && j - i > 6) frames++;
+            }
+        } else if (b[i] == 0xB5 && i + 7 < n && b[i + 1] == 0x62) { // UBX
+            int len = b[i + 4] | (b[i + 5] << 8);
+            if (i + 8 + len <= n) {
+                uint8_t a = 0, c = 0;
+                for (int k = i + 2; k < i + 6 + len; k++) { a += b[k]; c += a; }
+                if (a == b[i + 6 + len] && c == b[i + 7 + len]) frames++;
+            }
+        }
+    }
+    return frames;
+}
+
+static uint32_t gnssDetectBaud() {
+    Preferences p;
+    p.begin("gnss", true);
+    uint32_t last = p.getUInt("baud", 0);
+    p.end();
+    const uint32_t cands[] = {last, (uint32_t)GNSS_BAUD, 115200, 38400, 9600, 57600};
+    static uint8_t buf[1536];
+    for (int pass = 0; pass < 2; pass++) { // twice: a module may still be booting
+        for (uint32_t baud : cands) {
+            if (!baud) continue;
+            Serial2.updateBaudRate(baud);
+            while (Serial2.available()) Serial2.read();
+            int n = 0;
+            uint32_t t0 = millis();
+            while (millis() - t0 < 1300 && n < (int)sizeof(buf)) {
+                int a = Serial2.available();
+                if (a > 0) n += Serial2.readBytes(buf + n, a < (int)sizeof(buf) - n ? a : (int)sizeof(buf) - n);
+                else vTaskDelay(pdMS_TO_TICKS(10));
+                esp_task_wdt_reset();
+            }
+            int f = countValidFrames(buf, n);
+            if (f >= 2) {
+                Serial.printf("[gnss] module found at %lu baud (%d valid frames)\n", (unsigned long)baud, f);
+                if (baud != last) {
+                    p.begin("gnss", false);
+                    p.putUInt("baud", baud);
+                    p.end();
+                }
+                return baud;
+            }
+        }
+    }
+    Serial.printf("[gnss] no module answered — staying at %lu baud\n", (unsigned long)GNSS_BAUD);
+    Serial2.updateBaudRate(GNSS_BAUD);
+    return GNSS_BAUD;
+}
 
 static void ubxValset(const UbxKv *kv, int n) {
     static uint8_t pl[4 + 16 * 8];
@@ -446,8 +513,9 @@ static bool ubxFeed(uint8_t c) {
 }
 
 // Runs the configuration steps; called every loop tick until done.
+static int sUbxCfgStep = 0; // reset by the module re-scan in gnssTaskFn
 static void ubxConfigStep(uint32_t sinceBootMs) {
-    static int step = 0;
+    int &step = sUbxCfgStep;
     static uint32_t sentAt = 0;
     static const UbxKv kBase[] = {
         {0x20110021, 1, 4}, // CFG-NAVSPG-DYNMODEL = 4 (automotive)
@@ -475,7 +543,8 @@ static void ubxConfigStep(uint32_t sinceBootMs) {
     switch (step) {
     case 0:
         if (sinceBootMs < 800) return;
-#if BOARD_GNSS_PQTM
+        // Sent to whichever module is fitted: the P18 Pro takes these, an
+        // M10 ignores unknown $PQTM sentences (and the UBX below the reverse).
         // The P18 Pro's real config interface is a Quectel-style PQTM subset
         // (found 2026-10-10: answers $PQTMVERNO with "SUB,V01", firmware
         // "#VERSIONA,B01-V5.34.8"). Only message rates are writable there —
@@ -486,7 +555,6 @@ static void ubxConfigStep(uint32_t sinceBootMs) {
         // RAM only (no $PQTMSAVEPAR), so the module stays stock for a drone.
         gnssSendNmeaCmd("PQTMCFGMSGRATE,W,RMC,0");
         gnssSendNmeaCmd("PQTMCFGMSGRATE,W,GGA,0");
-#endif
         ubxSend(0x0A, 0x04, nullptr, 0); // poll MON-VER
         sentAt = sinceBootMs;
         step = 1;
@@ -530,10 +598,11 @@ static void gnssTaskFn(void *) {
     // reproduced on the bench: "did not reset the watchdog: gnssTask").
     Serial2.setRxBufferSize(4096);
     Serial2.begin(kGnssBaud, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
+    esp_task_wdt_add(NULL);
+    gnssDetectBaud(); // M10 or P18 Pro — see gnssDetectBaud()
 
     SpeedFilter speedFilter;
-    const uint32_t taskStartMs = millis();
-    esp_task_wdt_add(NULL);
+    uint32_t taskStartMs = millis();
     uint32_t lastFixMs = 0;
     uint32_t lastValidSentenceMs = 0;
     // Heading hold state (GNSS.h's kHeadingHoldMs comment) — lastKnownHeadingMs
@@ -593,6 +662,16 @@ static void gnssTaskFn(void *) {
             lastValidSentenceMs = millis();
         }
         bool linkAlive = lastValidSentenceMs != 0 && (millis() - lastValidSentenceMs) < kLinkTimeoutMs;
+        {   // Quiet for 20 s (module unplugged/swapped, or never found): scan again.
+            static uint32_t sLastScanMs = millis();
+            uint32_t quietSince = lastValidSentenceMs ? lastValidSentenceMs : sLastScanMs;
+            if (millis() - quietSince > 20000 && millis() - sLastScanMs > 20000) {
+                gnssDetectBaud();
+                sLastScanMs = millis();
+                taskStartMs = millis();
+                sUbxCfgStep = 0; // re-run the module configuration for the new module
+            }
+        }
 
         bool freshFix = gps.location.isValid() && gps.location.isUpdated();
         static uint32_t sFixSeq = 0;

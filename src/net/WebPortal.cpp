@@ -83,8 +83,31 @@ bool webPortalSavedNetwork(int i, char *ssid, size_t cap) {
     return true;
 }
 
+// New network entered on the portal / setup screen (2026-10-13 rule): it is
+// TRIED first and only saved once the unit actually joins it — a wrong
+// password or an out-of-range name never ends up in the saved list. The web
+// task drives the attempt (pendingTick); the portal polls /api/wifi/pending.
+enum PendState : uint8_t { PEND_IDLE, PEND_TRYING, PEND_OK, PEND_FAIL };
+static volatile uint8_t g_pendState = PEND_IDLE;
+static char g_pendSsid[33] = "", g_pendPass[65] = "";
+static uint32_t g_pendStartMs = 0;
+static const uint32_t kPendTimeoutMs = 30000;
+
+static bool saveNetwork(const char *ssid, const char *password);
+
 bool webPortalAddNetwork(const char *ssid, const char *password) {
     if (!ssid || !ssid[0]) return false;
+    strncpy(g_pendSsid, ssid, sizeof(g_pendSsid) - 1);
+    g_pendSsid[sizeof(g_pendSsid) - 1] = '\0';
+    strncpy(g_pendPass, password ? password : "", sizeof(g_pendPass) - 1);
+    g_pendPass[sizeof(g_pendPass) - 1] = '\0';
+    g_pendStartMs = 0; // the web task starts the attempt
+    g_pendState = PEND_TRYING;
+    Serial.printf("[wm] trying new network \"%s\" (saved only if it connects)\n", g_pendSsid);
+    return true;
+}
+
+static bool saveNetwork(const char *ssid, const char *password) {
     int slot = -1;
     for (int i = 0; i < cfg.savedNetworkCount; i++)
         if (strncmp(cfg.savedNetworks[i].ssid, ssid, 31) == 0) { slot = i; break; }
@@ -103,6 +126,35 @@ bool webPortalAddNetwork(const char *ssid, const char *password) {
     g_wmTry = -1; g_wmAttemptMs = 0;   // force a fresh manager cycle to try it now
     g_staReconnectReq = true;
     Serial.printf("[wm] saved network \"%s\" (slot %d, %d total)\n", ssid, slot, cfg.savedNetworkCount);
+    return true;
+}
+
+// Runs in the web task while a new network is being tried. True = it owns the
+// radio (the saved-network manager waits).
+static bool pendingTick() {
+    if (g_pendState != PEND_TRYING) return false;
+    if (g_pendStartMs == 0) {
+        g_pendStartMs = millis() | 1;
+        WiFi.disconnect(false, false); // leave the AP up: the phone stays connected
+        WiFi.begin(g_pendSsid, g_pendPass);
+        return true;
+    }
+    wl_status_t st = WiFi.status();
+    if (st == WL_CONNECTED && WiFi.SSID() == g_pendSsid) {
+        saveNetwork(g_pendSsid, g_pendPass);
+        strncpy(cfg.staSsid, g_pendSsid, sizeof(cfg.staSsid) - 1);
+        strncpy(cfg.staPassword, g_pendPass, sizeof(cfg.staPassword) - 1);
+        g_pendState = PEND_OK;
+        Serial.printf("[wm] \"%s\" connected -> saved\n", g_pendSsid);
+        return false;
+    }
+    if (st == WL_CONNECT_FAILED || millis() - g_pendStartMs > kPendTimeoutMs) {
+        g_pendState = PEND_FAIL;
+        Serial.printf("[wm] \"%s\" did not connect (status %d) -> not saved\n", g_pendSsid, (int)st);
+        WiFi.disconnect(false, false);
+        g_wmTry = -1; g_wmAttemptMs = 0; // back to the saved networks
+        return false;
+    }
     return true;
 }
 
@@ -645,7 +697,13 @@ static void handleWifiAdd() {
     String ssid = server.arg("ssid");
     if (ssid.length() == 0) { server.send(400, "text/plain", "ssid required"); return; }
     bool ok = webPortalAddNetwork(ssid.c_str(), server.arg("password").c_str());
-    server.send(ok ? 200 : 400, "text/plain", ok ? "Saved. Connecting..." : "Failed (list full?)");
+    server.send(ok ? 200 : 400, "text/plain", ok ? "Connecting..." : "Failed");
+}
+// {"state":"idle|trying|ok|fail","ssid":"..."} — the portal polls it after an add.
+static void handleWifiPending() {
+    static const char *kNames[] = {"idle", "trying", "ok", "fail"};
+    String o = String("{\"state\":\"") + kNames[g_pendState] + "\",\"ssid\":\"" + jsonEsc(g_pendSsid) + "\"}";
+    server.send(200, "application/json", o);
 }
 static void handleWifiDel() {
     bool ok = webPortalDeleteNetwork(server.arg("idx").toInt());
@@ -867,7 +925,8 @@ static void webTaskFn(void *) {
     server.on("/api/action", HTTP_POST, handleApiAction);       // feature G: control panel
     server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);      // WiFi Manager: scan
     server.on("/api/wifi/saved", HTTP_GET, handleWifiSaved);    // WiFi Manager: list saved
-    server.on("/api/wifi/add", HTTP_POST, handleWifiAdd);       // WiFi Manager: add/update
+    server.on("/api/wifi/add", HTTP_POST, handleWifiAdd);
+    server.on("/api/wifi/pending", HTTP_GET, handleWifiPending);       // WiFi Manager: add/update
     server.on("/api/wifi/del", HTTP_POST, handleWifiDel);       // WiFi Manager: delete
     // Common captive-portal probe URLs + a catch-all, all 302 -> portal root.
     server.on("/generate_204", HTTP_GET, handleCaptiveRedirect);       // Android
@@ -898,8 +957,9 @@ static void webTaskFn(void *) {
                 g_staReconnectReq = false;
                 g_wmTry = -1; g_wmAttemptMs = 0;  // force a fresh manager cycle (new/changed creds)
             }
-            // WiFi Manager: keep the strongest saved network connected.
-            wmTick();
+            // A newly entered network is tried first; otherwise the WiFi
+            // Manager keeps the strongest saved network connected.
+            if (!pendingTick()) wmTick();
         }
         if (wifiActuallyEnabled) {
             if (g_apActive) dnsServer.processNextRequest(); // feature E: captive portal DNS
@@ -946,7 +1006,7 @@ static void webTaskFn(void *) {
                 }
             }
             // OTA auto-check: on connect (above) and then every ~30 min while online.
-            if (sta && cfg.dataUpdateUrl[0] && (int32_t)(millis() - g_nextOtaCheckMs) >= 0) {
+            if (sta && (int32_t)(millis() - g_nextOtaCheckMs) >= 0) { // (also the road-name channel)
                 if (dataUpdateAutoCheckStart() || !dataUpdateCheckInProgress())
                     g_nextOtaCheckMs = millis() + 30UL * 60UL * 1000UL; // weekly gate inside
                 else
