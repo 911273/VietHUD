@@ -51,7 +51,7 @@ static bool fetchManifest(char *ver, size_t verCap, uint32_t *size, char sha[65]
     return true;
 }
 
-static void localVersion(char *out, size_t cap) {
+void namesLocalVersion(char *out, size_t cap) {
     out[0] = '\0';
     char p[80];
     localPath(p, sizeof(p), "roadnames.ver");
@@ -75,7 +75,7 @@ bool namesCheck() {
     uint32_t size;
     char sha[65], local[24];
     if (!fetchManifest(sRemoteVersion, sizeof(sRemoteVersion), &size, sha)) return false;
-    localVersion(local, sizeof(local));
+    namesLocalVersion(local, sizeof(local));
     sAvailable = strcmp(sRemoteVersion, local) != 0 && !installerVersionOlder(sRemoteVersion, local);
     Serial.printf("[names] check: local=\"%s\" remote=\"%s\" -> %s\n", local, sRemoteVersion,
                   sAvailable ? "UPDATE AVAILABLE" : "up to date");
@@ -90,7 +90,7 @@ int namesUpdateRun(uint8_t *buf, size_t bufSize, void (*progress)(int, const cha
     char ver[24], sha[65], local[24];
     uint32_t size = 0;
     if (!fetchManifest(ver, sizeof(ver), &size, sha)) return 0;
-    localVersion(local, sizeof(local));
+    namesLocalVersion(local, sizeof(local));
     if (strcmp(ver, local) == 0 || installerVersionOlder(ver, local)) return 2;
 
     char part[80], dst[80], verPath[80];
