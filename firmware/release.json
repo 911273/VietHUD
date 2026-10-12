@@ -1,35 +1,35 @@
 {
-  "version": "4.0.2",
+  "version": "4.0.3",
   "build": "20261013",
-  "notes": "Sửa: tên đường vẫn cập nhật khi dữ liệu trên thẻ mới hơn máy chủ",
+  "notes": "Tên đường gồm cả ngõ; dữ liệu kiểm tra mỗi tuần; sửa cập nhật tên đường",
   "images": {
     "viethud35": {
       "name": "VietHUD 3.5\"",
       "chip": "esp32s3",
-      "path": "4.0.2/viethud35.bin",
-      "size": 2251664,
-      "sha256": "b4541f5be4ec6e21c32d36d90d5ac2a52f210adeea270e0ec2a3fa1fd3d66563"
+      "path": "4.0.3/viethud35.bin",
+      "size": 2251776,
+      "sha256": "4194dad65773729729243e583d19d7cbd5e5b1d22f1ef5e1653a32b0ef48238d"
     },
     "viethud28": {
       "name": "VietHUD 2.8\"",
       "chip": "esp32s3",
-      "path": "4.0.2/viethud28.bin",
-      "size": 2244544,
-      "sha256": "da35c86a5e9aa4be1e23534e93d996df922a53c3dc274c700ad7e29578af3e4c"
+      "path": "4.0.3/viethud28.bin",
+      "size": 2244656,
+      "sha256": "d4928019a3e4768e8d81c74dec9d23c9444a83ebe0fd027314eb0b435e0308fa"
     },
     "viethud154": {
       "name": "VietHUD Lite 1.54\"",
       "chip": "esp32s3",
-      "path": "4.0.2/viethud154.bin",
-      "size": 1562960,
-      "sha256": "27789d9df95f46fdac3c1f62813ef4f555ecd478e5da76c6f70144adb1ba9104"
+      "path": "4.0.3/viethud154.bin",
+      "size": 1563072,
+      "sha256": "2af4bc702c115d6f0d76def72c494c31376a638019fd85c0f36d5b91abeadd7b"
     },
     "viethud43": {
       "name": "VietHUD 4.3\" (P4)",
       "chip": "esp32p4",
-      "path": "4.0.2/viethud43.bin",
-      "size": 2757296,
-      "sha256": "23bcbaeace4eddb35f7d72e60887fae1ba7fef2b8ff1f859f2b1ca9906dc13f9"
+      "path": "4.0.3/viethud43.bin",
+      "size": 2757360,
+      "sha256": "9bbe87d8562fe77607e7587995df38e696cd8c89be4efc584acb15e2ddc86bf5"
     }
   }
 }

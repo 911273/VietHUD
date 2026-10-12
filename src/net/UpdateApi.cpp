@@ -1,4 +1,5 @@
 #include "UpdateApi.h"
+#include "net/NamesUpdater.h" // namesLocalVersion() for /api/v1/update/state
 #include "WebPortal.h"
 #include "DataUpdater.h"
 #include "core/AppConfig.h"
@@ -76,6 +77,13 @@ static void handleState() {
              sta ? "true" : "false", sta ? cfg.staSsid : "", ip, cfg.savedNetworkCount, cfg.dataUpdateUrl);
     o += b;
     installerStateJson(o);
+    {   // road-name channel (net/NamesUpdater.h): installed release
+        char nv[24];
+        namesLocalVersion(nv, sizeof(nv));
+        o += ",\"names\":\"";
+        o += nv;
+        o += "\"";
+    }
     o += "}";
     srv->sendHeader("Cache-Control", "no-store");
     srv->send(200, "application/json", o);

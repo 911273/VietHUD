@@ -17,6 +17,7 @@
 // Call from a task with Wi-Fi up. Returns true when a newer one is available.
 bool namesCheck();
 bool namesUpdateAvailable();
+void namesLocalVersion(char *out, size_t cap); // installed road-name release, "" if unknown
 const char *namesRemoteVersion();
 
 // Downloads + installs it (run in update mode — TLS needs the free RAM).

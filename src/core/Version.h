@@ -9,7 +9,7 @@
 // exercise the update prompt).
 #include "boards/board.h"
 #ifndef VIETHUD_FW_VERSION
-#define VIETHUD_FW_VERSION "4.0.2"
+#define VIETHUD_FW_VERSION "4.0.3"
 #endif
 
 // Hardware model + OTA channel (include/boards/<board>/board_config.h). The
