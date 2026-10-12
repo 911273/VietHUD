@@ -194,7 +194,7 @@ static void showPhoneConnectedToast() {
         lv_obj_set_style_pad_hor(connToast, 14, 0);
         lv_obj_set_style_pad_ver(connToast, 6, 0);
         lv_obj_set_style_text_color(connToast, lv_color_hex(0xDFF5E6), 0);
-        lv_label_set_text(connToast, LV_SYMBOL_OK " Phone connected · settings page: 192.168.4.1");
+        lv_label_set_text(connToast, LV_SYMBOL_OK " Phone connected - settings page: 192.168.4.1");
         lv_obj_align(connToast, LV_ALIGN_TOP_MID, 0, 40);
     }
     lv_obj_clear_flag(connToast, LV_OBJ_FLAG_HIDDEN);
@@ -294,7 +294,7 @@ static bool bridgeStatusText(char *buf, size_t cap, int *pct) {
     case INST_VERIFYING: snprintf(buf, cap, LV_SYMBOL_REFRESH " Checking data..."); break;
     case INST_COMMITTED: snprintf(buf, cap, LV_SYMBOL_OK " Data OK — restart to install"); break;
     default:
-        snprintf(buf, cap, LV_SYMBOL_DOWNLOAD " Receiving data from phone  %d%%\n%u / %u KB · file %u/%u", *pct,
+        snprintf(buf, cap, LV_SYMBOL_DOWNLOAD " Receiving data from phone  %d%%\n%u / %u KB - file %u/%u", *pct,
                  (unsigned)(p.bytesDone / 1024), (unsigned)(p.bytesTotal / 1024),
                  (unsigned)(p.filesDone < p.filesTotal ? p.filesDone + 1 : p.filesTotal), (unsigned)p.filesTotal);
     }

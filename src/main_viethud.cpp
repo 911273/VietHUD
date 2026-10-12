@@ -441,7 +441,7 @@ static void runDataUpdateMode() {
             int overall = (st.filesDone * 100 + cur) / st.filesTotal;
             statusBar(overall);
             char b[48];
-            snprintf(b, sizeof(b), "File %d/%d  ·  %d%%",
+            snprintf(b, sizeof(b), "File %d/%d  -  %d%%",
                      st.filesDone < st.filesTotal ? st.filesDone + 1 : st.filesTotal, st.filesTotal, overall);
             statusSub(b);
         }
