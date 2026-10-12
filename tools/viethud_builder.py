@@ -898,7 +898,7 @@ def main():
     ref_map_dir = args.ref_map
     if not ref_map_dir:
         map_candidates = [
-            r'C:\Users\phamq\radar_car\data\speedmap',
+            os.path.normpath(os.path.join(script_dir, '..', 'data', 'speedmap')),
             os.path.join(input_dir, 'speedmap'),
             os.path.join(input_dir, 'VietHUD_SDCard_Ready', 'speedmap')
         ]
@@ -907,7 +907,7 @@ def main():
                 ref_map_dir = mc
                 break
     if not ref_map_dir:
-        ref_map_dir = r'C:\Users\phamq\radar_car\data\speedmap'
+        ref_map_dir = os.path.normpath(os.path.join(script_dir, '..', 'data', 'speedmap'))
 
     print(f"[*] Thu muc du lieu nguon: {input_dir}")
     print(f"[*] Thu muc ban do he thong: {ref_map_dir}")
@@ -951,7 +951,7 @@ def main():
     # Nguồn 3: Dữ liệu thẻ nhớ / backup WYN gốc
     sd_bak_paths = [
         os.path.join(input_dir, 'WYN_SpeedMap_Ready', 'speedmap', 'signs.bin'),
-        r'C:\Users\phamq\radar_car\tools\map_builder\output\speedmap\signs.bin',
+        os.path.join(script_dir, 'map_builder', 'output', 'speedmap', 'signs.bin'),
         r'E:\speedmap\signs.bin.bak',
         r'E:\speedmap\signs.bin',
         os.path.join(input_dir, 'output_viethud', 'speedmap', 'signs.bin'),

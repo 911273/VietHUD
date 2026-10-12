@@ -37,8 +37,8 @@ def to_e7(deg):
 def main():
     parser = argparse.ArgumentParser(description="Build offline traffic signs and camera binary database")
     parser.add_argument("--csv", default=r"C:\Users\phamq\Downloads\traffic_signs.csv", help="Path to traffic_signs.csv")
-    parser.add_argument("--out", default=r"C:\Users\phamq\radar_car\tools\map_builder\output\speedmap", help="Output directory")
-    parser.add_argument("--sound-dir", default=r"C:\Users\phamq\radar_car\tools\map_builder\wyn_assets\assets\flutter_assets\assets\sounds\vi", help="Directory containing Vietnamese audio MP3s")
+    parser.add_argument("--out", default=str(Path(__file__).resolve().parent / "output" / "speedmap"), help="Output directory")
+    parser.add_argument("--sound-dir", default=str(Path(__file__).resolve().parent / "wyn_assets" / "assets" / "flutter_assets" / "assets" / "sounds" / "vi"), help="Directory containing Vietnamese audio MP3s")
     parser.add_argument("--copy-sounds", action="store_true", default=True, help="Copy MP3 voice prompts into output directory")
     args = parser.parse_args()
 
