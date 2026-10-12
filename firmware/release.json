@@ -1,0 +1,35 @@
+{
+  "version": "4.0.1",
+  "build": "20261013",
+  "notes": "Tên đường gồm cả ngõ, cảnh báo tối đa 400 m, kiểm tra dữ liệu mỗi tuần",
+  "images": {
+    "viethud35": {
+      "name": "VietHUD 3.5\"",
+      "chip": "esp32s3",
+      "path": "4.0.1/viethud35.bin",
+      "size": 2251616,
+      "sha256": "77616b9f27d95a6508f6b1baeb164ad011b3145bfe9f86fb6410239b568f3502"
+    },
+    "viethud28": {
+      "name": "VietHUD 2.8\"",
+      "chip": "esp32s3",
+      "path": "4.0.1/viethud28.bin",
+      "size": 2244512,
+      "sha256": "10c88ff1c6c9de71c91961a49f877694e28b6bbcb88bc2b0355af8aa895d838d"
+    },
+    "viethud154": {
+      "name": "VietHUD Lite 1.54\"",
+      "chip": "esp32s3",
+      "path": "4.0.1/viethud154.bin",
+      "size": 1562912,
+      "sha256": "88d03db5008a525533e9702a743f943a6d1eeff234741b7bd68ca4f75710b193"
+    },
+    "viethud43": {
+      "name": "VietHUD 4.3\" (P4)",
+      "chip": "esp32p4",
+      "path": "4.0.1/viethud43.bin",
+      "size": 2757248,
+      "sha256": "898755c0f468ec47b6de61658d0438cf2bad88d42b37906d18e9a4d02d48d1b5"
+    }
+  }
+}
