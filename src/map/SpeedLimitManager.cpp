@@ -6,7 +6,8 @@
 #include "core/SharedState.h"
 #include "gnss/GNSS.h" // kGnssMotionThresholdKmh — ahead-lookahead only runs while actually moving
 #include "boards/board.h" // BOARD_HAS_MAP
-#include "MapRenderer.h" // mapRendererUpdate() — live background map, driven from this same task loop
+#include "MapRenderer.h"
+#include "RoadNames.h"     // roadNamesLookup() — street names incl. alleys // mapRendererUpdate() — live background map, driven from this same task loop
 #include <Arduino.h>
 #include <esp_heap_caps.h>
 #include <esp_task_wdt.h>
@@ -847,6 +848,17 @@ static bool deadReckonAlongRoute(uint32_t nowMs) {
         gCarDistM = gRoute.totalLenM();
     }
     return true;
+}
+
+// Copies UTF-8 without cutting a multi-byte character in half.
+static void utf8Copy(char *dst, size_t cap, const char *src) {
+    size_t n = strlen(src);
+    if (n >= cap) {
+        n = cap - 1;
+        while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) n--;
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
 }
 
 // Road NAME fallback (2026-10-12, user: the Lite stayed on "Đang dò tên
@@ -1940,7 +1952,15 @@ static void speedLimitTaskFn(void *) {
                 out.source = SPEED_SOURCE_DEFAULT;
             }
 
-            nearestRoadNameFallback(gnss, out); // name label only — see its comment
+            // Street name label (display only): the OSM road-name layer first —
+            // it has every alley the speed map doesn't (map/RoadNames.h) —
+            // then the matcher's own name, then the nearest named segment.
+            if (gnss.fix) {
+                const char *rn = roadNamesLookup(gnss.latDeg, gnss.lonDeg, gnss.headingValid, gnss.headingDeg,
+                                                 gnss.egoSpeedKmh);
+                if (rn && rn[0]) utf8Copy(out.roadName, sizeof(out.roadName), rn);
+            }
+            nearestRoadNameFallback(gnss, out);
             lastPublished = out;
             roadInfoPublish(out);
             // Live background map (2026-09-22) — rides this same ~500ms loop
