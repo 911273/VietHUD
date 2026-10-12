@@ -25,6 +25,8 @@ struct Key {
     uint32_t downAt = 0, upAt = 0;
     bool longFired = false;
     bool pendingShort = false; // released once, waiting to see if a second press follows
+    // gnu++11 (Arduino-ESP32 2.x): default member initializers make this a non-aggregate.
+    Key(uint8_t m) : mask(m) {}
 };
 
 Key keys[3] = {{BOARD_KEY_LEFT}, {BOARD_KEY_CENTER}, {BOARD_KEY_RIGHT}};
