@@ -7,7 +7,7 @@ Sources:
 
 Outputs clean, unified binary and CSV databases to:
 - E:/speedmap/ (SD Card)
-- C:/Users/phamq/radar_car/data/speedmap/ (Firmware Data)
+- <repo>/data/speedmap/ (Firmware Data)
 - C:/Users/phamq/Downloads/Data/output_viethud/speedmap/ (Data Package)
 """
 
@@ -45,7 +45,7 @@ PAPAGO_SPC = os.path.join(DATA_DIR, '1', 'papago_spc.bin')
 SD_CARD_SIGNS_BAK = r'E:\speedmap\signs.bin.bak'
 SD_CARD_CAMS_BAK = r'E:\speedmap\cameras.bin.bak'
 
-RADAR_CAR_DIR = r'C:\Users\phamq\radar_car\data\speedmap'
+RADAR_CAR_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'data', 'speedmap'))
 OUTPUT_PACKAGE_DIR = os.path.join(DATA_DIR, 'output_viethud', 'speedmap')
 DATA2_OUTPUT_DIR = os.path.join(DATA_DIR, '2', 'viethud_output', 'speedmap')
 SD_SPEEDMAP_DIR = r'E:\speedmap'

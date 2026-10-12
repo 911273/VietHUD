@@ -165,8 +165,8 @@ def main():
         script_dir = os.path.dirname(os.path.abspath(__file__))
         candidates = [
             os.path.join(r"C:\Users\phamq\Downloads\Data\VietHUD_SDCard_Ready", "speedmap"),
-            os.path.join(r"C:\Users\phamq\radar_car\speedmap"),
-            os.path.join(r"C:\Users\phamq\radar_car\data\speedmap"),
+            os.path.normpath(os.path.join(script_dir, "..", "..", "speedmap")),
+            os.path.normpath(os.path.join(script_dir, "..", "..", "data", "speedmap")),
             os.path.join(r"C:\Users\phamq\Downloads\Data\VietHUD_Git_Staging", "speedmap"),
             os.path.join(r"C:\Users\phamq\Downloads\Data", "speedmap"),
         ]

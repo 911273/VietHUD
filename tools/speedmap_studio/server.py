@@ -21,7 +21,7 @@ from urllib.parse import urlparse, parse_qs
 
 PORT = 8088
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_SPEEDMAP = Path(r"C:\Users\phamq\radar_car\speedmap")
+DEFAULT_SPEEDMAP = BASE_DIR.parents[1] / "speedmap"
 DEFAULT_CSV = Path(r"c:\Users\phamq\Downloads\cameras.csv")
 
 CAMERA_CATEGORIES = {"speed_cam", "red_light_cam"}
