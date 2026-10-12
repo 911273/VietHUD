@@ -1,6 +1,7 @@
 #include "DataInstaller.h"
 #include "core/SharedState.h" // gnssSnapshot() — refuse to swap data while the vehicle is moving
 #include "map/SdCardManager.h"
+#include "boards/board.h" // BOARD_FLASH_DATA_READONLY
 #include <Preferences.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>   // esp_random()
@@ -300,6 +301,11 @@ int installerOpenSession(const char *text, size_t len, const char *sigB64, char 
         return code;
     };
     if (!ensureSession()) return fail(503, "Out of memory");
+#if BOARD_FLASH_DATA_READONLY
+    // P4 without a card runs from its read-only flash copy: nothing can be
+    // installed there — say so instead of a misleading "cannot read the card".
+    if (sdMgrDataOnFlash()) return fail(507, "Insert a microSD card to update the data");
+#endif
     if (!sdMgrMkdir(STAGE)) return fail(503, "Cannot read the SD card");
     restoreSession();
     if (sdMgrExists(JOURNAL)) return fail(409, "Waiting for a restart to install the previous update");
