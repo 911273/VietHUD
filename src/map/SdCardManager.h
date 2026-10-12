@@ -200,3 +200,13 @@ int sdMgrScanDataSources(char names[][32], char dirs[][32], int maxCount);
 // partition on boards with BOARD_HAS_FLASH_DATA. Valid once a mount succeeded.
 fs::FS &sdMgrDataFs();
 bool sdMgrDataOnFlash();
+
+// Counts for Settings > Map "data in use": cameras and signs loaded from the
+// data set, by type (TrafficSignType index 0..10). Cheap: counts the arrays
+// already in PSRAM.
+struct AlertStats {
+    int cameras;
+    int signs;
+    int byType[11];
+};
+void sdMgrAlertStats(AlertStats &out);

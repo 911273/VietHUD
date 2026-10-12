@@ -10,6 +10,7 @@
 #include "net/UpdateApi.h"    // updateApiBusy() — a phone is pushing data right now
 #include "update/DataInstaller.h" // installerProgress() — phone->device transfer progress
 #include "audio/AudioPlayer.h"
+#include "net/NamesUpdater.h" // namesLocalVersion() — Map tab data info
 #include "map/SdCardManager.h" 
 #include "touch/TouchTask.h"      // gTouchCalRequested (P4 touch calibration button)
 #include <string.h>
@@ -582,25 +583,6 @@ static void addDropdownRow(lv_obj_t *parent, int &y, const char *name, const cha
     y += 38;
 }
 
-static void onMapSourceDropdownChanged(lv_event_t *e) {
-    lv_obj_t *dd = (lv_obj_t *)lv_event_get_target(e);
-    uint32_t sel = lv_dropdown_get_selected(dd);
-    cfg.mapSourceIndex = (float)sel;
-    if (sel == 0) {
-        strncpy(cfg.mapSource, "/speedmap_gofa", sizeof(cfg.mapSource) - 1);
-    } else if (sel == 1) {
-        strncpy(cfg.mapSource, "/speedmap_wyn", sizeof(cfg.mapSource) - 1);
-    } else {
-        strncpy(cfg.mapSource, "/speedmap", sizeof(cfg.mapSource) - 1);
-    }
-    cfg.mapSource[sizeof(cfg.mapSource) - 1] = 0;
-    saveConfigToNVS(cfg);
-    Serial.printf("[ui] Map source set to: %s (idx %u)\n", cfg.mapSource, (unsigned)sel);
-    lv_label_set_text(settingsStatusLabel, "Map source changed. Restart to apply.");
-    if (restartConfirmOverlay) {
-        lv_obj_clear_flag(restartConfirmOverlay, LV_OBJ_FLAG_HIDDEN);
-    }
-}
 
 static void onVoicePackDropdownChanged(lv_event_t *e) {
     lv_obj_t *dd = (lv_obj_t *)lv_event_get_target(e);
@@ -738,6 +720,41 @@ static void onDataUpdateBtnClicked(lv_event_t *) {
 // the rest come from roadInfoSnapshot() (updates every ~500ms).
 static lv_obj_t *speedMapStatusVal, *speedMapRegionVal, *speedMapVersionVal;
 static lv_obj_t *speedMapLimitVal, *speedMapSourceVal, *speedMapMatchVal, *speedMapRoadIdVal;
+static lv_obj_t *mapDataVerVal, *mapRoadsVal, *mapNamesVal, *mapStorageVal;
+static lv_obj_t *alertCamVal, *alertLimitVal, *alertResidentVal, *alertNoOvertakeVal, *alertLightVal, *alertTollVal,
+    *alertOtherVal;
+
+// Static facts about the data in use — counted once per Settings visit (the
+// sign array is ~100k entries; no need to walk it every refresh tick).
+static void fillDataInfo() {
+    static uint32_t sFilledMs = 0;
+    if (sFilledMs && millis() - sFilledMs < 60000) return;
+    sFilledMs = millis() | 1;
+    SpeedMapMetadata m;
+    if (speedLimitManagerGetInfo(m)) {
+        lv_label_set_text_fmt(mapRoadsVal, "%lu in %lu tiles", (unsigned long)m.segmentCount, (unsigned long)m.tileCount);
+    } else {
+        lv_label_set_text(mapRoadsVal, "--");
+    }
+    const char *dv = dataUpdateLocalVersion();
+    lv_label_set_text(mapDataVerVal, dv[0] ? dv : "--");
+    char nv[24];
+    namesLocalVersion(nv, sizeof(nv));
+    lv_label_set_text(mapNamesVal, nv[0] ? nv : (sdMgrExists("/speedmap/roadnames.bin") ? "installed" : "none"));
+    char st[40];
+    snprintf(st, sizeof(st), "%s, %u MB free", sdMgrDataOnFlash() ? "internal flash" : "microSD",
+             (unsigned)(sdMgrFreeBytes() >> 20));
+    lv_label_set_text(mapStorageVal, st);
+    AlertStats a;
+    sdMgrAlertStats(a);
+    lv_label_set_text_fmt(alertCamVal, "%d", a.cameras + a.byType[SIGN_TYPE_CAMERA]);
+    lv_label_set_text_fmt(alertLimitVal, "%d", a.byType[SIGN_TYPE_SPEED_LIMIT]);
+    lv_label_set_text_fmt(alertResidentVal, "%d", a.byType[SIGN_TYPE_RESIDENT_AREA]);
+    lv_label_set_text_fmt(alertNoOvertakeVal, "%d", a.byType[SIGN_TYPE_NO_OVERTAKING]);
+    lv_label_set_text_fmt(alertLightVal, "%d", a.byType[SIGN_TYPE_TRAFFIC_LIGHT]);
+    lv_label_set_text_fmt(alertTollVal, "%d", a.byType[SIGN_TYPE_TOLL_BOOTH]);
+    lv_label_set_text_fmt(alertOtherVal, "%d", a.byType[SIGN_TYPE_DANGER_OTHER] + a.byType[SIGN_TYPE_UNKNOWN]);
+}
 
 static void refreshSensorsPanel(lv_timer_t *) {
     // Only worth doing while Settings is actually the screen on-screen —
@@ -786,6 +803,7 @@ static void refreshSensorsPanel(lv_timer_t *) {
     // card is swapped and the device rebooted, so a single mapLoaded check
     // gates all the "static" fields; the rest (limit/source/match/road)
     // come from the live 500ms RoadInfoSnapshot regardless.
+    fillDataInfo();
     SpeedMapMetadata mapInfo;
     bool mapLoaded = speedLimitManagerGetInfo(mapInfo);
     if (mapLoaded) {
@@ -1488,30 +1506,38 @@ void buildSettingsScreen() {
     // Map tab (categoryPanels[1]) — vector map display options
     // -----------------------------------------------------------------
     y = 4;
-    static const char *kMapSourceOptions = "GOFA (/speedmap_gofa)\nWYN (/speedmap_wyn)\nMac dinh (/speedmap)";
-    uint32_t mapSel = 0;
-    if (strcmp(cfg.mapSource, "/speedmap_wyn") == 0 || (int)cfg.mapSourceIndex == 1) mapSel = 1;
-    else if (strcmp(cfg.mapSource, "/speedmap") == 0 || (int)cfg.mapSourceIndex == 2) mapSel = 2;
-    else mapSel = 0;
-    addDropdownRow(categoryPanels[1], y, "Map Data Source", kMapSourceOptions, mapSel, onMapSourceDropdownChanged, nullptr);
-
+    // One map source only — OpenStreetMap in /speedmap (user rule 2026-10-13;
+    // the GOFA/WYN pack chooser is gone, see core/NvsStore.cpp).
     // Vector map only (raster JPEG background removed 2026-09-26).
     addSwitchRow(categoryPanels[1], y, "Heading up (rotate map)", &cfg.mapHeadingUp);
     addSwitchRow(categoryPanels[1], y, "Vehicle trail", &cfg.showVehicleTrail);
 
-    // Speed Map diagnostics (spec section 25) — offline microSD map-matching
-    // status, see map/SpeedLimitManager.h. This group is why categoryPanels[1]
-    // needs to be scrollable above: it doesn't fit in 260px alongside
-    // everything already in this tab.
-    y += 6;
-    lv_obj_t *mapHeaderSpeed = lv_label_create(categoryPanels[1]);
-    lv_label_set_text(mapHeaderSpeed, "Speed Map");
-    lv_obj_set_style_text_color(mapHeaderSpeed, lv_color_hex(0x7C8A9A), 0);
-    lv_obj_set_pos(mapHeaderSpeed, 4, y);
-    y += 20;
+    // What data the unit is using — filled by refreshSensorsPanel().
+    auto addGroupHeader = [&](const char *t) {
+        y += 6;
+        lv_obj_t *h = lv_label_create(categoryPanels[1]);
+        lv_label_set_text(h, t);
+        lv_obj_set_style_text_color(h, lv_color_hex(0x7C8A9A), 0);
+        lv_obj_set_pos(h, 4, y);
+        y += 20;
+    };
+    addGroupHeader("Map data (OpenStreetMap)");
     speedMapStatusVal = addReadonlyRow(categoryPanels[1], y, "Status");
     speedMapRegionVal = addReadonlyRow(categoryPanels[1], y, "Region");
-    speedMapVersionVal = addReadonlyRow(categoryPanels[1], y, "Version");
+    speedMapVersionVal = addReadonlyRow(categoryPanels[1], y, "Map version");
+    mapDataVerVal = addReadonlyRow(categoryPanels[1], y, "Data release");
+    mapRoadsVal = addReadonlyRow(categoryPanels[1], y, "Road segments");
+    mapNamesVal = addReadonlyRow(categoryPanels[1], y, "Street names");
+    mapStorageVal = addReadonlyRow(categoryPanels[1], y, "Stored on");
+    addGroupHeader("Traffic alerts");
+    alertCamVal = addReadonlyRow(categoryPanels[1], y, "Speed cameras");
+    alertLimitVal = addReadonlyRow(categoryPanels[1], y, "Speed-limit signs");
+    alertResidentVal = addReadonlyRow(categoryPanels[1], y, "Residential area");
+    alertNoOvertakeVal = addReadonlyRow(categoryPanels[1], y, "No overtaking");
+    alertLightVal = addReadonlyRow(categoryPanels[1], y, "Traffic lights");
+    alertTollVal = addReadonlyRow(categoryPanels[1], y, "Toll booths");
+    alertOtherVal = addReadonlyRow(categoryPanels[1], y, "Red-light cam / danger");
+    addGroupHeader("Now");
     speedMapLimitVal = addReadonlyRow(categoryPanels[1], y, "Current limit");
     speedMapSourceVal = addReadonlyRow(categoryPanels[1], y, "Source");
     speedMapMatchVal = addReadonlyRow(categoryPanels[1], y, "Match");

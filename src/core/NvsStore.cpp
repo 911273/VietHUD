@@ -94,6 +94,14 @@ void loadConfigFromNVS(AppConfig &cfg) {
     String msrc = prefs.getString("mapSrc", cfg.mapSource);
     strncpy(cfg.mapSource, msrc.c_str(), sizeof(cfg.mapSource) - 1);
     cfg.mapSource[sizeof(cfg.mapSource) - 1] = 0;
+    // One map source only since 2026-10-13: OpenStreetMap in /speedmap. Units
+    // that had picked a GOFA/WYN pack (/speedmap_gofa, /speedmap_wyn) — which
+    // also left them with no map at all when that folder was missing — go back.
+    if (strcmp(cfg.mapSource, "/speedmap") != 0) {
+        Serial.printf("[nvs] map source %s -> /speedmap\n", cfg.mapSource);
+        strncpy(cfg.mapSource, "/speedmap", sizeof(cfg.mapSource) - 1);
+        cfg.mapSourceIndex = 0;
+    }
     cfg.voicePack = prefs.getFloat("voicePack", cfg.voicePack);
     cfg.touchOffsetX = prefs.getFloat("touchOffX", cfg.touchOffsetX);
     cfg.touchOffsetY = prefs.getFloat("touchOffY", cfg.touchOffsetY);

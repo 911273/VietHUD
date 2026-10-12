@@ -1316,3 +1316,11 @@ int sdMgrClearDir(const char *dir) {
         if (gDataFs->remove(names[i])) removed++;
     return removed;
 }
+
+void sdMgrAlertStats(AlertStats &out) {
+    memset(&out, 0, sizeof(out));
+    out.cameras = cameraPointCount;
+    out.signs = trafficSignCount;
+    for (int i = 0; i < trafficSignCount && trafficSigns; i++)
+        if (trafficSigns[i].signType < 11) out.byType[trafficSigns[i].signType]++;
+}
