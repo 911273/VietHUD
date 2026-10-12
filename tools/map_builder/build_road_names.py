@@ -12,7 +12,8 @@ check while moving).
     # main roads of a region, every street (alleys too) only inside --full-bbox:
     python tools/map_builder/build_road_names.py --bbox 19 23.5 102 108.5 --major-only --full-bbox 20.6 21.5 105.3 106.3
 
-Source: data/speedmap/roads.sqlite (OpenStreetMap, ODbL).
+Source: OpenStreetMap (ODbL) — data/speedmap/roads.sqlite on the PC, or the
+Geofabrik vietnam-latest.osm.pbf with --pbf (the Pi's weekly job).
 
 Layout "VHRN" v1, little endian — designed for reads straight off the card:
   header (44 B): char[4] "VHRN", u16 version=1, u16 cellE5, i32 minLatE5,
@@ -34,12 +35,9 @@ import struct
 import unicodedata
 from collections import defaultdict
 
-from shapely import wkb
-from shapely.geometry import LineString
-
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 DB = os.path.join(ROOT, 'data', 'speedmap', 'roads.sqlite')
-OUT = os.path.join(ROOT, 'speedmap', 'roadnames.bin')
+OUT = os.path.join(ROOT, 'roadnames', 'roadnames.bin')
 
 CELL_E5 = 1000            # 0.01 deg ~ 1.1 km
 SIMPLIFY_DEG = 0.00004    # ~4 m Douglas-Peucker tolerance
@@ -58,10 +56,90 @@ ROAD_CLASS = {
 MAJOR_CLASSES = {0, 1, 2, 3, 4, 7}
 
 
-def gpkg_geom(blob):
-    flags = blob[3]
-    env = (flags >> 1) & 7
-    return wkb.loads(bytes(blob[8 + (0, 32, 48, 48, 64)[env]:]))
+def simplify(coords, tol=SIMPLIFY_DEG):
+    """Douglas-Peucker on (lon, lat) tuples (iterative, no shapely needed)."""
+    if len(coords) < 3:
+        return list(coords)
+    keep = [False] * len(coords)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(coords) - 1)]
+    while stack:
+        a, b = stack.pop()
+        (x0, y0), (x1, y1) = coords[a], coords[b]
+        dx, dy = x1 - x0, y1 - y0
+        L = dx * dx + dy * dy
+        best, bi = -1.0, -1
+        for i in range(a + 1, b):
+            x, y = coords[i]
+            if L == 0:
+                d = (x - x0) ** 2 + (y - y0) ** 2
+            else:
+                t = ((x - x0) * dx + (y - y0) * dy) / L
+                t = 0 if t < 0 else 1 if t > 1 else t
+                d = (x - x0 - t * dx) ** 2 + (y - y0 - t * dy) ** 2
+            if d > best:
+                best, bi = d, i
+        if bi >= 0 and best > tol * tol:
+            keep[bi] = True
+            stack += [(a, bi), (bi, b)]
+    return [c for c, k in zip(coords, keep) if k]
+
+
+def roads_from_sqlite(db, bbox):
+    """(name, ref, highway, [[(lon, lat), ...], ...]) from the GeoPackage-style roads.sqlite (PC)."""
+    from shapely import wkb
+    con = sqlite3.connect(db)
+    q = 'select name, ref, highway, geometry from roads where max_lat >= ? and min_lat <= ? and max_lon >= ? and min_lon <= ?'
+    for name, ref, hw, blob in con.execute(q, bbox):
+        env = (blob[3] >> 1) & 7
+        g = wkb.loads(bytes(blob[8 + (0, 32, 48, 48, 64)[env]:]))
+        parts = list(g.geoms) if g.geom_type == 'MultiLineString' else [g]
+        yield name, ref, hw, [list(p.coords) for p in parts if p.geom_type == 'LineString']
+
+
+VIETNAM = (8.4, 23.5, 102.1, 109.6)
+_PBF_CACHE = {}
+
+
+def roads_from_pbf(pbf, bbox):
+    """Same, straight from an OpenStreetMap .pbf with pyosmium (the Pi's weekly job).
+    The file is parsed once per process; later calls only filter by bbox."""
+    min_lat, max_lat, min_lon, max_lon = bbox
+    if pbf not in _PBF_CACHE:
+        _PBF_CACHE[pbf] = _parse_pbf(pbf)
+    for name, ref, hw, lines in _PBF_CACHE[pbf]:
+        b = bbox_of_lines(lines)
+        if b[1] >= min_lat and b[0] <= max_lat and b[3] >= min_lon and b[2] <= max_lon:
+            yield name, ref, hw, lines
+
+
+def _parse_pbf(pbf):
+    import osmium
+    import tempfile
+    min_lat, max_lat, min_lon, max_lon = VIETNAM
+    out = []
+
+    class H(osmium.SimpleHandler):
+        def way(self, w):
+            hw = w.tags.get('highway')
+            if hw not in ROAD_CLASS or not (w.tags.get('name') or w.tags.get('ref')):
+                return
+            pts = [(n.lon, n.lat) for n in w.nodes if n.location.valid()]
+            if len(pts) < 2:
+                return
+            if max(p[1] for p in pts) < min_lat or min(p[1] for p in pts) > max_lat or                max(p[0] for p in pts) < min_lon or min(p[0] for p in pts) > max_lon:
+                return
+            out.append((w.tags.get('name'), w.tags.get('ref'), hw, [pts]))
+
+    with tempfile.TemporaryDirectory() as tmp:  # node locations on disk, not RAM
+        H().apply_file(pbf, locations=True, idx='sparse_file_array,' + os.path.join(tmp, 'nodes.idx'))
+    return out
+
+
+def bbox_of_lines(lines):
+    xs = [x for ln in lines for x, _ in ln]
+    ys = [y for ln in lines for _, y in ln]
+    return min(ys), max(ys), min(xs), max(xs)
 
 
 def clean_name(name, ref):
@@ -84,10 +162,8 @@ def densify(coords):
     return out
 
 
-def build(db, out_path, bbox, major_only=False, full_bbox=None):
-    con = sqlite3.connect(db)
-    if bbox is None:
-        bbox = con.execute('select min(min_lat), max(max_lat), min(min_lon), max(max_lon) from roads').fetchone()
+def build(db, out_path, bbox, major_only=False, full_bbox=None, pbf=None):
+    bbox = tuple(bbox) if bbox else VIETNAM
     min_lat, max_lat, min_lon, max_lon = bbox
     min_lat_e5 = int(min_lat * 1e5) // CELL_E5 * CELL_E5
     min_lon_e5 = int(min_lon * 1e5) // CELL_E5 * CELL_E5
@@ -97,31 +173,29 @@ def build(db, out_path, bbox, major_only=False, full_bbox=None):
     names, name_idx = [], {}
     cells = defaultdict(list)  # cellId -> [(nameIdx, cls, [(latE5, lonE5), ...])]
     ways = 0
-    q = 'select name, ref, highway, geometry from roads where max_lat >= ? and min_lat <= ? and max_lon >= ? and min_lon <= ?'
-    for name, ref, hw, blob in con.execute(q, (min_lat, max_lat, min_lon, max_lon)):
+    src = roads_from_pbf(pbf, bbox) if pbf else roads_from_sqlite(db, bbox)
+    for name, ref, hw, lines in src:
         cls = ROAD_CLASS.get(hw)
-        if cls is None:
+        if cls is None or not lines:
             continue
         if major_only and cls not in MAJOR_CLASSES:
             if full_bbox is None:
                 continue
-            g = gpkg_geom(blob).bounds  # (minx, miny, maxx, maxy) = lon/lat
-            if g[3] < full_bbox[0] or g[1] > full_bbox[1] or g[2] < full_bbox[2] or g[0] > full_bbox[3]:
+            g = bbox_of_lines(lines)
+            if g[1] < full_bbox[0] or g[0] > full_bbox[1] or g[3] < full_bbox[2] or g[2] > full_bbox[3]:
                 continue
         label = clean_name(name, ref)
         if not label:
             continue
-        geom = gpkg_geom(blob)
-        lines = list(geom.geoms) if geom.geom_type == 'MultiLineString' else [geom]
         if label not in name_idx:
             name_idx[label] = len(names)
             names.append(label)
         ni = name_idx[label]
         ways += 1
         for line in lines:
-            if not isinstance(line, LineString) or len(line.coords) < 2:
+            if len(line) < 2:
                 continue
-            coords = densify(list(line.simplify(SIMPLIFY_DEG, preserve_topology=False).coords))
+            coords = densify(simplify(line))
             e5 = [(round(y * 1e5), round(x * 1e5)) for x, y in coords]
             run, run_cell = [], None
             for a, b in zip(e5, e5[1:]):
@@ -186,14 +260,15 @@ def build(db, out_path, bbox, major_only=False, full_bbox=None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--db', default=DB)
+    ap.add_argument('--db', default=DB, help='roads.sqlite (PC)')
+    ap.add_argument('--pbf', help='OpenStreetMap .pbf instead of --db (needs pyosmium)')
     ap.add_argument('--out', default=OUT)
     ap.add_argument('--bbox', nargs=4, type=float, metavar=('MINLAT', 'MAXLAT', 'MINLON', 'MAXLON'))
     ap.add_argument('--major-only', action='store_true', help='only main roads (motorway..tertiary + links) ...')
     ap.add_argument('--full-bbox', nargs=4, type=float, metavar=('MINLAT', 'MAXLAT', 'MINLON', 'MAXLON'),
                     help='... except inside this box, where every named road is kept')
     a = ap.parse_args()
-    build(a.db, a.out, a.bbox, a.major_only, a.full_bbox)
+    build(a.db, a.out, a.bbox, a.major_only, a.full_bbox, a.pbf)
 
 
 if __name__ == '__main__':

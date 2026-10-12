@@ -1,0 +1,10 @@
+[Unit]
+Description=VietHUD road-name channels (OpenStreetMap, weekly)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=admin
+ExecStart=/bin/bash /home/admin/viethud-names/run.sh
+Nice=10

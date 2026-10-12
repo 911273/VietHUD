@@ -2,6 +2,7 @@
 #include "core/AppConfig.h"
 #include "map/SdCardManager.h"
 #include "update/DataInstaller.h" // staging + signature + atomic boot-time install
+#include "net/NamesUpdater.h"     // the separate road-name channel
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -149,6 +150,7 @@ static int runUpdate(uint8_t *dlBuf, size_t dlBufSize) {
     s_status.percent = 0;
     setStatus(DU_RUNNING, "Loading the data list...");
 
+    if (!cfg.dataUpdateUrl[0]) return 2; // board without a speed-map channel (road names only)
     String base = cfg.dataUpdateUrl;
     if (base.length() && !base.endsWith("/")) base += "/";
     Serial.printf("[dataupd] STA ip=%s dns=%s  url=%s\n", WiFi.localIP().toString().c_str(),
@@ -166,7 +168,7 @@ static int runUpdate(uint8_t *dlBuf, size_t dlBufSize) {
     char err[80];
     int rc = installerOpenSession(manifest.c_str(), manifest.length(), sig.c_str(), err, sizeof(err));
     if (rc == 200) {
-        setStatus(DU_SUCCESS, "Data is already up to date");
+        setStatus(DU_RUNNING, "Data is already up to date"); // final status set after the road names
         return 2;
     }
     if (rc != 201) {
@@ -199,7 +201,7 @@ static int runUpdate(uint8_t *dlBuf, size_t dlBufSize) {
     }
     char done[64];
     snprintf(done, sizeof(done), "Downloaded %d files — restart to install", n);
-    setStatus(DU_SUCCESS, done);
+    setStatus(DU_RUNNING, done); // final status set after the road names
     return 1;
 }
 
@@ -207,13 +209,28 @@ static void dataUpdateTask(void *) {
     // Download buffer in PSRAM so internal RAM stays free for WiFi/TLS.
     const size_t DL = 4096;
     uint8_t *dlBuf = (uint8_t *)heap_caps_malloc(DL, MALLOC_CAP_SPIRAM);
-    int result = 0;
-    if (dlBuf) result = runUpdate(dlBuf, DL);
-    else setStatus(DU_FAILED, "Out of memory");
+    int result = 0, names = 2;
+    if (dlBuf) {
+        result = runUpdate(dlBuf, DL);
+        if (result != 0) { // speed map/alerts fine (or current): then the road-name channel
+            names = namesUpdateRun(dlBuf, DL, [](int pct, const char *msg) {
+                if (pct >= 0) s_status.percent = pct;
+                if (msg) setStatus(DU_RUNNING, msg);
+            });
+        }
+    } else {
+        setStatus(DU_FAILED, "Out of memory");
+    }
     if (dlBuf) heap_caps_free(dlBuf);
+    if (result != 0) {
+        if (names == 0) setStatus(DU_FAILED, "Road names: download failed (map data OK)");
+        else if (result == 1) setStatus(DU_SUCCESS, "Downloaded — restarting to install");
+        else if (names == 1) setStatus(DU_SUCCESS, "Road names updated");
+        else setStatus(DU_SUCCESS, "Data is already up to date");
+    }
 
     s_running = false;
-    if (result == 1) {
+    if (result == 1 || names == 1) {
         vTaskDelay(pdMS_TO_TICKS(2500)); // let the UI show success + the HTTP reply flush
         ESP.restart();
     }
@@ -278,7 +295,9 @@ static void checkTask(void *) {
     String base = cfg.dataUpdateUrl;
     if (base.length() && !base.endsWith("/")) base += "/";
     readLocalVersion(s_localVersion, sizeof(s_localVersion));
-    if (httpGetText(base + DU_MANIFEST_NAME, remoteText)) {
+    bool fetched = false;
+    if (base.length() && httpGetText(base + DU_MANIFEST_NAME, remoteText)) {
+        fetched = true;
         extractVersion(remoteText.c_str(), s_remoteVersion, sizeof(s_remoteVersion));
         // "Update available" only for a NEWER release — a card carrying a more
         // recent local build must not be nagged into a downgrade.
@@ -288,8 +307,18 @@ static void checkTask(void *) {
         Serial.printf("[dataupd] check: local=\"%s\" remote=\"%s\" -> %s\n",
                       s_localVersion, s_remoteVersion,
                       newer ? "UPDATE AVAILABLE" : "up to date");
-    } else {
+    } else if (base.length()) {
         Serial.println("[dataupd] check: could not fetch remote manifest");
+    }
+    bool namesOk = namesCheck() || namesRemoteVersion()[0];
+    if (fetched || namesOk) { // a check that reached the server counts for the weekly schedule
+        time_t now = time(nullptr);
+        if (now > 1700000000) {
+            Preferences p;
+            p.begin("dataupd", false);
+            p.putUInt("lastChk", (uint32_t)now);
+            p.end();
+        }
     }
     s_checkRunning = false;
     vTaskDelete(NULL);
@@ -300,16 +329,31 @@ static void checkTask(void *) {
 // only fetches the tiny manifest.txt.
 bool dataUpdateCheckStart() {
     if (s_checkRunning || s_running) return false;
-    if (strlen(cfg.dataUpdateUrl) == 0) return false;
-    if (WiFi.status() != WL_CONNECTED) return false;
+    if (WiFi.status() != WL_CONNECTED) return false; // (an empty URL still checks the road-name channel)
     s_checkRunning = true;
     xTaskCreatePinnedToCore(checkTask, "dataChk", 12288, NULL, 1, NULL, 0);
     return true;
 }
 
-bool dataUpdateAvailable() { return s_updateAvailable; }
+// Automatic checks (on a new Wi-Fi link, the Update screen opening, the
+// periodic timer) run at most once a week — user rule 2026-10-13: "dữ liệu 1
+// tuần mới check mới 1 lần". A check the user asks for runs at once.
+static const uint32_t kAutoCheckEverySec = 7UL * 24UL * 3600UL;
+bool dataUpdateAutoCheckStart() {
+    time_t now = time(nullptr);
+    if (now > 1700000000) { // clock known (NTP/GNSS); otherwise check, the stamp comes later
+        Preferences p;
+        p.begin("dataupd", true);
+        uint32_t last = p.getUInt("lastChk", 0);
+        p.end();
+        if (last && (uint32_t)now >= last && (uint32_t)now - last < kAutoCheckEverySec) return false;
+    }
+    return dataUpdateCheckStart();
+}
+
+bool dataUpdateAvailable() { return s_updateAvailable || namesUpdateAvailable(); }
 bool dataUpdateCheckInProgress() { return s_checkRunning; }
-const char *dataUpdateRemoteVersion() { return s_remoteVersion; }
+const char *dataUpdateRemoteVersion() { return s_updateAvailable ? s_remoteVersion : namesRemoteVersion(); }
 const char *dataUpdateLocalVersion() {
     // Normally filled by the online check; read it from the card directly when
     // no check has run yet (Wi-Fi off), so the Update screen doesn't claim

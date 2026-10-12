@@ -101,28 +101,30 @@ Build/flash one model: `python tools/build.py <env> [upload|uploadfs] [--port CO
 (`all` = every model). It picks the toolchain: S3 = default PlatformIO core
 (espressif32@7.1.3); P4 = isolated pioarduino core `~/.platformio_p4`.
 
-## Data: one set, cut per storage
+## Data
 
-`speedmap/` (format V2: metadata/index/tiles/names/seg_names/cameras/signs +
-ECDSA-signed manifest) is the single source; the Pi pipeline refreshes it daily.
-Card boards use it as is. Flash-only boards get a cut of the same files, same
-data version, re-signed:
+Two independent online channels, each with its own ECDSA-signed manifest:
 
-```
-python tools/build_flash_data.py all [--publish]
-python tools/build.py viethud_lite154 uploadfs
-```
+| channel | content | publisher | read by |
+|---|---|---|---|
+| `speedmap/` | speed map + cameras/signs | the Pi's existing 02:00 data job | `net/DataUpdater` (3.5", 2.8", P4 with a card) |
+| `roadnames/` | every named road incl. alleys, whole country (OSM) | `tools/roadnames-job` on the Pi, weekly | `net/NamesUpdater` (card boards) |
+| `roadnames_lite154/` | same, ~33 km around Ha Noi | same job | `net/NamesUpdater` (Lite) |
 
-| profile | partition | content |
-|---|---|---|
-| `p4` (`data_p4/`) | 13.5 MB, read-only | whole country, default voices |
-| `lite154` (`data_lite154/`, published `speedmap_lite154/`) | 9.9 MB | all cameras/signs nationwide, road tiles ~25 km around Ha Noi |
+Devices check automatically **at most once a week** (`dataUpdateAutoCheckStart`);
+a check the user asks for runs at once. Updates download in update mode
+(reboot), are SHA-256 checked, and the speed-map set installs atomically with
+rollback.
 
-Online data updates read `BOARD_DATA_PROFILE`: card boards `speedmap/`, Lite
-`speedmap_lite154/`. **TODO:** the Pi daily job must also run
-`build_flash_data.py lite154 --publish` after it refreshes `speedmap/`,
-or the Lite channel goes stale. The P4 without a card cannot take online data
-(its flash data is read-only) — insert a card.
+Flash-only boards get an image cut from `speedmap/` + `roadnames_lite154/`
+(`python tools/build_flash_data.py all`): every main road of the north, the
+region's cameras/signs, Ha Noi street names, `sounds/vi/`; the Lite keeps ~2 MB
+free to stage updates. That image contains the third-party alert data, so it
+is loaded over USB (`tools/build.py viethud_lite154 uploadfs`) or pushed from
+this PC (`tools/push_data.py --dir data_lite154/speedmap`) — never published.
+The Lite therefore has no online speed-map channel (`BOARD_DATA_URL ""`), only
+its road-name channel. The P4 without a card cannot install data (read-only
+flash).
 
 ## Old stand-alone Lite (3.x) units
 

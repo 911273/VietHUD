@@ -93,3 +93,5 @@ data_lite154/
 !boards/*.csv
 !partitions_*.csv
 .pio_p4/
+speedmap_lite154/
+speedmap_p4/

@@ -947,8 +947,8 @@ static void webTaskFn(void *) {
             }
             // OTA auto-check: on connect (above) and then every ~30 min while online.
             if (sta && cfg.dataUpdateUrl[0] && (int32_t)(millis() - g_nextOtaCheckMs) >= 0) {
-                if (dataUpdateCheckStart())
-                    g_nextOtaCheckMs = millis() + 30UL * 60UL * 1000UL;
+                if (dataUpdateAutoCheckStart() || !dataUpdateCheckInProgress())
+                    g_nextOtaCheckMs = millis() + 30UL * 60UL * 1000UL; // weekly gate inside
                 else
                     g_nextOtaCheckMs = millis() + 60UL * 1000UL; // busy/not-ready: retry in 1 min
             }

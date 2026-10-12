@@ -50,6 +50,8 @@ DataUpdateStatus dataUpdateGetStatus();
 // "update available" indicator. Applying an update is still the manual
 // dataUpdateSchedule() path.
 bool dataUpdateCheckStart();
+// Same, but at most once a week (automatic triggers). False = skipped/busy.
+bool dataUpdateAutoCheckStart();
 bool dataUpdateAvailable();
 bool dataUpdateCheckInProgress();
 const char *dataUpdateRemoteVersion();
