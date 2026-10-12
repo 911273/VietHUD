@@ -52,7 +52,11 @@
 #define BOARD_I2S_MCLK_PIN        -1       // plain I2S amp, no MCLK
 #define BOARD_AUDIO_NAME          "I2S amp"
 #define BOARD_HAS_SD_SLOT         0
-#define BOARD_DATA_PROFILE        "speedmap_lite154" // regional cut that fits the FFat
+// Data: the flash image (tools/build_flash_data.py lite154) is loaded over USB
+// or pushed from a PC (tools/push_data.py); online the Lite takes only its
+// road-name channel (OSM, regional cut that fits the FFat).
+#define BOARD_DATA_URL            ""
+#define BOARD_NAMES_CHANNEL       "roadnames_lite154"
 #define BOARD_HAS_FLASH_DATA      1        // FFat partition "ffat"
 #define BOARD_UI_LITE             1        // stand-alone Lite HUD, no LVGL/map (src/boards/lite154/ui)
 #define BOARD_HAS_TOUCH           0        // buttons instead (core/Board.h boardButtonsRaw)

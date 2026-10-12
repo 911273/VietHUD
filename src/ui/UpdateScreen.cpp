@@ -251,7 +251,7 @@ void openUpdateScreen() {
 
     // Auto-trigger background checks
     if (WiFi.status() == WL_CONNECTED) {
-        dataUpdateCheckStart();
+        dataUpdateAutoCheckStart(); // data: at most weekly unless the user taps Check
         startFwCheck();
     }
 }

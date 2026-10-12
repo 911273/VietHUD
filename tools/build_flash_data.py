@@ -43,7 +43,6 @@ PROFILES = {
 # road-name layer (every street incl. alleys) around HOME — the country-wide
 # roadnames.bin is 14 MB.
 REGION = (19.0, 23.5, 102.0, 108.5)  # Bac Bo + Bac Trung Bo (to Thanh Hoa / Nghe An)
-NAMES_FULL_BBOX = (HOME[0] - 0.3, HOME[0] + 0.3, HOME[1] - 0.35, HOME[1] + 0.3)  # ~33 km: all of Ha Noi proper
 # Free space kept on a writable flash partition so daily alert updates can be
 # staged (installer needs the changed files + 0.5 MB; the Lite cut of signs.bin is ~0.9 MB).
 STAGING_HEADROOM_MB = 1.8
@@ -103,9 +102,14 @@ def build(profile, publish):
     p = PROFILES[profile]
     out = os.path.join(ROOT, p['out'], 'speedmap')
     with tempfile.TemporaryDirectory() as tmp:
-        names = os.path.join(tmp, 'roadnames_region.bin')
-        subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'map_builder', 'build_road_names.py'),
-                        '--bbox'] + [str(v) for v in NAMES_FULL_BBOX] + ['--out', names], check=True)
+        # Road names: the published Lite name channel (same file the unit would
+        # download), so the image and the channel agree; built if missing.
+        chan = os.path.join(ROOT, 'roadnames_lite154')
+        if not os.path.exists(os.path.join(chan, 'manifest.txt')):
+            subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'map_builder', 'publish_roadnames.py')],
+                           check=True)
+        names = os.path.join(chan, 'roadnames.bin')
+        names_ver = open(os.path.join(chan, 'manifest.txt'), encoding='utf-8').readline().split()[1]
         budget_mb = p['budget_mb'] - os.path.getsize(names) / 1e6  # what is left for the speed map
         if p['writable']:
             budget_mb -= STAGING_HEADROOM_MB  # room to stage online data updates
@@ -122,18 +126,14 @@ def build(profile, publish):
             subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'map_builder', 'make_region_subset.py'),
                             src, out, str(HOME[0]), str(HOME[1]), '%.2f' % budget_mb], check=True)
         shutil.copy2(names, os.path.join(out, 'roadnames.bin'))
+        with open(os.path.join(out, 'roadnames.ver'), 'w', encoding='utf-8', newline='\n') as f:
+            f.write(names_ver + '\n')  # net/NamesUpdater: the unit knows which name release it has
     version = write_manifest(out)
     print('[%s] %s: %.2f MB, %s' % (profile, os.path.relpath(out, ROOT), tree_size(out) / 1e6, version))
     if publish:
-        pub = os.path.join(ROOT, 'speedmap_' + profile)
-        if os.path.exists(pub):
-            shutil.rmtree(pub)
-        os.makedirs(pub)
-        # Only what the online updater downloads (manifest-listed files);
-        # voices ship in the flash image and in speedmap/sounds.
-        for f in MANIFEST_FILES + ['manifest.txt', 'manifest.txt.sig']:
-            shutil.copy2(os.path.join(out, f), os.path.join(pub, f))
-        print('[%s] published to %s' % (profile, os.path.relpath(pub, ROOT)))
+        print('[%s] --publish is retired: the flash cut carries third-party alert data, so it is '
+              'loaded over USB or pushed from this PC (tools/push_data.py --dir %s), never published.'
+              % (profile, os.path.relpath(out, ROOT)))
 
 
 def main():

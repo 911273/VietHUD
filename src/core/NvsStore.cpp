@@ -79,6 +79,11 @@ void loadConfigFromNVS(AppConfig &cfg) {
     String durl = prefs.getString("dataUrl", cfg.dataUpdateUrl);
     strncpy(cfg.dataUpdateUrl, durl.c_str(), sizeof(cfg.dataUpdateUrl) - 1);
     cfg.dataUpdateUrl[sizeof(cfg.dataUpdateUrl) - 1] = '\0';
+    // The Lite's online speed-map channel was retired before it shipped (2026-10-13).
+    if (strstr(cfg.dataUpdateUrl, "speedmap_lite154")) {
+        strncpy(cfg.dataUpdateUrl, BOARD_DATA_URL, sizeof(cfg.dataUpdateUrl) - 1);
+        cfg.dataUpdateUrl[sizeof(cfg.dataUpdateUrl) - 1] = '\0';
+    }
     cfg.screenRotation = prefs.getFloat("screenRot", cfg.screenRotation);
     cfg.themeMode = prefs.getFloat("themeMode", cfg.themeMode);
     cfg.brightnessMode = prefs.getFloat("briMode", cfg.brightnessMode);
