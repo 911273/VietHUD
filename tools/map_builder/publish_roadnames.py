@@ -97,7 +97,7 @@ def main():
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
     version = now.strftime('%Y.%m.%d.%H%M')
     changed = [publish_channel(a.repo, n, bbox, a.db, a.pbf, version) for n, bbox in CHANNELS.items()]
-    if a.push and any(changed):
+    if a.push:  # also commits what an earlier failed run left uncommitted
         push(a.repo, version)
 
 
