@@ -55,6 +55,9 @@
 #include "net/WebPortal.h"
 #include "core/Board.h" // boardEarlyInit()
 #include "ui/ButtonInput.h" // buttonInputPoll()
+#if BOARD_UI_LITE
+#include "boards/lite154/ui/LiteUi.h" // the Lite's own screen (no LVGL, no map)
+#endif
 #include "core/Version.h" // VIETHUD_MODEL / VIETHUD_FW_VERSION boot banner
 #include "net/DataUpdater.h" // dataUpdateStart()/GetStatus() — serial 'u' bench trigger
 #include "update/DataInstaller.h" // boot-time atomic data install + rollback (Phone Update Bridge)
@@ -207,6 +210,24 @@ static void showBootSplash() {
 }
 
 // ---------------------------------------------------------------------
+// A simple full-screen status page used by update mode and the install-result
+// notice: icon, title, message, optional progress bar, footer hint. LVGL on the
+// big screens; the Lite (BOARD_UI_LITE, no LVGL) draws it with its own OTA
+// page (src/boards/lite154/ui/LiteUi.cpp liteStatus*).
+#if BOARD_UI_LITE
+static void statusOpen(const char *title, uint32_t accent) { liteStatusOpen(title, accent); }
+static void statusIcon(bool ok, uint32_t color) { liteStatusIcon(ok, color); }
+static void statusMsg(const char *t) { liteStatusMsg(t); }
+static void statusBar(int pct) { liteStatusBar(pct); }
+static void statusSub(const char *t) { liteStatusSub(t); }
+static void statusHint(const char *t) { liteStatusHint(t); }
+static void statusClose() {}
+static void setupPump() {
+    liteStatusPump();
+    esp_task_wdt_reset();
+    delay(10);
+}
+#else
 // Shared pump for the blocking setup-time screens below (update mode, install
 // result): drive LVGL + feed the watchdog while nothing else is running yet.
 static uint32_t sPumpLastMs = 0;
@@ -221,51 +242,61 @@ static void setupPump() {
     delay(10);
 }
 
-// A simple full-screen status page used by update mode and the install-result
-// notice: big icon, title, message, optional progress bar, footer hint.
 struct StatusScreen {
     lv_obj_t *scr, *icon, *title, *msg, *bar, *sub, *hint;
 };
-static StatusScreen makeStatusScreen(const char *titleTxt, uint32_t accent) {
-    StatusScreen s;
-    s.scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(s.scr, lv_color_hex(0x0B0F14), 0);
-    lv_obj_clear_flag(s.scr, LV_OBJ_FLAG_SCROLLABLE);
+static StatusScreen sStatus;
+static void statusOpen(const char *titleTxt, uint32_t accent) {
+    sStatus.scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(sStatus.scr, lv_color_hex(0x0B0F14), 0);
+    lv_obj_clear_flag(sStatus.scr, LV_OBJ_FLAG_SCROLLABLE);
     int w = gfx->width();
-    s.icon = lv_label_create(s.scr);
-    lv_obj_set_style_text_font(s.icon, &lv_font_montserrat_28, 0);
-    lv_obj_set_style_text_color(s.icon, lv_color_hex(accent), 0);
-    lv_label_set_text(s.icon, LV_SYMBOL_DOWNLOAD);
-    lv_obj_align(s.icon, LV_ALIGN_TOP_MID, 0, 26);
-    s.title = lv_label_create(s.scr);
-    lv_obj_set_style_text_color(s.title, lv_color_hex(accent), 0);
-    lv_label_set_text(s.title, titleTxt);
-    lv_obj_align(s.title, LV_ALIGN_TOP_MID, 0, 70);
-    s.msg = lv_label_create(s.scr);
-    lv_obj_set_width(s.msg, w - 60);
-    lv_label_set_long_mode(s.msg, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(s.msg, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(s.msg, lv_color_hex(0xE6EDF3), 0);
-    lv_label_set_text(s.msg, "");
-    lv_obj_align(s.msg, LV_ALIGN_TOP_MID, 0, 104);
-    s.bar = lv_bar_create(s.scr);
-    lv_obj_set_size(s.bar, w - 120, 12);
-    lv_obj_align(s.bar, LV_ALIGN_TOP_MID, 0, 196);
-    lv_obj_set_style_bg_color(s.bar, lv_color_hex(0x1E2A38), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s.bar, lv_color_hex(accent), LV_PART_INDICATOR);
-    lv_bar_set_range(s.bar, 0, 100);
-    lv_obj_add_flag(s.bar, LV_OBJ_FLAG_HIDDEN);
-    s.sub = lv_label_create(s.scr);
-    lv_obj_set_style_text_color(s.sub, lv_color_hex(0x8A98A8), 0);
-    lv_label_set_text(s.sub, "");
-    lv_obj_align(s.sub, LV_ALIGN_TOP_MID, 0, 216);
-    s.hint = lv_label_create(s.scr);
-    lv_obj_set_style_text_color(s.hint, lv_color_hex(0x6B7888), 0);
-    lv_label_set_text(s.hint, "");
-    lv_obj_align(s.hint, LV_ALIGN_BOTTOM_MID, 0, -18);
-    lv_screen_load(s.scr);
-    return s;
+    sStatus.icon = lv_label_create(sStatus.scr);
+    lv_obj_set_style_text_font(sStatus.icon, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(sStatus.icon, lv_color_hex(accent), 0);
+    lv_label_set_text(sStatus.icon, LV_SYMBOL_DOWNLOAD);
+    lv_obj_align(sStatus.icon, LV_ALIGN_TOP_MID, 0, 26);
+    sStatus.title = lv_label_create(sStatus.scr);
+    lv_obj_set_style_text_color(sStatus.title, lv_color_hex(accent), 0);
+    lv_label_set_text(sStatus.title, titleTxt);
+    lv_obj_align(sStatus.title, LV_ALIGN_TOP_MID, 0, 70);
+    sStatus.msg = lv_label_create(sStatus.scr);
+    lv_obj_set_width(sStatus.msg, w - 60);
+    lv_label_set_long_mode(sStatus.msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(sStatus.msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(sStatus.msg, lv_color_hex(0xE6EDF3), 0);
+    lv_label_set_text(sStatus.msg, "");
+    lv_obj_align(sStatus.msg, LV_ALIGN_TOP_MID, 0, 104);
+    sStatus.bar = lv_bar_create(sStatus.scr);
+    lv_obj_set_size(sStatus.bar, w - 120, 12);
+    lv_obj_align(sStatus.bar, LV_ALIGN_TOP_MID, 0, 196);
+    lv_obj_set_style_bg_color(sStatus.bar, lv_color_hex(0x1E2A38), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sStatus.bar, lv_color_hex(accent), LV_PART_INDICATOR);
+    lv_bar_set_range(sStatus.bar, 0, 100);
+    lv_obj_add_flag(sStatus.bar, LV_OBJ_FLAG_HIDDEN);
+    sStatus.sub = lv_label_create(sStatus.scr);
+    lv_obj_set_style_text_color(sStatus.sub, lv_color_hex(0x8A98A8), 0);
+    lv_label_set_text(sStatus.sub, "");
+    lv_obj_align(sStatus.sub, LV_ALIGN_TOP_MID, 0, 216);
+    sStatus.hint = lv_label_create(sStatus.scr);
+    lv_obj_set_style_text_color(sStatus.hint, lv_color_hex(0x6B7888), 0);
+    lv_label_set_text(sStatus.hint, "");
+    lv_obj_align(sStatus.hint, LV_ALIGN_BOTTOM_MID, 0, -18);
+    lv_screen_load(sStatus.scr);
 }
+static void statusIcon(bool ok, uint32_t color) {
+    lv_label_set_text(sStatus.icon, ok ? LV_SYMBOL_OK : LV_SYMBOL_WARNING);
+    lv_obj_set_style_text_color(sStatus.icon, lv_color_hex(color), 0);
+}
+static void statusMsg(const char *t) { lv_label_set_text(sStatus.msg, t); }
+static void statusBar(int pct) {
+    lv_obj_clear_flag(sStatus.bar, LV_OBJ_FLAG_HIDDEN);
+    lv_bar_set_value(sStatus.bar, pct, LV_ANIM_OFF);
+}
+static void statusSub(const char *t) { lv_label_set_text(sStatus.sub, t); }
+static void statusHint(const char *t) { lv_label_set_text(sStatus.hint, t); }
+static void statusClose() { lv_obj_delete(sStatus.scr); }
+#endif
 
 // After a boot that swapped in new data (or rolled back a bad install), tell
 // the driver what happened for ~2.5 s before the normal splash.
@@ -273,17 +304,16 @@ static void showInstallResult(bool rolledBack) {
     char detail[64];
     installerLastResult(detail, sizeof(detail), false);
     Serial.printf("[install] result screen: %s (%s)\n", rolledBack ? "ROLLED BACK" : "UPDATED", detail);
-    StatusScreen s = makeStatusScreen(rolledBack ? "PREVIOUS DATA RESTORED" : "DATA UPDATED",
-                                      rolledBack ? 0xE8B931 : 0x34C46A);
-    lv_label_set_text(s.icon, rolledBack ? LV_SYMBOL_WARNING : LV_SYMBOL_OK);
+    statusOpen(rolledBack ? "PREVIOUS DATA RESTORED" : "DATA UPDATED", rolledBack ? 0xE8B931 : 0x34C46A);
+    statusIcon(!rolledBack, rolledBack ? 0xE8B931 : 0x34C46A);
     char b[160];
     if (rolledBack)
         snprintf(b, sizeof(b), "The update could not be used (%s).\nVietHUD went back to the previous data.", detail);
     else
         snprintf(b, sizeof(b), "Maps and alerts installed.\nData version: %s", detail);
-    lv_label_set_text(s.msg, b);
+    statusMsg(b);
     for (int i = 0; i < 250; i++) setupPump();
-    lv_obj_delete(s.scr);
+    statusClose();
 }
 
 // ---------------------------------------------------------------------
@@ -297,15 +327,14 @@ static void showInstallResult(bool rolledBack) {
 // the boot-time installer swaps the data in. This function never returns.
 static void runDataUpdateMode() {
     Serial.println("[update-mode] entered — display+SD only, connecting WiFi for OTA");
-    StatusScreen s = makeStatusScreen("DATA UPDATE", 0x3DA5FF);
-    lv_label_set_text(s.hint, "Do not power off during the update");
-    lv_label_set_text(s.msg, "Connecting to Wi-Fi...");
+    statusOpen("DATA UPDATE", 0x3DA5FF);
+    statusHint("Do not power off during the update");
+    statusMsg("Connecting to Wi-Fi...");
     for (int i = 0; i < 12; i++) setupPump();
     auto finish = [&](const char *text, bool ok, int ticks) {
-        lv_label_set_text(s.icon, ok ? LV_SYMBOL_OK : LV_SYMBOL_WARNING);
-        lv_obj_set_style_text_color(s.icon, lv_color_hex(ok ? 0x34C46A : 0xE8B931), 0);
-        lv_label_set_text(s.msg, text);
-        lv_label_set_text(s.hint, "Restarting...");
+        statusIcon(ok, ok ? 0x34C46A : 0xE8B931);
+        statusMsg(text);
+        statusHint("Restarting...");
         for (int i = 0; i < ticks; i++) setupPump();
         ESP.restart();
     };
@@ -381,7 +410,7 @@ static void runDataUpdateMode() {
             // that specific network".
             char b[64];
             snprintf(b, sizeof(b), "Connecting to Wi-Fi... %lus", (unsigned long)((millis() - tAll) / 1000));
-            lv_label_set_text(s.msg, b);
+            statusMsg(b);
             setupPump();
         }
         up = WiFi.status() == WL_CONNECTED;
@@ -394,7 +423,7 @@ static void runDataUpdateMode() {
     Serial.printf("[update-mode] STA up: %s  free internal=%u biggest=%u\n", WiFi.localIP().toString().c_str(),
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    lv_label_set_text(s.msg, "Connected. Checking for updates...");
+    statusMsg("Connected. Checking for updates...");
     for (int i = 0; i < 10; i++) setupPump();
 
     if (!dataUpdateStart()) {
@@ -403,18 +432,18 @@ static void runDataUpdateMode() {
         snprintf(b, sizeof(b), "Error: %s", st.message);
         finish(b, false, 450);
     }
-    lv_obj_clear_flag(s.bar, LV_OBJ_FLAG_HIDDEN);
+    statusBar(0);
     for (;;) {
         DataUpdateStatus st = dataUpdateGetStatus();
-        lv_label_set_text(s.msg, st.message);
+        statusMsg(st.message);
         if (st.filesTotal > 0) {
             int cur = st.filesDone < st.filesTotal ? st.percent : 0;
             int overall = (st.filesDone * 100 + cur) / st.filesTotal;
-            lv_bar_set_value(s.bar, overall, LV_ANIM_OFF);
+            statusBar(overall);
             char b[48];
             snprintf(b, sizeof(b), "File %d/%d  ·  %d%%",
                      st.filesDone < st.filesTotal ? st.filesDone + 1 : st.filesTotal, st.filesTotal, overall);
-            lv_label_set_text(s.sub, b);
+            statusSub(b);
         }
         setupPump();
         if (st.state == DU_SUCCESS || st.state == DU_FAILED) {
@@ -454,6 +483,13 @@ void setup() {
     loadConfigFromNVS(cfg);
 
     boardEarlyInit(); // VietHUD 2.8: shared touch/codec I2C bus, FT6336 reset, ES8311 setup (no-op on 3.5")
+#if BOARD_UI_LITE
+    // Lite: its own plain-GFX screen (no LVGL, no map) — src/boards/lite154/ui.
+    audioInit();
+    audioSetVoicePack((int)cfg.voicePack);
+    audioPlayStartupJingle();
+    liteUiBegin();
+#else
     backlightBegin();
     applyConfig(); // sets initial backlight duty from loaded cfg.brightness
 
@@ -504,6 +540,7 @@ void setup() {
     // 20ms is a middle ground between that and LVGL's laggier ~30ms default.
     lv_timer_set_period(lv_indev_get_read_timer(lvTouchIndev), 20);
     lv_indev_set_long_press_time(lvTouchIndev, HOLD_PRESS_MS);      // hold 1s anywhere on the dashboard = Settings
+#endif // !BOARD_UI_LITE
 
     // Data install journal (Phone Update Bridge / online update): swap staged,
     // verified files in BEFORE the map data is loaded into PSRAM, then let the
@@ -524,10 +561,12 @@ void setup() {
         runDataUpdateMode();
     }
 
+#if !BOARD_UI_LITE
     buildDashboard();
     buildSettingsScreen();
     buildUpdateScreen();
     showBootSplash(); // ~2s animated VRE logo, then cross-fades to the Dashboard (blocking)
+#endif
 #ifdef VIETHUD_P4
     // First boot on this panel / after a rotation change: calibrate touch
     // (gives up after 30 s untouched, keeping the nominal mapping).
@@ -556,9 +595,11 @@ void setup() {
     // project's own working code. SdCardManager.cpp now uses SD_MMC.h,
     // which shares no hardware with the display's QSPI or the touch I2C
     // bus, so this is re-enabled.)
+#if !BOARD_UI_LITE
     refreshDashboard();
     lv_timer_create(simTimerCb, 150, NULL);
     lv_timer_create(burnInTimerCb, 60000, NULL);
+#endif
 
     Serial.println("[viethud] running — hold the screen 1s to open Settings");
 }
@@ -712,7 +753,9 @@ void loop() {
             else roadSimRequestStop();
         } else if (c == 'P') {
             // Bench: screenshot of the active screen as raw RGB565 over serial.
-#ifdef VIETHUD_P4
+#if BOARD_UI_LITE
+            Serial.println("[snap] not available on the Lite screen");
+#elif defined(VIETHUD_P4)
             // DIRECT-mode frame is the whole current screen already (a 768KB
             // lv_snapshot_take would not fit the LVGL pool).
             {
@@ -728,6 +771,7 @@ void loop() {
 #else
             lv_draw_buf_t *snap = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_RGB565);
 #endif
+#if !BOARD_UI_LITE
             if (snap) {
                 Serial.printf("[snap] %u %u %u\n", (unsigned)snap->header.w, (unsigned)snap->header.h,
                               (unsigned)snap->header.stride);
@@ -742,9 +786,12 @@ void loop() {
                 Serial.println("[snap] failed (out of memory)");
             }
 #endif
+#endif // !BOARD_UI_LITE
         } else if (c == 'U') {
+#if !BOARD_UI_LITE
             openUpdateScreen();
             Serial.println("[debug] opened update screen via serial");
+#endif
         } else if (c == 'u') {
             // Bench trigger for the OTA data update. Uses the SAME reliable path
             // as the web + on-screen buttons: set the NVS flag and reboot into
@@ -773,12 +820,17 @@ void loop() {
 #endif
 
     uint32_t now = millis();
+#if BOARD_UI_LITE
+    (void)lastTick;
+    liteUiTick(); // Lite screen + buttons + alert sounds (src/boards/lite154/ui)
+#else
     lv_tick_inc(now - lastTick);
     lastTick = now;
     lv_timer_handler();
     updateScreenPoll();
     updatePromptPoll(); // auto firmware check on Wi-Fi + "update now?" prompt (UpdateScreen.cpp)
     buttonInputPoll();  // physical buttons on boards without touch (ui/ButtonInput.cpp)
+#endif
 
     // Report where the frame time actually goes, so tuning stops being guesswork.
     if (now - lastStatsMs > 5000) {
@@ -824,11 +876,13 @@ void loop() {
         // RAM audit) since that pool's own real max_used is what
         // LV_MEM_SIZE should be sized against, not a guess; see lv_conf.h's
         // own comment for the measurement this constant was picked from.
+#if !BOARD_UI_LITE
         lv_mem_monitor_t mon;
         lv_mem_monitor(&mon);
         Serial.printf("[mem] lvgl pool total=%uB maxUsed=%uB (%u%%) freeBiggest=%uB fragPct=%u%%\n",
                       (unsigned)mon.total_size, (unsigned)mon.max_used, mon.used_pct,
                       (unsigned)mon.free_biggest_size, mon.frag_pct);
+#endif
         // This loop() IS the Arduino framework's own loopTask (Core 1), not
         // one this project creates itself, but its stack still comes out of
         // internal RAM like every other task's, so it's tracked here too.
