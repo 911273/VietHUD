@@ -76,6 +76,7 @@
 // IPS panel with inversion on visibly lifts the lowest RGB565 codes: its
 // near-black 0x04060A showed as a tinted grey (2026-10-10) — use pure black.
 #define BOARD_DARK_BG             0x000000
+#define BOARD_UI_HIGH_CONTRAST    1        // IPS w/ inversion lifts dark greys: true-black Settings panels, brighter text
 #define BOARD_I2S_MCLK_PIN        I2S_MCLK_PIN // ES8311 needs MCLK = 256 x fs
 #define BOARD_AUDIO_NAME          "ES8311"
 // "P18 Pro" GPS: UBX-only, its real config interface is a Quectel-style
