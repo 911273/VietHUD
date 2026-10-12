@@ -167,7 +167,10 @@ static int runUpdate(uint8_t *dlBuf, size_t dlBufSize) {
     }
     char err[80];
     int rc = installerOpenSession(manifest.c_str(), manifest.length(), sig.c_str(), err, sizeof(err));
-    if (rc == 200) {
+    if (rc == 200 || (rc == 409 && strstr(err, "older"))) {
+        // Current — or the card already holds a NEWER set than the server (e.g.
+        // pushed from a PC): nothing to install here, but not a failure either,
+        // so the road-name channel still gets its turn.
         setStatus(DU_RUNNING, "Data is already up to date"); // final status set after the road names
         return 2;
     }
