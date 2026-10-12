@@ -11,7 +11,27 @@
 #include "boards/es3c28p/board_config.h"
 #elif defined(VIETHUD_BOARD_LITE154)
 #include "boards/lite154/board_config.h"
+#elif defined(VIETHUD_BOARD_JC4880P443C)
+#include "boards/jc4880p443c/board_config.h"
 #elif defined(VIETHUD_BOARD_JC3248W535) || !defined(VIETHUD_BOARD_DEFINED_ELSEWHERE)
 // JC3248W535 is also the default, so the bring-up/rawtest envs (no flag) keep working.
 #include "boards/jc3248w535/board_config.h"
+#endif
+
+// Defaults for capabilities most boards don't have, so a board config only
+// lists what it actually has.
+#ifndef BOARD_SD_4BIT
+#define BOARD_SD_4BIT 0 // 1-bit SD_MMC (CLK/CMD/D0)
+#endif
+#ifndef BOARD_SD_LDO_CHAN
+#define BOARD_SD_LDO_CHAN -1 // card power not from an on-chip LDO
+#endif
+#ifndef BOARD_FLASH_DATA_READONLY
+#define BOARD_FLASH_DATA_READONLY 0
+#endif
+// Online data channel (folder on the Pi / GitHub) this board updates from:
+// "speedmap" = the full shared set (card boards); a flash-only board gets the
+// cut of the same set that fits its partition (tools/build_flash_data.py).
+#ifndef BOARD_DATA_PROFILE
+#define BOARD_DATA_PROFILE "speedmap"
 #endif

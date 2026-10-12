@@ -1,95 +1,140 @@
-# VietHUD platform — one core, many boards
+# VietHUD platform — one firmware, one data set, many boards
 
-Status: phase 0–1 done 2026-10-10 (3.5" and 2.8" on the shared core). P4 and
-Lite 1.54" are the next phases (see *Roadmap*).
+Status 2026-10-12: all four models build from this one tree at platform
+version **4.0.0** — 3.5" (JC3248W535), 2.8" (ES3C28P), Lite 1.54" (Waveshare
+S3 LCD 1.54) and 4.3" (Guition JC4880P443C, ESP32-P4). Only the hardware layer
+and the screen layout differ per model; firmware versioning, data and OTA are
+the same for all.
+
+## Models
+
+| model id | env | board | screen / input | data |
+|---|---|---|---|---|
+| `viethud35` | `viethud` | JC3248W535 (ESP32-S3) | 3.5" 320x480 AXS15231B QSPI, touch | microSD |
+| `viethud28` | `viethud28` | LCDwiki ES3C28P (ESP32-S3) | 2.8" 320x240 ILI9341V, FT6336 touch | microSD |
+| `viethud154` | `viethud_lite154` | Waveshare S3 LCD 1.54 (ESP32-S3) | 1.54" 240x240 ST7789, 3 buttons | on-chip flash (`speedmap_lite154`) |
+| `viethud43` | `viethud_p4` | Guition JC4880P443C (ESP32-P4 + C6) | 4.3" 800x480 MIPI-DSI, GT911 touch | microSD, else on-chip flash (read-only) |
+
+`tools/models.py` is the registry every tool reads. `env:viethud_p4_sim` is a
+bench build of the P4 that drives a simulated car (never for a car).
 
 ## Layout
 
 ```
-platformio.ini            one env per model; [viethud_core] = the shared source list
-include/boards/board.h    picks the board from the env's -DVIETHUD_BOARD_* flag
-include/boards/<board>/board_config.h
-                          pins, panel geometry, identity (model id, OTA channel,
-                          release version) and CAPABILITY flags
-src/boards/<board>/board.cpp
-                          the board's implementation of src/core/Board.h:
-                          early init (buses, codec), amp, panel driver, touch
-src/core gnss map net log audio update display touch ui
-                          shared product code — no board names in here, only
-                          BOARD_* capabilities
-apps/lite154/             VietHUD Lite 1.54" (stand-alone, button UI) until it
-                          moves onto the core (phase 3)
-data/ speedmap*/ tools/   shared data format + builders
-firmware/<channel>/       OTA channels, one per model (version.json has "model")
+platformio.ini             one env per model; [viethud_core] = the shared source list
+include/boards/board.h     picks the board from -DVIETHUD_BOARD_*; capability defaults
+include/boards/<board>/board_config.h   pins, panel, identity, CAPABILITY flags
+src/boards/<board>/        board.cpp (src/core/Board.h) + any board-only drivers
+                           (the P4 brings its own display/touch/audio-out + 1.5x fonts)
+src/core gnss map net log audio update display touch ui   shared product code
+speedmap/                  THE data set (signed manifest), used by every model
+speedmap_<profile>/        cut of speedmap/ for flash-only boards (published, signed)
+firmware/release.json      THE firmware manifest: one version, one image per model
+firmware/<ver>/<model>.bin the images
+firmware/<model>/          pre-4.0 per-model channel (kept for units on 3.x)
+firmware/version.json      old stand-alone Lite's channel (do not reuse)
+apps/lite154/              old stand-alone Lite firmware (3.5.8), legacy only
+hardware/                  enclosures
+releases/                  frozen releases + archived trees (gitignored)
 ```
 
-Shared code may test a **capability** (`#if BOARD_GNSS_PQTM`,
-`BOARD_I2S_MCLK_PIN >= 0`, `TFT_RES_W <= 240`) but never a board name.
-`include/pincfg.h` / `include/dispcfg.h` remain as one-line shims to
-`boards/board.h` for older includes.
+Shared code tests a **capability** (`#if BOARD_HAS_SD_SLOT`,
+`BOARD_I2S_MCLK_PIN >= 0`, `TFT_RES_W <= 240`), never a board name. The one
+exception is `VIETHUD_P4`: the chip-family switch for IDF-5-only APIs (MIPI-DSI,
+PPA, i2s_std, temperature_sensor, C6 BLE) set by the P4 env.
 
-## Models
-
-| env | board | screen | model id / OTA channel | version line |
-|---|---|---|---|---|
-| `viethud` | JC3248W535 | 3.5" 320x480 AXS15231B QSPI, touch | `viethud35` / `firmware/viethud35` | 3.1.x |
-| `viethud28` | LCDwiki ES3C28P | 2.8" 240x320 ILI9341V SPI, FT6336, ES8311 | `viethud28` / `firmware/viethud28` | 3.1.x |
-| `apps/lite154` | Waveshare S3 LCD 1.54 | 1.54", buttons, no SD | (Lite, own code) / `firmware/` root | 3.4.x |
-
-The bare `firmware/` root is still VietHUD Lite's: deployed Lite units read
-it. It must not be reused for another model until Lite has moved to
-`firmware/lite154`.
-
-## Capability flags (board_config.h)
+## Capability flags
 
 | flag | meaning |
 |---|---|
-| `BOARD_MODEL`, `BOARD_MODEL_ID`, `BOARD_FW_CHANNEL`, `BOARD_FW_VERSION` | identity, OTA folder, release line |
-| `BOARD_PANEL_SPI_HZ` | clock for the panel bus (`GFX_NOT_DEFINED` = driver default) |
-| `BOARD_DEFAULT_ROTATION`, `BOARD_LANDSCAPE_ONLY` | which orientations have a layout |
-| `BOARD_DARK_BG` | darkest background colour the panel shows as black |
-| `BOARD_I2S_MCLK_PIN`, `BOARD_AUDIO_NAME` | codec needs MCLK (>=0) or plain I2S amp (-1) |
+| `BOARD_MODEL`, `BOARD_MODEL_ID`, `BOARD_FW_CHANNEL` | identity; the model id selects the OTA image |
+| `TFT_RES_W/H` | native panel size in UI units (layout choice) |
+| `BOARD_DEFAULT_ROTATION`, `BOARD_LANDSCAPE_ONLY` | orientations with a layout |
+| `BOARD_DARK_BG` | darkest background the panel shows as black |
+| `BOARD_I2S_MCLK_PIN`, `BOARD_AUDIO_NAME` | codec (MCLK >= 0) or plain I2S amp (-1) |
+| `BOARD_HAS_TOUCH` | 0 = physical buttons (`ui/ButtonInput.cpp`) |
+| `BOARD_HAS_SD_SLOT`, `BOARD_SD_4BIT`, `BOARD_SD_LDO_CHAN` | card slot wiring |
+| `BOARD_HAS_FLASH_DATA`, `BOARD_FLASH_DATA_READONLY` | data in the `ffat` partition |
+| `BOARD_DATA_PROFILE` | online data channel folder (default `speedmap`) |
 | `BOARD_GNSS_PQTM`, `GNSS_BAUD` | GPS module dialect / baud |
+
+## Firmware: one version, auto-selected per hardware
+
+`src/core/Version.h` holds the one platform version. A release builds every
+model at the same commit:
+
+```
+python tools/release.py 4.0.1 --notes "..." [--upload-pi]
+```
+
+It writes `firmware/<ver>/<model>.bin` and `firmware/release.json`:
+
+```json
+{"version": "4.0.1", "notes": "...",
+ "images": {"viethud35": {"chip": "esp32s3", "path": "4.0.1/viethud35.bin", "size": ..., "sha256": "..."},
+            "viethud43": {"chip": "esp32p4", ...}, ...}}
+```
+
+A device fetches `release.json` (Pi LAN → mDNS → Tailscale → GitHub), looks
+itself up by its model id and downloads only its own image. Before the new
+image can boot, `net/FwUpdater.cpp` checks it against the hardware:
+
+1. chip id in the image header = this chip (an S3 never takes a P4 image);
+2. the image's identity marker `VIETHUD-HW-ID:<model>;` = this model;
+3. SHA-256 = `release.json`.
+
+Any mismatch aborts; the running firmware stays. `release.py` runs the same
+three checks on every image before staging it. It also rewrites
+`firmware/<model>/version.json`, so units still on 3.x (which only read that)
+get 4.x and from then on use `release.json`.
+
+Build/flash one model: `python tools/build.py <env> [upload|uploadfs] [--port COMx]`
+(`all` = every model). It picks the toolchain: S3 = default PlatformIO core
+(espressif32@7.1.3); P4 = isolated pioarduino core `~/.platformio_p4`.
+
+## Data: one set, cut per storage
+
+`speedmap/` (format V2: metadata/index/tiles/names/seg_names/cameras/signs +
+ECDSA-signed manifest) is the single source; the Pi pipeline refreshes it daily.
+Card boards use it as is. Flash-only boards get a cut of the same files, same
+data version, re-signed:
+
+```
+python tools/build_flash_data.py all [--publish]
+python tools/build.py viethud_lite154 uploadfs
+```
+
+| profile | partition | content |
+|---|---|---|
+| `p4` (`data_p4/`) | 13.5 MB, read-only | whole country, default voices |
+| `lite154` (`data_lite154/`, published `speedmap_lite154/`) | 9.9 MB | all cameras/signs nationwide, road tiles ~25 km around Ha Noi |
+
+Online data updates read `BOARD_DATA_PROFILE`: card boards `speedmap/`, Lite
+`speedmap_lite154/`. **TODO:** the Pi daily job must also run
+`build_flash_data.py lite154 --publish` after it refreshes `speedmap/`,
+or the Lite channel goes stale. The P4 without a card cannot take online data
+(its flash data is read-only) — insert a card.
+
+## Old stand-alone Lite (3.x) units
+
+They run `apps/lite154` on the stock `default_16MB` partition table and read
+`firmware/version.json`. The core firmware needs `partitions_lite154.csv`
+(a FAT data partition), which OTA cannot change — so moving a Lite to the
+platform takes **one USB flash** (`build.py viethud_lite154 upload` +
+`uploadfs`); after that it updates like every other model. Never publish a
+core image into `firmware/version.json`.
 
 ## Adding a board
 
-1. `include/boards/<name>/board_config.h` — pins + every flag above.
+1. `include/boards/<name>/board_config.h` — pins + flags above.
 2. `src/boards/<name>/board.cpp` — implement `src/core/Board.h`.
 3. A branch in `include/boards/board.h` for `VIETHUD_BOARD_<NAME>`.
-4. An env: `build_src_filter = ${viethud_core.src_filter} +<boards/<name>/*>`
-   and `-DVIETHUD_BOARD_<NAME>`.
-5. If the screen size has no layout yet, add one in `ui/` keyed off the
-   screen size (as `buildDashboardCompact()` is for 320x240).
+4. An env with `build_src_filter = ${viethud_core.src_filter} +<boards/<name>/*>`.
+5. An entry in `tools/models.py` (and a data profile if it has no card slot).
+6. A layout in `ui/` if the screen class is new.
 
-## Data packs
+## Release checklist
 
-All map + traffic-alert data uses one on-card format (`speedmap` V2:
-metadata/index/tiles/names/seg_names/cameras/signs + signed manifest). Each
-source is a pack in its own folder — `/speedmap` (default), `/speedmap_wyn`,
-`/speedmap_gofa`, and planned `/speedmap_vietmap` — selected in Settings >
-Map. Builders live in `tools/`; the same builders must emit an
-**alerts-only pack** (cameras + signs, no road tiles) small enough for
-on-chip flash, for boards without an SD slot (Lite).
-
-## Release
-
-```
-python tools/release_firmware.py viethud28 3.1.2 --notes "..." [--upload-pi]
-```
-builds with the version stamped, stages `firmware/<channel>/<ver>/firmware.bin`
-and `version.json` (with `model`), optionally copies both to the Pi. Then
-commit + push the channel folder — devices away from home update from GitHub.
-Before every push: all envs build (`pio run -e viethud -e viethud28 -e jc3248w535`,
-`pio run -d apps/lite154`) and the host tests pass (`bash test/host/run_track.sh`).
-
-## Roadmap
-
-0. ✅ Lite code moved out of `src/` into `apps/lite154`; bring-up env fixed;
-   3.5" channel moved to `firmware/viethud35`; release script.
-1. ✅ Board configs + `src/boards/*` for 3.5" and 2.8"; shared code free of
-   board names.
-2. P4 (`radar_car_p4`, branch `p4-port`) as `boards/p4` — reconcile its
-   diverged core files feature by feature. Needs the P4 hardware to verify.
-3. Lite 1.54" on the core: shared GNSS/OTA/Wi-Fi/config, alerts-only pack in
-   flash, its button UI as `ui/lite`. Moves Lite's OTA to `firmware/lite154`.
-4. CI: build every env + host tests on each push; release from tags.
+All four models build (`python tools/build.py all`), host tests pass
+(`bash test/host/run_track.sh`), then `tools/release.py`. Hardware tests
+before publishing: at least one S3 model and the P4 on the bench.

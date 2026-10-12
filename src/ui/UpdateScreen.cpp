@@ -54,7 +54,7 @@ static void fwOtaTask(void *) {
             strncpy(s_fwStatusMsg, msg, sizeof(s_fwStatusMsg) - 1);
             s_fwStatusMsg[sizeof(s_fwStatusMsg) - 1] = '\0';
         }
-    });
+    }, s_fwInfo.sha256);
     s_updatingFw = false;
     vTaskDelete(NULL);
 }

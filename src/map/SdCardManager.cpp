@@ -7,6 +7,9 @@
 #if BOARD_HAS_FLASH_DATA
 #include <FFat.h>
 #endif
+#if BOARD_SD_LDO_CHAN >= 0
+#include <esp_ldo_regulator.h> // TF_VCC from an on-chip LDO (P4)
+#endif
 #include <esp_heap_caps.h>
 #include <esp_task_wdt.h> // esp_task_wdt_reset() — see ensureSdMmcBegun()'s own comment
 #include <mbedtls/sha256.h> // sdMgrSha256File() — data-install readback verify
@@ -34,6 +37,13 @@ static fs::FS *gDataFs = &SD_MMC;
 static bool gDataOnFlash = false;
 fs::FS &sdMgrDataFs() { return *gDataFs; }
 bool sdMgrDataOnFlash() { return gDataOnFlash; }
+// Boards whose flash data partition must never be written (P4: writes
+// corrupted its FFat) refuse every write while running from it.
+#if BOARD_FLASH_DATA_READONLY
+#define DATA_READONLY() (gDataOnFlash)
+#else
+#define DATA_READONLY() (false)
+#endif
 
 // Standard reflected CRC-32 (polynomial 0xEDB88320) — the same algorithm
 // Python's zlib.crc32 uses, so build_speedmap.py's `zlib.crc32(index_bytes)`
@@ -281,8 +291,43 @@ static uint32_t lastFailedAttemptMs = 0;
 // present at all.
 static const uint32_t kRetryCooldownMs = 30000;
 
-#if BOARD_HAS_SD_SLOT
-// Brings up the microSD card on the SD_MMC peripheral. Split out of
+#if BOARD_HAS_SD_SLOT && BOARD_SD_4BIT
+// 4-bit SDMMC slot (P4 JC4880P443C: IO_MUX pins, TF_VCC fed by the on-chip
+// LDO channel BOARD_SD_LDO_CHAN — without it the card is unpowered and init
+// times out with 0x107, exactly what the factory fw logged). SD_MMC must not
+// grab an LDO itself (setPowerChannel(-1)) or it collides with this one.
+static bool beginSdCard() {
+#if BOARD_SD_LDO_CHAN >= 0
+    static esp_ldo_channel_handle_t sSdLdo = nullptr;
+    if (!sSdLdo) {
+        esp_ldo_channel_config_t lc = {};
+        lc.chan_id = BOARD_SD_LDO_CHAN;
+        lc.voltage_mv = 3300;
+        if (esp_ldo_acquire_channel(&lc, &sSdLdo) != ESP_OK) Serial.println("[sdmgr] SD LDO acquire failed");
+        delay(50);
+    }
+#endif
+    SD_MMC.end();
+    SD_MMC.setPins(SD_MMC_CLK_PIN, SD_MMC_CMD_PIN, SD_MMC_D0_PIN, SD_MMC_D1_PIN, SD_MMC_D2_PIN, SD_MMC_D3_PIN);
+#if BOARD_SD_LDO_CHAN >= 0
+    SD_MMC.setPowerChannel(-1);
+#endif
+    static const int kFreqs[] = {SDMMC_FREQ_HIGHSPEED, SDMMC_FREQ_DEFAULT, SDMMC_FREQ_PROBING};
+    for (int f : kFreqs) {
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset(); // caller task may not be subscribed (IDF 5 logs an error then)
+        if (SD_MMC.begin("/sdmmc", false, false, f)) {
+            Serial.printf("[sdmgr] SD mounted (4-bit, %d kHz): %llu MB, type %d\n", f,
+                          SD_MMC.cardSize() / (1024 * 1024), SD_MMC.cardType());
+            return true;
+        }
+        SD_MMC.end();
+        delay(50);
+    }
+    Serial.println("[sdmgr] SD_MMC.begin() failed — no card detected");
+    return false;
+}
+#elif BOARD_HAS_SD_SLOT
+// Brings up the microSD card (1-bit) on the SD_MMC peripheral. Split out of
 // ensureSdMmcBegun() (2026-10-10) so boards with an on-chip data partition can
 // fall back to it.
 static bool beginSdCard() {
@@ -740,6 +785,21 @@ bool sdMgrReadTile(const TileIndexEntry &entry, RoadSegment *outBuf, int maxSegm
     size_t got = f.read((uint8_t *)outBuf, toRead * sizeof(RoadSegment));
     f.close();
     *outCount = (int)(got / sizeof(RoadSegment));
+    // Sanitize impossible limits from raw OSM maxspeed tags (found by the
+    // 2026-09-29 all-limits sweep: 2, and 6060 from a "60;60"-style tag).
+    // A doubled value decodes to itself; anything else outside 5..130 km/h
+    // becomes UNKNOWN rather than being shown or spoken. Odd-but-plausible
+    // values (51, 87, 89) are left as the data says.
+    for (int i = 0; i < *outCount; i++) {
+        int16_t &lim = outBuf[i].speedLimitKmh;
+        if (lim < 0 || (lim >= 5 && lim <= 130)) continue;
+        int16_t fixed = -1;
+        if (lim >= 1000 && lim % 100 == lim / 100 && lim % 100 >= 5 && lim % 100 <= 130) fixed = lim % 100;
+        static uint32_t sLogged = 0;
+        if (sLogged++ < 8)
+            Serial.printf("[sdmgr] seg %lu: invalid speed limit %d -> %d\n", (unsigned long)outBuf[i].id, lim, fixed);
+        lim = fixed;
+    }
     return true;
 }
 
@@ -854,6 +914,7 @@ int sdMgrListTripLogs(uint32_t *outIds, uint32_t *outSizes, int maxCount) {
 int sdMgrDeleteAllTripLogs() {
     SdLock lock;
     if (!ensureSdMmcBegun()) return -1;
+    if (DATA_READONLY()) return -1;
     File dir = gDataFs->open("/triplog");
     if (!dir || !dir.isDirectory()) {
         if (dir) dir.close();
@@ -904,6 +965,7 @@ int sdMgrReadFileChunk(const char *path, size_t offset, uint8_t *buf, size_t buf
 bool sdMgrAppendLine(const char *path, const char *line) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
+    if (DATA_READONLY()) return false;
 
     // FILE_APPEND creates the file if missing, but NOT missing parent
     // directories — SD_MMC.mkdir() one level up first if the target isn't
@@ -939,6 +1001,7 @@ bool sdMgrAppendLine(const char *path, const char *line) {
 bool sdMgrAppendBytes(const char *path, const uint8_t *buf, size_t len) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
+    if (DATA_READONLY()) return false;
     const char *slash = strrchr(path, '/');
     if (slash && slash != path) {
         char dir[64];
@@ -959,6 +1022,7 @@ bool sdMgrAppendBytes(const char *path, const uint8_t *buf, size_t len) {
 bool sdMgrRemove(const char *path) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
+    if (DATA_READONLY()) return false;
     if (!gDataFs->exists(path)) return true; // already gone = success
     return gDataFs->remove(path);
 }
@@ -966,6 +1030,7 @@ bool sdMgrRemove(const char *path) {
 bool sdMgrRename(const char *from, const char *to) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
+    if (DATA_READONLY()) return false;
     gDataFs->remove(to); // rename won't overwrite an existing target on some FS impls
     return gDataFs->rename(from, to);
 }
@@ -1107,6 +1172,7 @@ static File sWriter;
 bool sdMgrWriterOpen(const char *path, bool append) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
+    if (DATA_READONLY()) return false;
     if (sWriter) sWriter.close();
     sWriter = gDataFs->open(path, append ? FILE_APPEND : FILE_WRITE);
     return (bool)sWriter;
@@ -1145,6 +1211,7 @@ bool sdMgrExists(const char *path) {
 bool sdMgrMkdir(const char *path) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
+    if (DATA_READONLY()) return false;
     return gDataFs->exists(path) || gDataFs->mkdir(path);
 }
 
@@ -1154,6 +1221,7 @@ bool sdMgrMkdir(const char *path) {
 bool sdMgrMove(const char *from, const char *to) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
+    if (DATA_READONLY()) return false;
     return gDataFs->rename(from, to);
 }
 
@@ -1174,6 +1242,7 @@ uint64_t sdMgrFreeBytes() {
 bool sdMgrWriteSmallFile(const char *path, const void *data, size_t len) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
+    if (DATA_READONLY()) return false;
     File f = gDataFs->open(path, FILE_WRITE);
     if (!f) return false;
     size_t w = f.write((const uint8_t *)data, len);
@@ -1227,6 +1296,7 @@ bool sdMgrSha256File(const char *path, uint8_t out[32], void (*tick)()) {
 int sdMgrClearDir(const char *dir) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return -1;
+    if (DATA_READONLY()) return -1;
     File d = gDataFs->open(dir);
     if (!d || !d.isDirectory()) return 0;
     // Collect first, delete after: deleting while iterating is unreliable on SD_MMC.

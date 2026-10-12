@@ -2,23 +2,31 @@
 #include "map/SdCardManager.h" // sdMgrExists() — self-test picks the voice set on the card
 #include "core/AppConfig.h" // cfg.audioEnabled — master alert-audio toggle (Settings > Display)
 #include <Arduino.h>
+#ifndef VIETHUD_P4
 #include <driver/i2s.h>
+#endif
 #include <math.h>
 #include <string.h>
 #include <SD_MMC.h>
+#include "map/SdCardManager.h" // sdMgrDataFs(): card, or P4 flash fallback
 #include <AudioFileSourceFS.h>
 #include <AudioGeneratorMP3.h>
+#ifdef VIETHUD_P4
+#include "boards/jc4880p443c/AudioOutP4.h" // ES8311 + i2s_std channel shared by tones and mp3
+#else
 #include <AudioOutputI2S.h>
+#endif
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 
-#include "core/Board.h" // boardAmpEnable() — VietHUD 2.8 speaker amp
+#include "core/Board.h" // boardAmpEnable() — speaker amp switch where the board has one
 #include "pincfg.h"
 
-#define I2S_PORT        I2S_NUM_0
 #define I2S_SAMPLE_RATE 16000
+#ifndef VIETHUD_P4
+#define I2S_PORT        I2S_NUM_0
 // I2S pins, MCLK and the amp/codec name come from the board config
 // (include/boards/<board>/board_config.h). A codec (ES8311) needs a real
 // MCLK = 256 x fs; a plain I2S amp (NS4168) has none (BOARD_I2S_MCLK_PIN -1).
@@ -26,6 +34,7 @@
 #define I2S_MCLK_OUT    BOARD_I2S_MCLK_PIN
 #else
 #define I2S_MCLK_OUT    I2S_PIN_NO_CHANGE
+#endif
 #endif
 #define AUDIO_HW_NAME   BOARD_AUDIO_NAME
 
@@ -99,6 +108,15 @@ static void audioTaskFn(void *); // defined below
 // after ESP8266Audio's AudioOutputI2S releases the port — see that
 // function's own comment for why the two APIs can't share it
 // simultaneously.
+#ifdef VIETHUD_P4
+static bool installToneI2S() { return p4AudioSetRate(I2S_SAMPLE_RATE); }
+// Mono tone chunk -> interleaved L/R on the shared stereo channel.
+static void toneWrite(const int16_t *mono, int n) {
+    int16_t st[256];
+    for (int i = 0; i < n; i++) st[2 * i] = st[2 * i + 1] = mono[i];
+    p4AudioWrite(st, n);
+}
+#else
 static bool installToneI2S() {
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
@@ -141,6 +159,7 @@ static bool installToneI2S() {
     Serial.printf("[audio] installToneI2S failed after 3 tries: 0x%x\n", err);
     return false;
 }
+#endif
 
 void audioInit() {
     if (s_initialized) return;
@@ -154,11 +173,15 @@ void audioInit() {
             xTaskCreatePinnedToCore(audioTaskFn, "audioTask", 6144, NULL, 1, NULL, 0);
         }
     }
+#ifdef VIETHUD_P4
+    if (p4AudioBegin() && installToneI2S()) s_initialized = true;
+#else
     if (installToneI2S()) {
         s_initialized = true;
         Serial.printf("[audio] %s I2S audio driver initialized on BCLK=%d, LRCK=%d, DOUT=%d\n", AUDIO_HW_NAME,
                       I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
     }
+#endif
 }
 
 void audioSetVolume(uint8_t percent) {
@@ -204,15 +227,23 @@ void audioPlayTone(uint16_t freqHz, uint16_t durationMs) {
             phase += phaseInc;
             if (phase >= 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
         }
+#ifdef VIETHUD_P4
+        toneWrite(buffer, chunk);
+#else
         size_t bytesWritten = 0;
         i2s_write(I2S_PORT, buffer, chunk * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
+#endif
         samplesRemaining -= chunk;
     }
 
     // Flush small silent buffer at the end to prevent click
     memset(buffer, 0, sizeof(buffer));
+#ifdef VIETHUD_P4
+    toneWrite(buffer, 64);
+#else
     size_t bw = 0;
     i2s_write(I2S_PORT, buffer, 64 * sizeof(int16_t), &bw, portMAX_DELAY);
+#endif
     if (s_i2sMutex) xSemaphoreGive(s_i2sMutex);
 }
 
@@ -388,18 +419,24 @@ static void audioTaskFn(void *) {
         Serial.printf("[audio] playing voice: %s\n", path);
 
         if (s_i2sMutex) xSemaphoreTake(s_i2sMutex, portMAX_DELAY);
+#ifndef VIETHUD_P4
         boardAmpEnable(false); // MCLK stops during the driver swap — mute the amp so it doesn't pop
         i2s_driver_uninstall(I2S_PORT);
         s_initialized = false;
         vTaskDelay(pdMS_TO_TICKS(10));
+#endif
 
         AudioFileSourceFS source(sdMgrDataFs(), path); // card or on-chip data partition
         if (source.isOpen()) {
+#ifdef VIETHUD_P4
+            AudioOutputP4 out;
+#else
             AudioOutputI2S out;
 #if BOARD_I2S_MCLK_PIN >= 0
             out.SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_OUT);
 #else
             out.SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
+#endif
 #endif
             out.SetGain((float)s_volume / 100.0f * VOICE_GAIN_BOOST);
             AudioGeneratorMP3 mp3;
@@ -419,9 +456,13 @@ static void audioTaskFn(void *) {
         }
         vTaskDelay(pdMS_TO_TICKS(10));
 
+#ifdef VIETHUD_P4
+        installToneI2S(); // back to the tone rate; the channel itself stays up
+#else
         boardAmpEnable(false);
         if (installToneI2S()) s_initialized = true;
         boardAmpEnable(true);
+#endif
         if (s_i2sMutex) xSemaphoreGive(s_i2sMutex);
     }
 }

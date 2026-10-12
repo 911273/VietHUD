@@ -1,19 +1,21 @@
 #pragma once
-// Firmware version string — shown in the web portal (System tab, /api/v1/update/state)
-// and used by the data manifest's future "min firmware" gate. Bump on every
-// release flashed to real devices.
-// Each model has its own release line (BOARD_FW_VERSION in its board config).
-// #ifndef so a build can be stamped explicitly (tools/release_firmware.py, or a
-// bench build stamped older to exercise the update prompt).
+// Firmware version — ONE platform version for every VietHUD model (3.5", 2.8",
+// Lite 1.54", 4.3" P4): all models are built from the same core at the same
+// commit and released together by tools/release.py, so a version number means
+// the same feature set on every model. Shown in the web portal / System screen
+// and compared against the OTA channel's version.json (FwUpdater.cpp).
+// Bump here on every release (tools/release.py checks it matches its argument).
+// #ifndef so a build can be stamped explicitly (a bench build stamped older to
+// exercise the update prompt).
 #include "boards/board.h"
 #ifndef VIETHUD_FW_VERSION
-#define VIETHUD_FW_VERSION BOARD_FW_VERSION
+#define VIETHUD_FW_VERSION "4.0.0"
 #endif
 
-// Hardware model + OTA channel. VietHUD 2.8 (ES3C28P, 320x240 ILI9341) is a
-// separate product from the 3.5" JC3248W535 build: its firmware images are
-// NOT interchangeable (different display/touch/audio/pins), so each model
-// fetches version.json + firmware.bin from its own folder.
+// Hardware model + OTA channel (include/boards/<board>/board_config.h). The
+// firmware IMAGES are per model (different display/touch/audio/pins), so each
+// model fetches version.json + firmware.bin from its own folder
+// firmware/<model id>/ — same version number, different binary.
 //
 // VIETHUD_MODEL_ID must appear as "model" in the channel's version.json or the
 // update is refused (FwUpdater.cpp). Folder separation alone wasn't enough:

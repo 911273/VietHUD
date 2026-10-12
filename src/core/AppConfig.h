@@ -168,7 +168,7 @@ struct AppConfig {
     // Settings > WiFi. Default = the project's public GitHub release path so OTA
     // works out of the box (GitHub raw 301/302s to Fastly — DataUpdater follows
     // redirects). Empty = updater disabled.
-    char dataUpdateUrl[128] = "https://raw.githubusercontent.com/911273/VietHUD/main/speedmap/";
+    char dataUpdateUrl[128] = "https://raw.githubusercontent.com/911273/VietHUD/main/" BOARD_DATA_PROFILE "/"; // per board: boards/board.h
     // Auto-off the WiFi AP after this many minutes with NO client connected.
     // Always on (1..120 min, default 10 — user rule 2026-09-26: WiFi is OFF at
     // boot and must switch itself off again when unused; the old 0 = "never"

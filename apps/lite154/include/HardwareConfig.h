@@ -35,4 +35,8 @@
 // Connect GPS Module RX -> ESP32-S3 TX (GPIO 43)
 #define PIN_GPS_RX      44
 #define PIN_GPS_TX      43
-#define GPS_BAUD_DEFAULT 9600
+#define GPS_BAUD_DEFAULT 115200 // P18 Pro; GPSManager auto-detects 9600/38400/57600 too
+
+// Battery (same wiring as the board's xiaozhi firmware power_manager.h)
+#define PIN_BAT_ADC      17  // ADC2_CH6, battery voltage divider
+#define PIN_BAT_CHARGING 38  // HIGH while the charger is charging

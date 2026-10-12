@@ -66,7 +66,6 @@
 #define BOARD_MODEL       "VietHUD 2.8"
 #define BOARD_MODEL_ID    "viethud28"
 #define BOARD_FW_CHANNEL  "firmware/viethud28"
-#define BOARD_FW_VERSION  "3.1.1" // this model's own release line
 
 // ---- Capabilities (read by shared code instead of board names) ----
 #define BOARD_PANEL_SPI_HZ        TFT_SPI_HZ
