@@ -14,6 +14,32 @@
 #include "map/SdCardManager.h" 
 #include "touch/TouchTask.h"      // gTouchCalRequested (P4 touch calibration button)
 #include <string.h>
+#include "boards/board.h" // BOARD_UI_HIGH_CONTRAST
+
+// Settings palette per panel (2026-10-13, user: "màu sắc tại trang setting mờ
+// nhạt" on the 2.8"). Its dark-grey panels and grey text were tuned on the
+// 3.5"; the 2.8"'s IPS panel runs with inversion on, which lifts the lowest
+// codes, so those greys came out as a washed-out grey-on-grey. Boards with
+// BOARD_UI_HIGH_CONTRAST get true-black panels and brighter text/borders;
+// every other colour (accents, status) is unchanged.
+static lv_color_t uiColor(uint32_t hex) {
+#if BOARD_UI_HIGH_CONTRAST
+    switch (hex) {
+    case 0x0C1017: case 0x0E141B: case 0x151C24: case 0x1B222A: case 0x1E2A38: return lv_color_hex(0x000000); // panels
+    case 0x0F2238: return lv_color_hex(0x00244E); // selected/blue panel
+    case 0x10261A: return lv_color_hex(0x003A1C); // green panel
+    case 0x2E3B4E: return lv_color_hex(0x6A7A90);
+    case 0x2E4A66: return lv_color_hex(0x4A86C0);
+    case 0x3A4A5C: return lv_color_hex(0x7A8A9C); // borders
+    case 0x3B4654: return lv_color_hex(0x8A96A2);
+    case 0x44505C: return lv_color_hex(0xA0ACB8); // dim text
+    case 0x7C8A9A: return lv_color_hex(0xC8D2DC); // muted text / headers
+    case 0xCCD6E0: return lv_color_hex(0xFFFFFF); // values
+    default: break;
+    }
+#endif
+    return lv_color_hex(hex);
+}
 
 // ---------------------------------------------------------------------
 // Settings screen (spec sections 16-17, 55-61)
@@ -187,14 +213,14 @@ static uint32_t connToastUntilMs = 0;
 static void showPhoneConnectedToast() {
     if (!connToast) {
         connToast = lv_label_create(lv_layer_top());
-        lv_obj_set_style_bg_color(connToast, lv_color_hex(0x10261A), 0);
+        lv_obj_set_style_bg_color(connToast, uiColor(0x10261A), 0);
         lv_obj_set_style_bg_opa(connToast, LV_OPA_90, 0);
-        lv_obj_set_style_border_color(connToast, lv_color_hex(0x3CC46E), 0);
+        lv_obj_set_style_border_color(connToast, uiColor(0x3CC46E), 0);
         lv_obj_set_style_border_width(connToast, 1, 0);
         lv_obj_set_style_radius(connToast, 14, 0);
         lv_obj_set_style_pad_hor(connToast, 14, 0);
         lv_obj_set_style_pad_ver(connToast, 6, 0);
-        lv_obj_set_style_text_color(connToast, lv_color_hex(0xDFF5E6), 0);
+        lv_obj_set_style_text_color(connToast, uiColor(0xDFF5E6), 0);
         lv_label_set_text(connToast, LV_SYMBOL_OK " Phone connected - settings page: 192.168.4.1");
         lv_obj_align(connToast, LV_ALIGN_TOP_MID, 0, 40);
     }
@@ -244,7 +270,7 @@ static void buildWifiScanOverlay(lv_obj_t *panel) {
     // Same row style as addSwitchRow(): label left, switch right.
     lv_obj_t *swLbl = lv_label_create(panel);
     lv_label_set_text(swLbl, "Wi-Fi");
-    lv_obj_set_style_text_color(swLbl, lv_color_hex(0xCCD6E0), 0);
+    lv_obj_set_style_text_color(swLbl, uiColor(0xCCD6E0), 0);
     lv_obj_set_pos(swLbl, 4, 7);
     qrWifiSwitch = lv_switch_create(panel);
     lv_obj_set_size(qrWifiSwitch, 44, 22);
@@ -270,15 +296,15 @@ static void buildWifiScanOverlay(lv_obj_t *panel) {
     scanSavedLbl = lv_label_create(panel);
     lv_label_set_long_mode(scanSavedLbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(scanSavedLbl, cw - 8);
-    lv_obj_set_style_text_color(scanSavedLbl, lv_color_hex(0xCCD6E0), 0);
+    lv_obj_set_style_text_color(scanSavedLbl, uiColor(0xCCD6E0), 0);
     lv_obj_set_style_text_line_space(scanSavedLbl, 2, 0);
     lv_obj_align_to(scanSavedLbl, scanConnLbl, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
 
     bridgeBar = lv_bar_create(panel);
     lv_obj_set_size(bridgeBar, cw - 8, 8);
     lv_obj_align(bridgeBar, LV_ALIGN_BOTTOM_LEFT, 4, -2);
-    lv_obj_set_style_bg_color(bridgeBar, lv_color_hex(0x1E2A38), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bridgeBar, lv_color_hex(0x3DA5FF), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(bridgeBar, uiColor(0x1E2A38), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bridgeBar, uiColor(0x3DA5FF), LV_PART_INDICATOR);
     lv_bar_set_range(bridgeBar, 0, 100);
     lv_obj_add_flag(bridgeBar, LV_OBJ_FLAG_HIDDEN);
 }
@@ -316,14 +342,14 @@ static void refreshBridgeToast() {
     }
     if (!bridgeToast) {
         bridgeToast = lv_label_create(lv_layer_top());
-        lv_obj_set_style_bg_color(bridgeToast, lv_color_hex(0x0F2238), 0);
+        lv_obj_set_style_bg_color(bridgeToast, uiColor(0x0F2238), 0);
         lv_obj_set_style_bg_opa(bridgeToast, LV_OPA_90, 0);
-        lv_obj_set_style_border_color(bridgeToast, lv_color_hex(0x3DA5FF), 0);
+        lv_obj_set_style_border_color(bridgeToast, uiColor(0x3DA5FF), 0);
         lv_obj_set_style_border_width(bridgeToast, 1, 0);
         lv_obj_set_style_radius(bridgeToast, 14, 0);
         lv_obj_set_style_pad_hor(bridgeToast, 12, 0);
         lv_obj_set_style_pad_ver(bridgeToast, 5, 0);
-        lv_obj_set_style_text_color(bridgeToast, lv_color_hex(0xDCEBFA), 0);
+        lv_obj_set_style_text_color(bridgeToast, uiColor(0xDCEBFA), 0);
         lv_obj_align(bridgeToast, LV_ALIGN_BOTTOM_MID, 0, -6);
     }
     InstallerProgress p = installerProgress();
@@ -466,7 +492,7 @@ static void addSliderRow(lv_obj_t *parent, int &y, const char *name, float *targ
 
     lv_obj_t *nameLbl = lv_label_create(parent);
     lv_label_set_text(nameLbl, name);
-    lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
+    lv_obj_set_style_text_color(nameLbl, uiColor(0xCCD6E0), 0);
 
     lv_obj_t *slider = lv_slider_create(parent);
     lv_slider_set_range(slider, minRaw, maxRaw);
@@ -566,7 +592,7 @@ static void addDropdownRow(lv_obj_t *parent, int &y, const char *name, const cha
                            lv_event_cb_t event_cb, void *user_data) {
     lv_obj_t *nameLbl = lv_label_create(parent);
     lv_label_set_text(nameLbl, name);
-    lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
+    lv_obj_set_style_text_color(nameLbl, uiColor(0xCCD6E0), 0);
     lv_obj_set_pos(nameLbl, 4, y);
     y += 18;
 
@@ -576,9 +602,9 @@ static void addDropdownRow(lv_obj_t *parent, int &y, const char *name, const cha
     lv_dropdown_set_selected(dd, selected);
     lv_obj_set_width(dd, parentW > 280 ? 280 : parentW);
     lv_obj_set_pos(dd, 4, y);
-    lv_obj_set_style_bg_color(dd, lv_color_hex(0x1B222A), 0);
+    lv_obj_set_style_bg_color(dd, uiColor(0x1B222A), 0);
     lv_obj_set_style_text_color(dd, lv_color_white(), 0);
-    lv_obj_set_style_border_color(dd, lv_color_hex(0x3A4A5C), 0);
+    lv_obj_set_style_border_color(dd, uiColor(0x3A4A5C), 0);
     lv_obj_add_event_cb(dd, event_cb, LV_EVENT_VALUE_CHANGED, user_data);
     y += 38;
 }
@@ -599,7 +625,7 @@ static void addChoiceRow(lv_obj_t *parent, int &y, const char *name, float *targ
                           int count) {
     lv_obj_t *nameLbl = lv_label_create(parent);
     lv_label_set_text(nameLbl, name);
-    lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
+    lv_obj_set_style_text_color(nameLbl, uiColor(0xCCD6E0), 0);
     lv_obj_set_pos(nameLbl, 4, y);
     y += 15;
 
@@ -618,8 +644,8 @@ static void addChoiceRow(lv_obj_t *parent, int &y, const char *name, float *targ
         lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
         lv_obj_set_size(btn, btnW, btnH);
         lv_obj_set_pos(btn, leftMargin + i * (btnW + gap), y);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x2E3B4E), 0);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x2F7CE0), LV_STATE_CHECKED);
+        lv_obj_set_style_bg_color(btn, uiColor(0x2E3B4E), 0);
+        lv_obj_set_style_bg_color(btn, uiColor(0x2F7CE0), LV_STATE_CHECKED);
         if (i == sel) lv_obj_add_state(btn, LV_STATE_CHECKED);
         lv_obj_t *lbl = lv_label_create(btn);
         lv_label_set_text(lbl, labels[i]);
@@ -639,7 +665,7 @@ static void addSwitchRow(lv_obj_t *parent, int &y, const char *name, bool *targe
 
     lv_obj_t *nameLbl = lv_label_create(parent);
     lv_label_set_text(nameLbl, name);
-    lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
+    lv_obj_set_style_text_color(nameLbl, uiColor(0xCCD6E0), 0);
     lv_obj_set_pos(nameLbl, 4, y + 3);
     // A label too long for the space left of the switch wraps (e.g. "Heading up
     // (rotate map)" ran under the switch on VietHUD 2.8's narrow panel).
@@ -673,7 +699,7 @@ static lv_obj_t *addReadonlyRow(lv_obj_t *parent, int &y, const char *name) {
     const int valX = lv_obj_get_content_width(parent) - 112; // room for "NOT CONNECTED"-length values
     lv_obj_t *nameLbl = lv_label_create(parent);
     lv_label_set_text(nameLbl, name);
-    lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
+    lv_obj_set_style_text_color(nameLbl, uiColor(0xCCD6E0), 0);
     lv_obj_set_pos(nameLbl, 4, y + 5);
     int nameH = wrapLabel(nameLbl, valX - 4 - 6); // "Speed (filtered)" ran into its value on 2.8"
 
@@ -693,7 +719,7 @@ static lv_obj_t *addReadonlyRow(lv_obj_t *parent, int &y, const char *name) {
 static lv_obj_t *addWideReadonlyRow(lv_obj_t *parent, int &y, const char *name) {
     lv_obj_t *nameLbl = lv_label_create(parent);
     lv_label_set_text(nameLbl, name);
-    lv_obj_set_style_text_color(nameLbl, lv_color_hex(0xCCD6E0), 0);
+    lv_obj_set_style_text_color(nameLbl, uiColor(0xCCD6E0), 0);
     lv_obj_set_pos(nameLbl, 4, y);
     y += 15;
 
@@ -772,13 +798,13 @@ static void refreshSensorsPanel(lv_timer_t *) {
     // wiring/power/baud problem). User-reported confusion 2026-09-15.
     if (gnss.fix) {
         lv_label_set_text(gnssFixVal, "OK");
-        lv_obj_set_style_text_color(gnssFixVal, lv_color_hex(0x33CC66), 0);
+        lv_obj_set_style_text_color(gnssFixVal, uiColor(0x33CC66), 0);
     } else if (gnss.linkAlive) {
         lv_label_set_text(gnssFixVal, "SEARCHING");
-        lv_obj_set_style_text_color(gnssFixVal, lv_color_hex(0xE0C020), 0);
+        lv_obj_set_style_text_color(gnssFixVal, uiColor(0xE0C020), 0);
     } else {
         lv_label_set_text(gnssFixVal, "FAULT");
-        lv_obj_set_style_text_color(gnssFixVal, lv_color_hex(0xFF3B30), 0);
+        lv_obj_set_style_text_color(gnssFixVal, uiColor(0xFF3B30), 0);
     }
     lv_label_set_text_fmt(gnssSatsVal, "%d", gnss.satCount);
 
@@ -808,12 +834,12 @@ static void refreshSensorsPanel(lv_timer_t *) {
     bool mapLoaded = speedLimitManagerGetInfo(mapInfo);
     if (mapLoaded) {
         lv_label_set_text(speedMapStatusVal, "CONNECTED");
-        lv_obj_set_style_text_color(speedMapStatusVal, lv_color_hex(0x33CC66), 0);
+        lv_obj_set_style_text_color(speedMapStatusVal, uiColor(0x33CC66), 0);
         lv_label_set_text_fmt(speedMapRegionVal, "%.16s", mapInfo.region);
         lv_label_set_text_fmt(speedMapVersionVal, "%.16s", mapInfo.mapVersion);
     } else {
         lv_label_set_text(speedMapStatusVal, "NOT CONNECTED");
-        lv_obj_set_style_text_color(speedMapStatusVal, lv_color_hex(0x7C8A9A), 0);
+        lv_obj_set_style_text_color(speedMapStatusVal, uiColor(0x7C8A9A), 0);
         lv_label_set_text(speedMapRegionVal, "--");
         lv_label_set_text(speedMapVersionVal, "--");
     }
@@ -1041,7 +1067,7 @@ static void buildTouchCalibOverlay(lv_obj_t *parent) {
     touchCalibOverlay = lv_obj_create(parent);
     lv_obj_set_pos(touchCalibOverlay, 0, 0);
     lv_obj_set_size(touchCalibOverlay, scrW, scrH);
-    lv_obj_set_style_bg_color(touchCalibOverlay, lv_color_hex(0x0C1017), 0);
+    lv_obj_set_style_bg_color(touchCalibOverlay, uiColor(0x0C1017), 0);
     lv_obj_set_style_bg_opa(touchCalibOverlay, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(touchCalibOverlay, 0, 0);
     lv_obj_set_style_radius(touchCalibOverlay, 0, 0);
@@ -1052,7 +1078,7 @@ static void buildTouchCalibOverlay(lv_obj_t *parent) {
 
     lv_obj_t *title = lv_label_create(touchCalibOverlay);
     lv_label_set_text(title, "HIỆU CHUẨN CẢM ỨNG (4 ĐIỂM)");
-    lv_obj_set_style_text_color(title, lv_color_hex(0x00D2FF), 0);
+    lv_obj_set_style_text_color(title, uiColor(0x00D2FF), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
 
     calibPromptLbl = lv_label_create(touchCalibOverlay);
@@ -1062,14 +1088,14 @@ static void buildTouchCalibOverlay(lv_obj_t *parent) {
 
     calibSubLbl = lv_label_create(touchCalibOverlay);
     lv_label_set_text(calibSubLbl, "Dùng bút cảm ứng hoặc đầu ngón tay chạm chuẩn tâm");
-    lv_obj_set_style_text_color(calibSubLbl, lv_color_hex(0x7C8A9A), 0);
+    lv_obj_set_style_text_color(calibSubLbl, uiColor(0x7C8A9A), 0);
     lv_obj_align(calibSubLbl, LV_ALIGN_CENTER, 0, 14);
 
     calibTargetObj = lv_obj_create(touchCalibOverlay);
     lv_obj_set_size(calibTargetObj, 40, 40);
-    lv_obj_set_style_bg_color(calibTargetObj, lv_color_hex(0xFF3B30), 0);
+    lv_obj_set_style_bg_color(calibTargetObj, uiColor(0xFF3B30), 0);
     lv_obj_set_style_bg_opa(calibTargetObj, LV_OPA_30, 0);
-    lv_obj_set_style_border_color(calibTargetObj, lv_color_hex(0xFF3B30), 0);
+    lv_obj_set_style_border_color(calibTargetObj, uiColor(0xFF3B30), 0);
     lv_obj_set_style_border_width(calibTargetObj, 2, 0);
     lv_obj_set_style_radius(calibTargetObj, LV_RADIUS_CIRCLE, 0);
     lv_obj_clear_flag(calibTargetObj, LV_OBJ_FLAG_SCROLLABLE);
@@ -1086,7 +1112,7 @@ static void buildTouchCalibOverlay(lv_obj_t *parent) {
     calibCancelBtn = lv_button_create(touchCalibOverlay);
     lv_obj_set_size(calibCancelBtn, 100, 32);
     lv_obj_align(calibCancelBtn, LV_ALIGN_BOTTOM_MID, 0, -16);
-    lv_obj_set_style_bg_color(calibCancelBtn, lv_color_hex(0x3B4654), 0);
+    lv_obj_set_style_bg_color(calibCancelBtn, uiColor(0x3B4654), 0);
     lv_obj_add_event_cb(calibCancelBtn, onCalibCancelClicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t *cbl = lv_label_create(calibCancelBtn);
     lv_label_set_text(cbl, "Hủy");
@@ -1097,7 +1123,7 @@ static void buildRestartConfirmOverlay(lv_obj_t *parent) {
     restartConfirmOverlay = lv_obj_create(parent);
     lv_obj_set_pos(restartConfirmOverlay, 0, 0);
     lv_obj_set_size(restartConfirmOverlay, gfx->width(), gfx->height());
-    lv_obj_set_style_bg_color(restartConfirmOverlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_color(restartConfirmOverlay, uiColor(0x000000), 0);
     lv_obj_set_style_bg_opa(restartConfirmOverlay, LV_OPA_60, 0);
     lv_obj_set_style_border_width(restartConfirmOverlay, 0, 0);
     lv_obj_set_style_radius(restartConfirmOverlay, 0, 0);
@@ -1107,8 +1133,8 @@ static void buildRestartConfirmOverlay(lv_obj_t *parent) {
     lv_obj_t *box = lv_obj_create(restartConfirmOverlay);
     lv_obj_set_size(box, 300, 130);
     lv_obj_center(box);
-    lv_obj_set_style_bg_color(box, lv_color_hex(0x1B222A), 0);
-    lv_obj_set_style_border_color(box, lv_color_hex(0x3A4A5C), 0);
+    lv_obj_set_style_bg_color(box, uiColor(0x1B222A), 0);
+    lv_obj_set_style_border_color(box, uiColor(0x3A4A5C), 0);
     lv_obj_set_style_radius(box, 8, 0);
     lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -1120,7 +1146,7 @@ static void buildRestartConfirmOverlay(lv_obj_t *parent) {
     lv_obj_t *noBtn = lv_button_create(box);
     lv_obj_set_size(noBtn, 110, 36);
     lv_obj_align(noBtn, LV_ALIGN_BOTTOM_LEFT, 0, -4);
-    lv_obj_set_style_bg_color(noBtn, lv_color_hex(0x44505C), 0);
+    lv_obj_set_style_bg_color(noBtn, uiColor(0x44505C), 0);
     lv_obj_set_ext_click_area(noBtn, 10);
     lv_obj_add_event_cb(noBtn, closeRestartConfirm, LV_EVENT_CLICKED, NULL);
     lv_obj_t *noLbl = lv_label_create(noBtn);
@@ -1130,7 +1156,7 @@ static void buildRestartConfirmOverlay(lv_obj_t *parent) {
     lv_obj_t *yesBtn = lv_button_create(box);
     lv_obj_set_size(yesBtn, 110, 36);
     lv_obj_align(yesBtn, LV_ALIGN_BOTTOM_RIGHT, 0, -4);
-    lv_obj_set_style_bg_color(yesBtn, lv_color_hex(0x8A3A3A), 0);
+    lv_obj_set_style_bg_color(yesBtn, uiColor(0x8A3A3A), 0);
     lv_obj_set_ext_click_area(yesBtn, 10);
     lv_obj_add_event_cb(yesBtn, onConfirmRestartYes, LV_EVENT_CLICKED, NULL);
     lv_obj_t *yesLbl = lv_label_create(yesBtn);
@@ -1142,7 +1168,7 @@ static void buildConfirmOverlay(lv_obj_t *parent) {
     confirmOverlay = lv_obj_create(parent);
     lv_obj_set_pos(confirmOverlay, 0, 0);
     lv_obj_set_size(confirmOverlay, gfx->width(), gfx->height());
-    lv_obj_set_style_bg_color(confirmOverlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_color(confirmOverlay, uiColor(0x000000), 0);
     lv_obj_set_style_bg_opa(confirmOverlay, LV_OPA_60, 0);
     lv_obj_set_style_border_width(confirmOverlay, 0, 0);
     lv_obj_set_style_radius(confirmOverlay, 0, 0);
@@ -1152,8 +1178,8 @@ static void buildConfirmOverlay(lv_obj_t *parent) {
     lv_obj_t *box = lv_obj_create(confirmOverlay);
     lv_obj_set_size(box, 300, 130);
     lv_obj_center(box);
-    lv_obj_set_style_bg_color(box, lv_color_hex(0x1B222A), 0);
-    lv_obj_set_style_border_color(box, lv_color_hex(0x3A4A5C), 0);
+    lv_obj_set_style_bg_color(box, uiColor(0x1B222A), 0);
+    lv_obj_set_style_border_color(box, uiColor(0x3A4A5C), 0);
     lv_obj_set_style_radius(box, 8, 0);
     lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -1165,7 +1191,7 @@ static void buildConfirmOverlay(lv_obj_t *parent) {
     lv_obj_t *noBtn = lv_button_create(box);
     lv_obj_set_size(noBtn, 110, 36);
     lv_obj_align(noBtn, LV_ALIGN_BOTTOM_LEFT, 0, -4);
-    lv_obj_set_style_bg_color(noBtn, lv_color_hex(0x44505C), 0);
+    lv_obj_set_style_bg_color(noBtn, uiColor(0x44505C), 0);
     lv_obj_set_ext_click_area(noBtn, 10);
     lv_obj_add_event_cb(noBtn, closeConfirm, LV_EVENT_CLICKED, NULL);
     lv_obj_t *noLbl = lv_label_create(noBtn);
@@ -1175,7 +1201,7 @@ static void buildConfirmOverlay(lv_obj_t *parent) {
     lv_obj_t *yesBtn = lv_button_create(box);
     lv_obj_set_size(yesBtn, 110, 36);
     lv_obj_align(yesBtn, LV_ALIGN_BOTTOM_RIGHT, 0, -4);
-    lv_obj_set_style_bg_color(yesBtn, lv_color_hex(0x2E7D4F), 0);
+    lv_obj_set_style_bg_color(yesBtn, uiColor(0x2E7D4F), 0);
     lv_obj_set_ext_click_area(yesBtn, 10);
     lv_obj_add_event_cb(yesBtn, onConfirmSaveYes, LV_EVENT_CLICKED, NULL);
     lv_obj_t *yesLbl = lv_label_create(yesBtn);
@@ -1236,10 +1262,10 @@ static void selectCategory(int idx) {
     for (int i = 0; i < kCategoryCount; i++) {
         if (i == idx) {
             lv_obj_clear_flag(categoryPanels[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_bg_color(navButtons[i], lv_color_hex(0x2E4A66), 0);
+            lv_obj_set_style_bg_color(navButtons[i], uiColor(0x2E4A66), 0);
         } else {
             lv_obj_add_flag(categoryPanels[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_bg_color(navButtons[i], lv_color_hex(0x151C24), 0);
+            lv_obj_set_style_bg_color(navButtons[i], uiColor(0x151C24), 0);
         }
     }
 }
@@ -1251,7 +1277,7 @@ void buildSettingsScreen() {
     settingsScreen = lv_obj_create(NULL);
     // Pure black, not 0x0B0F14 — same request/reasoning as Dashboard.cpp's
     // applyTheme() night background (2026-09-16, screen longevity/glare).
-    lv_obj_set_style_bg_color(settingsScreen, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_color(settingsScreen, uiColor(0x000000), 0);
     lv_obj_set_style_pad_all(settingsScreen, 0, 0);
     lv_obj_clear_flag(settingsScreen, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -1273,7 +1299,7 @@ void buildSettingsScreen() {
     lv_obj_t *header = lv_obj_create(settingsScreen);
     lv_obj_set_pos(header, 0, 0);
     lv_obj_set_size(header, scrW, HEADER_H);
-    lv_obj_set_style_bg_color(header, lv_color_hex(0x151C24), 0);
+    lv_obj_set_style_bg_color(header, uiColor(0x151C24), 0);
     lv_obj_set_style_border_width(header, 0, 0);
     lv_obj_set_style_radius(header, 0, 0);
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
@@ -1302,7 +1328,7 @@ void buildSettingsScreen() {
     lv_obj_t *calibHeaderBtn = lv_button_create(header);
     lv_obj_set_size(calibHeaderBtn, 95, 20);
     lv_obj_align(calibHeaderBtn, LV_ALIGN_RIGHT_MID, -76, 0);
-    lv_obj_set_style_bg_color(calibHeaderBtn, lv_color_hex(0x1976D2), 0);
+    lv_obj_set_style_bg_color(calibHeaderBtn, uiColor(0x1976D2), 0);
     lv_obj_set_ext_click_area(calibHeaderBtn, 15);
     lv_obj_add_event_cb(calibHeaderBtn, onTouchCalibStartClicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t *calibHdrLbl = lv_label_create(calibHeaderBtn);
@@ -1313,7 +1339,7 @@ void buildSettingsScreen() {
     lv_obj_t *navRail = lv_obj_create(settingsScreen);
     lv_obj_set_pos(navRail, 0, BODY_TOP);
     lv_obj_set_size(navRail, NAV_W, BODY_H);
-    lv_obj_set_style_bg_color(navRail, lv_color_hex(0x0E141B), 0);
+    lv_obj_set_style_bg_color(navRail, uiColor(0x0E141B), 0);
     lv_obj_set_style_border_width(navRail, 0, 0);
     lv_obj_set_style_radius(navRail, 0, 0);
     lv_obj_set_style_pad_all(navRail, 4, 0);
@@ -1355,7 +1381,7 @@ void buildSettingsScreen() {
         // later lv_obj_get_width(categoryPanels[i]) call return the real
         // value instead.
         lv_obj_update_layout(panel);
-        lv_obj_set_style_bg_color(panel, lv_color_hex(0x000000), 0); // pure black — see settingsScreen's own comment above
+        lv_obj_set_style_bg_color(panel, uiColor(0x000000), 0); // pure black — see settingsScreen's own comment above
         lv_obj_set_style_border_width(panel, 0, 0);
         lv_obj_set_style_pad_all(panel, 4, 0);
         // Display and WiFi both fit inside BODY_H with no scrolling. Sensors
@@ -1394,7 +1420,7 @@ void buildSettingsScreen() {
     {
         lv_obj_t *hint = lv_label_create(categoryPanels[0]);
         lv_label_set_text(hint, "Auto: 50% brightness at night");
-        lv_obj_set_style_text_color(hint, lv_color_hex(0x7C8A9A), 0);
+        lv_obj_set_style_text_color(hint, uiColor(0x7C8A9A), 0);
         placeWrappedLine(categoryPanels[0], hint, y, 6);
     }
     // Label updated 2026-09-16 alongside the gate itself changing from
@@ -1438,7 +1464,7 @@ void buildSettingsScreen() {
     {
         lv_obj_t *th = lv_label_create(categoryPanels[0]);
         lv_label_set_text(th, "Touch Calibration (Hieu chuan cam ung)");
-        lv_obj_set_style_text_color(th, lv_color_hex(0x00D2FF), 0);
+        lv_obj_set_style_text_color(th, uiColor(0x00D2FF), 0);
         y += 6;
         placeWrappedLine(categoryPanels[0], th, y, 2);
     }
@@ -1451,7 +1477,7 @@ void buildSettingsScreen() {
         lv_obj_t *calibBtn = lv_button_create(categoryPanels[0]);
         lv_obj_set_size(calibBtn, calibW, 28);
         lv_obj_set_pos(calibBtn, 4, y + 2);
-        lv_obj_set_style_bg_color(calibBtn, lv_color_hex(0x1976D2), 0);
+        lv_obj_set_style_bg_color(calibBtn, uiColor(0x1976D2), 0);
         lv_obj_set_ext_click_area(calibBtn, 8);
         lv_obj_add_event_cb(calibBtn, onTouchCalibStartClicked, LV_EVENT_CLICKED, NULL);
         lv_obj_t *calibLbl = lv_label_create(calibBtn);
@@ -1461,7 +1487,7 @@ void buildSettingsScreen() {
         lv_obj_t *resetBtn = lv_button_create(categoryPanels[0]);
         lv_obj_set_size(resetBtn, resetW, 28);
         lv_obj_set_pos(resetBtn, 4 + calibW + 6, y + 2);
-        lv_obj_set_style_bg_color(resetBtn, lv_color_hex(0x44505C), 0);
+        lv_obj_set_style_bg_color(resetBtn, uiColor(0x44505C), 0);
         lv_obj_set_ext_click_area(resetBtn, 8);
         lv_obj_add_event_cb(resetBtn, onTouchResetClicked, LV_EVENT_CLICKED, NULL);
         lv_obj_t *resetLbl = lv_label_create(resetBtn);
@@ -1489,7 +1515,7 @@ void buildSettingsScreen() {
 
         lv_obj_t *hint = lv_label_create(ap);
         lv_label_set_text(hint, "Hold the main screen 2.5 s to toggle sound.\nPlay sound for:");
-        lv_obj_set_style_text_color(hint, lv_color_hex(0x7C8A9A), 0);
+        lv_obj_set_style_text_color(hint, uiColor(0x7C8A9A), 0);
         placeWrappedLine(ap, hint, ya, 6);
         addSwitchRow(ap, ya, "Overspeed", &cfg.audioOverspeed);
         addSwitchRow(ap, ya, "Camera", &cfg.audioCamera);
@@ -1517,7 +1543,7 @@ void buildSettingsScreen() {
         y += 6;
         lv_obj_t *h = lv_label_create(categoryPanels[1]);
         lv_label_set_text(h, t);
-        lv_obj_set_style_text_color(h, lv_color_hex(0x7C8A9A), 0);
+        lv_obj_set_style_text_color(h, uiColor(0x7C8A9A), 0);
         lv_obj_set_pos(h, 4, y);
         y += 20;
     };
@@ -1556,7 +1582,7 @@ void buildSettingsScreen() {
 
     lv_obj_t *sensorsHeader1 = lv_label_create(categoryPanels[2]);
     lv_label_set_text(sensorsHeader1, "Live status");
-    lv_obj_set_style_text_color(sensorsHeader1, lv_color_hex(0x7C8A9A), 0);
+    lv_obj_set_style_text_color(sensorsHeader1, uiColor(0x7C8A9A), 0);
     lv_obj_set_pos(sensorsHeader1, 4, y);
     y += 20;
     gnssFixVal = addReadonlyRow(categoryPanels[2], y, "GNSS fix");
@@ -1567,7 +1593,7 @@ void buildSettingsScreen() {
     y += 6;
     lv_obj_t *sensorsHeader2 = lv_label_create(categoryPanels[2]);
     lv_label_set_text(sensorsHeader2, "GNSS calibration");
-    lv_obj_set_style_text_color(sensorsHeader2, lv_color_hex(0x7C8A9A), 0);
+    lv_obj_set_style_text_color(sensorsHeader2, uiColor(0x7C8A9A), 0);
     lv_obj_set_pos(sensorsHeader2, 4, y);
     y += 20;
     addSliderRow(categoryPanels[2], y, "Speed filter smoothing", &cfg.gnssSpeedFilterAlpha, 5, 90, 100.0f, "");
@@ -1624,13 +1650,13 @@ void buildSettingsScreen() {
     lv_obj_t *footer = lv_obj_create(settingsScreen);
     lv_obj_set_pos(footer, 0, scrH - FOOTER_H);
     lv_obj_set_size(footer, scrW, FOOTER_H);
-    lv_obj_set_style_bg_color(footer, lv_color_hex(0x151C24), 0);
+    lv_obj_set_style_bg_color(footer, uiColor(0x151C24), 0);
     lv_obj_set_style_border_width(footer, 0, 0);
     lv_obj_set_style_radius(footer, 0, 0);
     lv_obj_clear_flag(footer, LV_OBJ_FLAG_SCROLLABLE);
 
     settingsStatusLabel = lv_label_create(footer);
-    lv_obj_set_style_text_color(settingsStatusLabel, lv_color_hex(0x66CC88), 0);
+    lv_obj_set_style_text_color(settingsStatusLabel, uiColor(0x66CC88), 0);
     lv_label_set_text(settingsStatusLabel, "");
     lv_obj_align(settingsStatusLabel, LV_ALIGN_LEFT_MID, 12, 0);
 
@@ -1653,7 +1679,7 @@ void buildSettingsScreen() {
     lv_obj_t *restartBtn = lv_button_create(footer);
     lv_obj_set_size(restartBtn, 70, 24);
     lv_obj_align(restartBtn, LV_ALIGN_RIGHT_MID, -208, 0);
-    lv_obj_set_style_bg_color(restartBtn, lv_color_hex(0x44505C), 0);
+    lv_obj_set_style_bg_color(restartBtn, uiColor(0x44505C), 0);
     lv_obj_set_ext_click_area(restartBtn, 20);
     lv_obj_add_event_cb(restartBtn, onRestartBtnClicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t *restartLbl = lv_label_create(restartBtn);
@@ -1663,7 +1689,7 @@ void buildSettingsScreen() {
     lv_obj_t *saveBtn = lv_button_create(footer);
     lv_obj_set_size(saveBtn, 90, 24);
     lv_obj_align(saveBtn, LV_ALIGN_RIGHT_MID, -8, 0);
-    lv_obj_set_style_bg_color(saveBtn, lv_color_hex(0x2E7D4F), 0);
+    lv_obj_set_style_bg_color(saveBtn, uiColor(0x2E7D4F), 0);
     lv_obj_set_ext_click_area(saveBtn, 20);
     lv_obj_add_event_cb(saveBtn, onSaveConfig, LV_EVENT_CLICKED, NULL);
     lv_obj_t *saveLbl = lv_label_create(saveBtn);
