@@ -1,10 +1,10 @@
 {
   "model": "viethud154",
-  "version": "4.0.3",
+  "version": "4.0.4",
   "build": "20261013",
-  "url_pi4": "http://192.168.1.65/viethud/firmware/4.0.3/viethud154.bin",
-  "url_pi4_mdns": "http://homebridge.local/viethud/firmware/4.0.3/viethud154.bin",
-  "url_pi4_tailscale": "http://100.107.34.92/viethud/firmware/4.0.3/viethud154.bin",
-  "url_github": "https://raw.githubusercontent.com/911273/VietHUD/main/firmware/4.0.3/viethud154.bin",
-  "notes": "Tên đường gồm cả ngõ; dữ liệu kiểm tra mỗi tuần; sửa cập nhật tên đường"
+  "url_pi4": "http://192.168.1.65/viethud/firmware/4.0.4/viethud154.bin",
+  "url_pi4_mdns": "http://homebridge.local/viethud/firmware/4.0.4/viethud154.bin",
+  "url_pi4_tailscale": "http://100.107.34.92/viethud/firmware/4.0.4/viethud154.bin",
+  "url_github": "https://raw.githubusercontent.com/911273/VietHUD/main/firmware/4.0.4/viethud154.bin",
+  "notes": "Một nguồn bản đồ OSM, thông tin dữ liệu chi tiết, Wi-Fi chỉ lưu khi kết nối được, tự nhận GPS M10/P18"
 }
