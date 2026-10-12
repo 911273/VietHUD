@@ -32,6 +32,14 @@
 // Online data channel (folder on the Pi / GitHub) this board updates from:
 // "speedmap" = the full shared set (card boards); a flash-only board gets the
 // cut of the same set that fits its partition (tools/build_flash_data.py).
+// Screen family: 0 = the LVGL dashboard with the live map (3.5", 2.8", 4.3");
+// 1 = the Lite's own plain-GFX HUD, no LVGL, no map (src/boards/lite154/ui).
+#ifndef BOARD_UI_LITE
+#define BOARD_UI_LITE 0
+#endif
+#ifndef BOARD_HAS_MAP
+#define BOARD_HAS_MAP (!BOARD_UI_LITE)
+#endif
 #ifndef BOARD_DATA_PROFILE
 #define BOARD_DATA_PROFILE "speedmap"
 #endif

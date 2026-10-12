@@ -54,5 +54,6 @@
 #define BOARD_HAS_SD_SLOT         0
 #define BOARD_DATA_PROFILE        "speedmap_lite154" // regional cut that fits the FFat
 #define BOARD_HAS_FLASH_DATA      1        // FFat partition "ffat"
+#define BOARD_UI_LITE             1        // stand-alone Lite HUD, no LVGL/map (src/boards/lite154/ui)
 #define BOARD_HAS_TOUCH           0        // buttons instead (core/Board.h boardButtonsRaw)
 #define BOARD_GNSS_PQTM           1

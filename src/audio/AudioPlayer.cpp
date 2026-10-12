@@ -2,6 +2,7 @@
 #include "map/SdCardManager.h" // sdMgrExists() — self-test picks the voice set on the card
 #include "core/AppConfig.h" // cfg.audioEnabled — master alert-audio toggle (Settings > Display)
 #include <Arduino.h>
+#include <driver/gpio.h> // gpio_reset_pin() — see the MCLK note in the voice path
 #ifndef VIETHUD_P4
 #include <driver/i2s.h>
 #endif
@@ -441,6 +442,15 @@ static void audioTaskFn(void *) {
             out.SetGain((float)s_volume / 100.0f * VOICE_GAIN_BOOST);
             AudioGeneratorMP3 mp3;
             bool begun = mp3.begin(&source, &out);
+#if !defined(VIETHUD_P4) && BOARD_I2S_MCLK_PIN < 0
+            // ESP8266Audio 1.9.9 defaults its MCLK pin to GPIO0 and routes the
+            // I2S MCLK there even when the amp needs none — and the routing
+            // outlives the driver. On the Lite GPIO0 is the centre button, which
+            // then read as held forever after the first voice line (2026-10-12).
+            // No MCLK is wanted here, so give the pin back.
+            gpio_reset_pin(GPIO_NUM_0);
+            pinMode(0, INPUT_PULLUP);
+#endif
             boardAmpEnable(true);
             if (begun) {
                 while (mp3.isRunning()) {

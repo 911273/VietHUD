@@ -15,6 +15,14 @@ the same for all.
 | `viethud154` | `viethud_lite154` | Waveshare S3 LCD 1.54 (ESP32-S3) | 1.54" 240x240 ST7789, 3 buttons | on-chip flash (`speedmap_lite154`) |
 | `viethud43` | `viethud_p4` | Guition JC4880P443C (ESP32-P4 + C6) | 4.3" 800x480 MIPI-DSI, GT911 touch | microSD, else on-chip flash (read-only) |
 
+Screens: the 3.5", 2.8" and 4.3" run the LVGL dashboard with the live map.
+The Lite (`BOARD_UI_LITE`) runs the stand-alone Lite firmware's own HUD —
+big limit sign, speed, alert card, road name, battery, button settings menu,
+Wi-Fi/OTA page — drawn straight with Arduino_GFX, no LVGL and no map render
+(`src/boards/lite154/ui/`). Everything under it (GNSS, map matching, alert
+sounds in `core/AlertAudio.cpp`, settings in `AppConfig`, Wi-Fi, OTA) is the
+shared core.
+
 `tools/models.py` is the registry every tool reads. `env:viethud_p4_sim` is a
 bench build of the P4 that drives a simulated car (never for a car).
 
@@ -52,7 +60,8 @@ PPA, i2s_std, temperature_sensor, C6 BLE) set by the P4 env.
 | `BOARD_DEFAULT_ROTATION`, `BOARD_LANDSCAPE_ONLY` | orientations with a layout |
 | `BOARD_DARK_BG` | darkest background the panel shows as black |
 | `BOARD_I2S_MCLK_PIN`, `BOARD_AUDIO_NAME` | codec (MCLK >= 0) or plain I2S amp (-1) |
-| `BOARD_HAS_TOUCH` | 0 = physical buttons (`ui/ButtonInput.cpp`) |
+| `BOARD_HAS_TOUCH` | 0 = physical buttons |
+| `BOARD_UI_LITE`, `BOARD_HAS_MAP` | Lite HUD instead of the LVGL dashboard; skip the map render |
 | `BOARD_HAS_SD_SLOT`, `BOARD_SD_4BIT`, `BOARD_SD_LDO_CHAN` | card slot wiring |
 | `BOARD_HAS_FLASH_DATA`, `BOARD_FLASH_DATA_READONLY` | data in the `ffat` partition |
 | `BOARD_DATA_PROFILE` | online data channel folder (default `speedmap`) |

@@ -5,6 +5,7 @@
 #include "core/AppConfig.h" // cfg.aheadLimitWarnDistM / cfg.cameraWarnDistM — user-tunable, see that file's own comment
 #include "core/SharedState.h"
 #include "gnss/GNSS.h" // kGnssMotionThresholdKmh — ahead-lookahead only runs while actually moving
+#include "boards/board.h" // BOARD_HAS_MAP
 #include "MapRenderer.h" // mapRendererUpdate() — live background map, driven from this same task loop
 #include <Arduino.h>
 #include <esp_heap_caps.h>
@@ -1862,12 +1863,14 @@ static void speedLimitTaskFn(void *) {
             // rather than a new task; mapRendererUpdate() itself gates on real
             // movement/heading delta (see MapRenderer.cpp's own comment) so a
             // stationary or straight-driving car costs nothing extra here.
+#if BOARD_HAS_MAP // no map on screen (Lite): skip the render entirely
             {
                 uint32_t tMap0 = micros();
                 mapRendererUpdate(gnss);
                 uint32_t tMap = micros() - tMap0;
                 if (tMap > gTickMaxMapUs) gTickMaxMapUs = tMap;
             }
+#endif
             uint32_t tTick = micros() - tTick0;
             if (tTick > gTickMaxUs) gTickMaxUs = tTick;
             if (tMatch > gTickMaxMatchUs) gTickMaxMatchUs = tMatch;

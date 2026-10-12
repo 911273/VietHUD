@@ -1,0 +1,149 @@
+#pragma once
+
+#include <Arduino.h>
+#include <Arduino_GFX_Library.h>
+#include "HardwareConfig.h"
+#include "FreeSansBold24pt7b.h"
+#include "FreeSansBold18pt7b.h"
+#include "SpeedSignFonts.h"
+#include "VnText.h"
+
+// Live values for the system info page that DisplayManager cannot read itself.
+struct SystemInfoData {
+    const char* gpsProtocol;   // "UBX", "NMEA" or "--"
+    uint32_t gpsBaud;
+    int gpsSats;
+    bool gpsFix;
+    float gpsHAccM;
+    uint32_t alertCount;
+    uint32_t roadNameCount;
+    bool batteryPresent;
+    uint8_t batteryLevel;
+    bool batteryCharging;
+    uint32_t gpsTtffMs;
+};
+
+class DisplayManager {
+public:
+    DisplayManager();
+    bool begin();
+
+    // Update HUD data
+    void updateData(
+        int currentSpeed,
+        int speedLimit,
+        int satellites,
+        bool gpsFix,
+        bool isMuted,
+        const char* roadName = nullptr,
+        bool wifiEnabled = false,
+        bool wifiConnected = false,
+        const char* wifiIp = nullptr,
+        bool isOtaUpdating = false,
+        int otaProgress = 0,
+        bool alertActive = false,
+        uint8_t alertType = 0,
+        uint16_t alertDistance = 0
+    );
+
+    // Update WiFi & OTA dedicated screen state
+    void updateWiFiState(
+        bool enabled,
+        uint8_t workflowState,
+        const char* workflowMsg,
+        const char* ssid,
+        const char* ipStr,
+        int rssi,
+        int progress,
+        int countdownSec
+    );
+    
+    // Render frame to display (canvas flush)
+    void render();
+
+    // Set road name
+    void setRoadName(const char* name);
+
+    // Battery indicator in the top bar (hidden when no battery is connected)
+    void setBattery(bool present, uint8_t level, bool charging);
+
+    // Brightness controls
+    void cycleBrightness();
+    void setBrightness(uint8_t pct);
+    uint8_t getBrightness() const { return m_brightness; }
+
+    // Popup toast notification for user feedback
+    void showToast(const char* text, uint16_t color = 0xFFFF);
+
+    // Dedicated Full-Screen Settings Page
+    void renderSettings(uint8_t selectedIdx, bool isEditing);
+
+    // Full-screen hardware / firmware info (Settings > System info)
+    void renderSystemInfo(const SystemInfoData& info);
+
+    // Dedicated Full-Screen OTA Progress and Result Visualizers
+    void showOtaProgress(const char* title, int progress, const char* detail = nullptr);
+    void showOtaSuccess(const char* version, int countdownSec = 3);
+    void showOtaFailure(const char* reason);
+
+private:
+    Arduino_DataBus *m_bus;
+    Arduino_GFX *m_tft;
+    Arduino_Canvas *m_canvas;
+
+    int m_speed;
+    int m_speedLimit;
+    int m_sats;
+    bool m_fix;
+    bool m_muted;
+    char m_roadName[128];   // UTF-8
+
+    bool m_batPresent = false;
+    uint8_t m_batLevel = 0;
+    bool m_batCharging = false;
+
+    // Marquee scrolling state
+    uint32_t m_marqueeStartTime;
+
+    // WiFi & OTA Dedicated Screen
+    bool m_wifiEnabled;
+    bool m_wifiConnected;
+    uint8_t m_otaWorkflowState;
+    char m_otaWorkflowMsg[48];
+    char m_wifiSsid[32];
+    char m_wifiIp[24];
+    int m_wifiRssi;
+    int m_otaProgress;
+    int m_otaCountdownSec;
+
+    // Traffic Alert (Icon & Distance based)
+    bool m_alertActive;
+    uint8_t m_alertType;
+    uint16_t m_alertDistance;
+
+    uint8_t m_brightness;
+    uint8_t m_rotation;
+
+    uint32_t m_lastFlashTime;
+    bool m_flashState;
+
+    char m_toastText[48];   // UTF-8
+    uint16_t m_toastColor;
+    uint32_t m_toastExpiry;
+
+    void drawTopBar();
+    int drawBatteryIcon(int xRight, int midY);   // returns the icon's left x
+    void drawAlertLeftCard();
+    void drawSpeedLimitSign(int cx, int cy, int radius, int limit);
+    void drawCurrentSpeedSection(int cx, int cy, int speed, int limit);
+    void drawToast();
+    void drawWiFiOTAPage();
+
+    // Traffic Alert Icon Drawing Primitives (Centered at cx, cy)
+    void drawIconCamera(int cx, int cy);
+    void drawIconTrafficLight(int cx, int cy);
+    void drawIconResidentArea(int cx, int cy);
+    void drawIconNoOvertaking(int cx, int cy);
+    void drawIconTollBooth(int cx, int cy);
+    void drawIconDanger(int cx, int cy);
+};
