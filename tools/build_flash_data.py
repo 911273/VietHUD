@@ -35,15 +35,18 @@ MANIFEST_FILES = CORE + ['roadnames.bin']
 HOME = (21.0285, 105.8542)  # Ha Noi — centre of a regional cut
 # usable bytes of each board's "ffat" partition (FAT overhead + slack taken off)
 PROFILES = {
-    'p4': dict(budget_mb=9.4, out='data_p4'),            # partitions_p4_data.csv: 9.9 MB
-    'lite154': dict(budget_mb=11.1, out='data_lite154'),  # boards/partitions_lite154.csv: 11.6 MB
+    'p4': dict(budget_mb=9.4, out='data_p4', writable=False),            # partitions_p4_data.csv: 9.9 MB, read-only
+    'lite154': dict(budget_mb=11.1, out='data_lite154', writable=True),  # boards/partitions_lite154.csv: 11.6 MB
 }
 # A flash cut covers the NORTH: every main road of the speed map (which carries
 # those roads' names itself), the region's cameras and signs, plus the detailed
 # road-name layer (every street incl. alleys) around HOME — the country-wide
 # roadnames.bin is 14 MB.
 REGION = (19.0, 23.5, 102.0, 108.5)  # Bac Bo + Bac Trung Bo (to Thanh Hoa / Nghe An)
-NAMES_FULL_BBOX = (HOME[0] - 0.43, HOME[0] + 0.43, HOME[1] - 0.5, HOME[1] + 0.45)
+NAMES_FULL_BBOX = (HOME[0] - 0.3, HOME[0] + 0.3, HOME[1] - 0.35, HOME[1] + 0.3)  # ~33 km: all of Ha Noi proper
+# Free space kept on a writable flash partition so daily alert updates can be
+# staged (installer needs the changed files + 0.5 MB; the Lite cut of signs.bin is ~0.9 MB).
+STAGING_HEADROOM_MB = 1.8
 
 
 def in_region(lat, lon):
@@ -76,8 +79,10 @@ def stage_source(tmp):
     """speedmap/ core files + the default voice set (no optional packs)."""
     for f in CORE:
         shutil.copy2(os.path.join(SRC, f), os.path.join(tmp, f))
-    shutil.copytree(os.path.join(SRC, 'sounds'), os.path.join(tmp, 'sounds'),
-                    ignore=shutil.ignore_patterns('packs', '*.bak*'))
+    # Only sounds/vi/ — the firmware plays from /speedmap/sounds/vi/ (audio/
+    # AudioPlayer.cpp VOICE_DIR); the clips loose in sounds/ duplicate it.
+    shutil.copytree(os.path.join(SRC, 'sounds', 'vi'), os.path.join(tmp, 'sounds', 'vi'),
+                    ignore=shutil.ignore_patterns('*.bak*'))
 
 
 def write_manifest(d):
@@ -102,6 +107,8 @@ def build(profile, publish):
         subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'map_builder', 'build_road_names.py'),
                         '--bbox'] + [str(v) for v in NAMES_FULL_BBOX] + ['--out', names], check=True)
         budget_mb = p['budget_mb'] - os.path.getsize(names) / 1e6  # what is left for the speed map
+        if p['writable']:
+            budget_mb -= STAGING_HEADROOM_MB  # room to stage online data updates
         src = os.path.join(tmp, 'src')
         os.makedirs(src)
         stage_source(src)
