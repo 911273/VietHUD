@@ -29,12 +29,16 @@ from models import ROOT  # noqa: E402
 
 SRC = os.path.join(ROOT, 'speedmap')
 CORE = ['metadata.bin', 'index.bin', 'tiles.bin', 'names.bin', 'seg_names.bin', 'cameras.bin', 'signs.bin']
+MANIFEST_FILES = CORE + ['roadnames.bin']
 HOME = (21.0285, 105.8542)  # Ha Noi — centre of a regional cut
 # usable bytes of each board's "ffat" partition (FAT overhead + slack taken off)
 PROFILES = {
-    'p4': dict(budget_mb=12.8, out='data_p4'),       # partitions_p4_data.csv: 13.5 MB
-    'lite154': dict(budget_mb=9.4, out='data_lite154'),  # boards/partitions_lite154.csv: 9.9 MB
+    'p4': dict(budget_mb=9.4, out='data_p4'),            # partitions_p4_data.csv: 9.9 MB
+    'lite154': dict(budget_mb=11.1, out='data_lite154'),  # boards/partitions_lite154.csv: 11.6 MB
 }
+# Road-name layer for a flash cut: the region around HOME (the country-wide
+# speedmap/roadnames.bin is 14 MB). ~1.8 MB with every alley.
+NAMES_BBOX = (HOME[0] - 0.43, HOME[0] + 0.43, HOME[1] - 0.5, HOME[1] + 0.45)
 
 
 def tree_size(d):
@@ -52,7 +56,7 @@ def stage_source(tmp):
 def write_manifest(d):
     version = open(os.path.join(SRC, 'manifest.txt'), encoding='utf-8').readline().strip()
     lines = [version]
-    for f in CORE:
+    for f in MANIFEST_FILES:
         data = open(os.path.join(d, f), 'rb').read()
         lines.append('%s %d %s' % (f, len(data), hashlib.sha256(data).hexdigest()))
     open(os.path.join(d, 'manifest.txt'), 'w', encoding='utf-8', newline='\n').write('\n'.join(lines) + '\n')
@@ -66,17 +70,23 @@ def write_manifest(d):
 def build(profile, publish):
     p = PROFILES[profile]
     out = os.path.join(ROOT, p['out'], 'speedmap')
-    budget = p['budget_mb'] * 1e6
     with tempfile.TemporaryDirectory() as tmp:
-        stage_source(tmp)
+        names = os.path.join(tmp, 'roadnames_region.bin')
+        subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'map_builder', 'build_road_names.py'),
+                        '--bbox'] + [str(v) for v in NAMES_BBOX] + ['--out', names], check=True)
+        budget_mb = p['budget_mb'] - os.path.getsize(names) / 1e6  # what is left for the speed map
+        src = os.path.join(tmp, 'src')
+        os.makedirs(src)
+        stage_source(src)
         if os.path.exists(out):
             shutil.rmtree(out)
-        if tree_size(tmp) <= budget:
-            shutil.copytree(tmp, out)
+        if tree_size(src) <= budget_mb * 1e6:
+            shutil.copytree(src, out)
             print('[%s] whole country fits' % profile)
         else:
             subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'map_builder', 'make_region_subset.py'),
-                            tmp, out, str(HOME[0]), str(HOME[1]), str(p['budget_mb'])], check=True)
+                            src, out, str(HOME[0]), str(HOME[1]), '%.2f' % budget_mb], check=True)
+        shutil.copy2(names, os.path.join(out, 'roadnames.bin'))
     version = write_manifest(out)
     print('[%s] %s: %.2f MB, %s' % (profile, os.path.relpath(out, ROOT), tree_size(out) / 1e6, version))
     if publish:
@@ -86,7 +96,7 @@ def build(profile, publish):
         os.makedirs(pub)
         # Only what the online updater downloads (manifest-listed files);
         # voices ship in the flash image and in speedmap/sounds.
-        for f in CORE + ['manifest.txt', 'manifest.txt.sig']:
+        for f in MANIFEST_FILES + ['manifest.txt', 'manifest.txt.sig']:
             shutil.copy2(os.path.join(out, f), os.path.join(pub, f))
         print('[%s] published to %s' % (profile, os.path.relpath(pub, ROOT)))
 

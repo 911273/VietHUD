@@ -46,10 +46,10 @@ static const size_t kMaxManifest = 4096;
 struct DatasetDef {
     const char *id;
     const char *label;
-    const char *files[6];
+    const char *files[7];
 };
 static const DatasetDef kDatasets[] = {
-    {"map", "Road map", {"tiles.bin", "index.bin", "metadata.bin", "names.bin", "seg_names.bin", nullptr}},
+    {"map", "Road map", {"tiles.bin", "index.bin", "metadata.bin", "names.bin", "seg_names.bin", "roadnames.bin", nullptr}},
     {"alerts", "Traffic alerts", {"signs.bin", "cameras.bin", nullptr}},
 };
 static const int kDatasetCount = sizeof(kDatasets) / sizeof(kDatasets[0]);
