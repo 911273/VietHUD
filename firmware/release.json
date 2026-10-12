@@ -1,35 +1,35 @@
 {
-  "version": "4.0.3",
+  "version": "4.0.4",
   "build": "20261013",
-  "notes": "Tên đường gồm cả ngõ; dữ liệu kiểm tra mỗi tuần; sửa cập nhật tên đường",
+  "notes": "Một nguồn bản đồ OSM, thông tin dữ liệu chi tiết, Wi-Fi chỉ lưu khi kết nối được, tự nhận GPS M10/P18",
   "images": {
     "viethud35": {
       "name": "VietHUD 3.5\"",
       "chip": "esp32s3",
-      "path": "4.0.3/viethud35.bin",
-      "size": 2251776,
-      "sha256": "4194dad65773729729243e583d19d7cbd5e5b1d22f1ef5e1653a32b0ef48238d"
+      "path": "4.0.4/viethud35.bin",
+      "size": 2255616,
+      "sha256": "52f1f154a2931f8bf5755dbc34618b7f1d0ef6fbae95e1f10f55105a79121735"
     },
     "viethud28": {
       "name": "VietHUD 2.8\"",
       "chip": "esp32s3",
-      "path": "4.0.3/viethud28.bin",
-      "size": 2244656,
-      "sha256": "d4928019a3e4768e8d81c74dec9d23c9444a83ebe0fd027314eb0b435e0308fa"
+      "path": "4.0.4/viethud28.bin",
+      "size": 2248320,
+      "sha256": "79516d5327e72faa69aef2e3575e00fb28794378df711183f6933291543cbfb7"
     },
     "viethud154": {
       "name": "VietHUD Lite 1.54\"",
       "chip": "esp32s3",
-      "path": "4.0.3/viethud154.bin",
-      "size": 1563072,
-      "sha256": "2af4bc702c115d6f0d76def72c494c31376a638019fd85c0f36d5b91abeadd7b"
+      "path": "4.0.4/viethud154.bin",
+      "size": 1566016,
+      "sha256": "0ada161c17600456f39aabd92bb22ed6b2daf3b55c5dbe1c87c3e39719c4e982"
     },
     "viethud43": {
       "name": "VietHUD 4.3\" (P4)",
       "chip": "esp32p4",
-      "path": "4.0.3/viethud43.bin",
-      "size": 2757360,
-      "sha256": "9bbe87d8562fe77607e7587995df38e696cd8c89be4efc584acb15e2ddc86bf5"
+      "path": "4.0.4/viethud43.bin",
+      "size": 2760992,
+      "sha256": "bf0041c078ac86cd3cdad46d81037e18071cd06b265980ca7efd21155304a0ab"
     }
   }
 }
