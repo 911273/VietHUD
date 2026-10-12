@@ -27,7 +27,8 @@ void speedLimitManagerStart();
 size_t speedLimitTaskStackFreeBytes();
 
 // Dynamic warning distance based on vehicle speed:
-// Minimum 100m. Scales smoothly with vehicle speed (lead time ~14-15s: ~4.5m per km/h).
+// Minimum 100m. Scales smoothly with vehicle speed (lead time ~14-15s: ~4.5m per km/h),
+// at most cfg.warnDistMaxM (<= 400 m).
 float computeDynamicWarnDistance(float speedKmh);
 
 // How far ahead regulatory SIGNS (resident area, no-overtaking, toll booth,

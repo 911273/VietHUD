@@ -14,7 +14,7 @@ struct SystemSettings {
     uint8_t brightness;        // 25/50/75/100 %               <-> cfg.brightness
     bool overspeedAlert;       //                              <-> cfg.audioOverspeed
     int8_t overspeedTolerance; // 0/3/5/10 km/h                <-> cfg.overspeedOffsetKmh
-    uint16_t alertDistance;    // 50/75/100 m (camera + limit) <-> cfg.cameraWarnDistM/aheadLimitWarnDistM
+    uint16_t alertDistance;    // 200/300/350/400 m max       <-> cfg.warnDistMaxM
     bool signSound;            // sign voice/chimes            <-> cfg.audioResident/NoOvertake/Toll/Light/Danger
     uint8_t defaultSpeedLimit; // 0 = off, 40..120             <-> cfg.defaultLimitKmh
     uint8_t language;          // UiLanguage (Lite only)

@@ -849,6 +849,86 @@ static bool deadReckonAlongRoute(uint32_t nowMs) {
     return true;
 }
 
+// Road NAME fallback (2026-10-12, user: the Lite stayed on "Đang dò tên
+// đường" while parked / crawling). runMatch() only names a road it is
+// confident the car is ON (heading + movement) — right for the speed limit,
+// too strict for a name label. When it has no name but we have a fix, show
+// the nearest NAMED segment within kNameFallbackM, as the stand-alone Lite
+// did. Display only: the limit, route and warnings are untouched.
+static const float kNameFallbackM = 60.0f; // GPS indoors / under trees drifts tens of metres
+static void nearestRoadNameFallback(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
+    static uint32_t sLastMs = 0;
+    static char sName[sizeof(out.roadName)] = "";
+    static float sLat = 0, sLon = 0;
+    if (out.roadName[0] || !gnss.fix || !gMetadata.tileSizeDeg) return;
+    // Recompute at most every 2 s, or once the car moved ~15 m; else reuse.
+    bool moved = fabsf(gnss.latDeg - sLat) > 0.00014f || fabsf(gnss.lonDeg - sLon) > 0.00014f;
+    if (sName[0] && !moved && millis() - sLastMs < 2000) {
+        strncpy(out.roadName, sName, sizeof(out.roadName) - 1);
+        return;
+    }
+    sLastMs = millis();
+    sLat = gnss.latDeg;
+    sLon = gnss.lonDeg;
+    sName[0] = '\0';
+
+    int32_t latCell = (int32_t)((gnss.latDeg + 90.0f) / gMetadata.tileSizeDeg);
+    int32_t lonCell = (int32_t)((gnss.lonDeg + 180.0f) / gMetadata.tileSizeDeg);
+    uint32_t tileIds[5] = {packTile(latCell, lonCell), packTile(latCell + 1, lonCell),
+                           packTile(latCell - 1, lonCell), packTile(latCell, lonCell + 1),
+                           packTile(latCell, lonCell - 1)};
+    // The few nearest segments, then the first of them that has a name
+    // (each name lookup is two small flash/SD reads).
+    static const int kK = 6;
+    uint32_t ids[kK];
+    float dists[kK];
+    int n = 0;
+    for (int t = 0; t < 5; t++) {
+        const CachedTile *tile = getOrLoadTile(tileIds[t]);
+        if (!tile) continue;
+        for (int i = 0; i < tile->segCount; i++) {
+            const RoadSegment &sg = tile->segments[i];
+            float d = pointSegmentDistanceM(gnss.latDeg, gnss.lonDeg, sg.startLatE7 / 1e7f, sg.startLonE7 / 1e7f,
+                                            sg.endLatE7 / 1e7f, sg.endLonE7 / 1e7f);
+            if (d > kNameFallbackM) continue;
+            int slot = n < kK ? n++ : -1;
+            if (slot < 0) {
+                int far = 0;
+                for (int k = 1; k < kK; k++)
+                    if (dists[k] > dists[far]) far = k;
+                if (d >= dists[far]) continue;
+                slot = far;
+            }
+            ids[slot] = sg.id;
+            dists[slot] = d;
+        }
+    }
+    static uint32_t sFoundMs = 0;
+    static char sKept[sizeof(out.roadName)] = "";
+    for (int tries = 0; tries < n; tries++) {
+        int b = -1;
+        for (int k = 0; k < n; k++)
+            if (dists[k] >= 0 && (b < 0 || dists[k] < dists[b])) b = k;
+        if (b < 0) break;
+        dists[b] = -1; // consumed
+        const char *nm = sdMgrGetSegmentRoadName(ids[b]);
+        if (nm && nm[0]) {
+            strncpy(sName, nm, sizeof(sName) - 1);
+            sName[sizeof(sName) - 1] = '\0';
+            break;
+        }
+    }
+    // Nothing named in range this time: keep the last found name ~10 s
+    // (a short drift away shouldn't blank the label), as the stand-alone Lite did.
+    if (sName[0]) {
+        strncpy(sKept, sName, sizeof(sKept) - 1);
+        sFoundMs = millis();
+    } else if (sKept[0] && millis() - sFoundMs < 10000) {
+        strncpy(sName, sKept, sizeof(sName) - 1);
+    }
+    strncpy(out.roadName, sName, sizeof(out.roadName) - 1);
+}
+
 static void runMatch(const GnssSnapshot &gnss, RoadInfoSnapshot &out) {
     out.mapLoaded = true;
 
@@ -1109,11 +1189,14 @@ static const float kMinAheadStepM = 20.0f;
 
 // Dynamic warning distance based on vehicle speed:
 // Minimum 100m. Scales smoothly with vehicle speed (lead time ~14-15s: ~4.5m per km/h).
-// e.g.: <=22 km/h -> 100m, 50 km/h -> 225m, 60 km/h -> 270m, 80 km/h -> 360m, 100 km/h -> 450m, 120 km/h -> 540m (capped at 600m).
+// e.g.: <=22 km/h -> 100m, 50 km/h -> 225m, 60 km/h -> 270m, 80 km/h -> 360m, 90+ km/h -> 400m.
+// Capped at cfg.warnDistMaxM — at most 400 m (user rule 2026-10-12; was 600 m).
 float computeDynamicWarnDistance(float speedKmh) {
     float d = speedKmh * 4.5f;
+    float cap = cfg.warnDistMaxM;
+    if (cap > 400.0f) cap = 400.0f;
+    if (d > cap) d = cap;
     if (d < 100.0f) d = 100.0f; // Minimum 100m
-    if (d > 600.0f) d = 600.0f; // Maximum 600m
     return d;
 }
 
@@ -1857,6 +1940,7 @@ static void speedLimitTaskFn(void *) {
                 out.source = SPEED_SOURCE_DEFAULT;
             }
 
+            nearestRoadNameFallback(gnss, out); // name label only — see its comment
             lastPublished = out;
             roadInfoPublish(out);
             // Live background map (2026-09-22) — rides this same ~500ms loop
