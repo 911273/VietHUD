@@ -16,6 +16,8 @@ if [ ! -d "$REPO/.git" ]; then
     git clone -q --depth 1 --filter=blob:none --sparse git@github.com:911273/VietHUD.git "$REPO"
     git -C "$REPO" sparse-checkout set --no-cone /roadnames/ /roadnames_lite154/ \
         /tools/sign_manifest.py /tools/map_builder/build_road_names.py /tools/map_builder/publish_roadnames.py
+    git -C "$REPO" config user.name "VietHUD Road Names Bot"
+    git -C "$REPO" config user.email "roadnames-bot@viethud.local"
 fi
 git -C "$REPO" pull -q --rebase --depth 1 origin main || git -C "$REPO" pull -q --rebase origin main
 
