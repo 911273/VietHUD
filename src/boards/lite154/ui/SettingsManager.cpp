@@ -28,7 +28,7 @@ void SettingsManager::load() {
     data.brightness = b <= 37 ? 25 : b <= 62 ? 50 : b <= 87 ? 75 : 100;
     data.overspeedAlert = cfg.audioOverspeed;
     data.overspeedTolerance = (int8_t)lroundf(cfg.overspeedOffsetKmh);
-    data.alertDistance = (uint16_t)lroundf(cfg.cameraWarnDistM);
+    data.alertDistance = (uint16_t)lroundf(cfg.warnDistMaxM);
     data.signSound = cfg.audioResident || cfg.audioNoOvertake || cfg.audioToll || cfg.audioLight || cfg.audioDanger;
     data.defaultSpeedLimit = (uint8_t)lroundf(cfg.defaultLimitKmh);
     data.speedCalPct = (int8_t)lroundf(cfg.gnssSpeedCalibrationPct);
@@ -41,8 +41,7 @@ void SettingsManager::save() {
     cfg.brightness = data.brightness;
     cfg.audioOverspeed = data.overspeedAlert;
     cfg.overspeedOffsetKmh = data.overspeedTolerance;
-    cfg.cameraWarnDistM = data.alertDistance;
-    cfg.aheadLimitWarnDistM = data.alertDistance;
+    cfg.warnDistMaxM = data.alertDistance;
     cfg.audioResident = cfg.audioNoOvertake = cfg.audioToll = cfg.audioLight = cfg.audioDanger = data.signSound;
     cfg.defaultLimitKmh = data.defaultSpeedLimit;
     cfg.gnssSpeedCalibrationPct = data.speedCalPct;
@@ -149,8 +148,8 @@ void SettingsManager::adjustValue(uint8_t index, bool inc) {
             data.speedCalPct = (int8_t)(v < -10 ? -10 : v > 10 ? 10 : v);
             break;
         }
-        case SETTING_ALERT_DISTANCE: { // the platform caps warning distance at 50..100 m
-            static const uint16_t k[] = {50, 75, 100};
+        case SETTING_ALERT_DISTANCE: { // max warning distance (speed-based, up to this), <= 400 m
+            static const uint16_t k[] = {200, 300, 350, 400};
             data.alertDistance = stepIn(k, data.alertDistance, inc);
             break;
         }

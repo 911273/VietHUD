@@ -97,6 +97,11 @@ struct AppConfig {
     // collapsing to a single fixed value.
     float aheadLimitWarnDistM = 100.0f; // how far ahead to project + re-match for an upcoming speed-limit CHANGE
     float cameraWarnDistM = 100.0f;     // how far out an upcoming speed camera starts showing on the alert card
+    // ^ both legacy/unused since 2026-09-24 (see ui/Settings.cpp). What is used:
+    // the speed-based warning distance (map/SpeedLimitManager.cpp
+    // computeDynamicWarnDistance: 4.5 m per km/h, min 100 m) capped at this.
+    // 400 m max (user rule 2026-10-12: "khoang cach canh bao toi da la 400m").
+    float warnDistMaxM = 400.0f;
 
     // Trip logging (log/TripLogger.cpp) — periodic + event-triggered CSV log
     // to the microSD card, for reviewing a drive's speed-limit/camera/sign
@@ -254,6 +259,7 @@ inline void clampConfig(AppConfig &c) {
     c.wifiAutoOffMin = constrain(c.wifiAutoOffMin, 1.0f, 120.0f);
     c.aheadLimitWarnDistM = constrain(c.aheadLimitWarnDistM, 50.0f, 100.0f);
     c.cameraWarnDistM = constrain(c.cameraWarnDistM, 50.0f, 100.0f);
+    c.warnDistMaxM = constrain(c.warnDistMaxM, 100.0f, 400.0f);
     c.screenRotation = constrain(c.screenRotation, 0.0f, 3.0f);
 #if BOARD_LANDSCAPE_ONLY
     if (lroundf(c.screenRotation) != 3) c.screenRotation = 1; // only a landscape layout exists for this board
@@ -290,6 +296,7 @@ inline void sanitizeConfig(AppConfig &c) {
     if (!isfinite(c.wifiAutoOffMin)) c.wifiAutoOffMin = d.wifiAutoOffMin;
     if (!isfinite(c.aheadLimitWarnDistM)) c.aheadLimitWarnDistM = d.aheadLimitWarnDistM;
     if (!isfinite(c.cameraWarnDistM)) c.cameraWarnDistM = d.cameraWarnDistM;
+    if (!isfinite(c.warnDistMaxM)) c.warnDistMaxM = d.warnDistMaxM;
     if (!isfinite(c.screenRotation)) c.screenRotation = d.screenRotation;
     if (!isfinite(c.themeMode)) c.themeMode = d.themeMode;
     if (!isfinite(c.brightnessMode)) c.brightnessMode = d.brightnessMode;

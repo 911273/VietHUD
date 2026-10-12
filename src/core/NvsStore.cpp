@@ -33,6 +33,7 @@ void loadConfigFromNVS(AppConfig &cfg) {
     cfg.overspeedOffsetKmh = prefs.getFloat("overspeedOff", cfg.overspeedOffsetKmh);
     cfg.aheadLimitWarnDistM = prefs.getFloat("aheadWarnM", cfg.aheadLimitWarnDistM);
     cfg.cameraWarnDistM = prefs.getFloat("camWarnM", cfg.cameraWarnDistM);
+    cfg.warnDistMaxM = prefs.getFloat("warnMaxM", cfg.warnDistMaxM);
     cfg.tripLoggingEnabled = prefs.getBool("tripLogEn", cfg.tripLoggingEnabled);
     // getString(), not getFloat() — see AppConfig.h's wifiSsid/wifiPassword
     // comment. Copied into the fixed buffers rather than kept as a String:
@@ -211,6 +212,7 @@ void saveConfigToNVS(const AppConfig &cfg) {
     prefs.putFloat("overspeedOff", cfg.overspeedOffsetKmh);
     prefs.putFloat("aheadWarnM", cfg.aheadLimitWarnDistM);
     prefs.putFloat("camWarnM", cfg.cameraWarnDistM);
+    prefs.putFloat("warnMaxM", cfg.warnDistMaxM);
     prefs.putBool("tripLogEn", cfg.tripLoggingEnabled);
     prefs.putString("wifiSsid", cfg.wifiSsid);
     prefs.putString("wifiPass", cfg.wifiPassword);
