@@ -55,7 +55,7 @@ def in_region(lat, lon):
 def cut_alerts(d):
     """cameras.bin / signs.bin limited to REGION (same formats; signs header + CRC rewritten)."""
     cam = open(os.path.join(d, 'cameras.bin'), 'rb').read()
-    rec = 24  # CameraPoint (u64 id, i32 lat, i32 lon, i16 limit, u16 dir) padded to 24
+    rec = 20  # CameraPoint, packed (SpeedMapFormat.h #pragma pack(1)): u64 id, i32 lat, i32 lon, i16 limit, u16 dir
     keep = [cam[i:i + rec] for i in range(0, len(cam) - len(cam) % rec, rec)
             if in_region(*(v / 1e7 for v in struct.unpack_from('<ii', cam, i + 8)))]
     open(os.path.join(d, 'cameras.bin'), 'wb').write(b''.join(keep))
