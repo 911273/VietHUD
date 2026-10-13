@@ -1,35 +1,56 @@
 {
-  "version": "4.0.4",
+  "version": "4.0.5",
   "build": "20261013",
-  "notes": "Một nguồn bản đồ OSM, thông tin dữ liệu chi tiết, Wi-Fi chỉ lưu khi kết nối được, tự nhận GPS M10/P18",
+  "notes": "Du lieu tu Pi (Wi-Fi nha / Tailscale), cham calib tot hon, ngo ngach",
   "images": {
     "viethud35": {
       "name": "VietHUD 3.5\"",
       "chip": "esp32s3",
-      "path": "4.0.4/viethud35.bin",
-      "size": 2255616,
-      "sha256": "52f1f154a2931f8bf5755dbc34618b7f1d0ef6fbae95e1f10f55105a79121735"
+      "path": "4.0.5/viethud35.bin",
+      "size": 2259408,
+      "sha256": "38c85771bc18343014910a08c2bd595b5b799b1caae1e1ffc7510093c8fa1a62",
+      "bootloader": "4.0.5/viethud35.bootloader.bin",
+      "bootloader_sha256": "2a71d69b471e20c2bac7fb469f3c6a807b3ebee780e348e5889db0da849ca363",
+      "partitions": "4.0.5/viethud35.partitions.bin",
+      "partitions_sha256": "bd0f7954aca2ef7d925ee21aaa1f3dc8822d1d6ce5cbbd26a135e5886bfff6ce",
+      "bootloader_addr": 0
     },
     "viethud28": {
       "name": "VietHUD 2.8\"",
       "chip": "esp32s3",
-      "path": "4.0.4/viethud28.bin",
-      "size": 2248320,
-      "sha256": "79516d5327e72faa69aef2e3575e00fb28794378df711183f6933291543cbfb7"
+      "path": "4.0.5/viethud28.bin",
+      "size": 2249872,
+      "sha256": "7b1d778ec727f215b9b3f99bcdde0b6005fd1245ee97508f9815d4a7a0e245bf",
+      "bootloader": "4.0.5/viethud28.bootloader.bin",
+      "bootloader_sha256": "2a71d69b471e20c2bac7fb469f3c6a807b3ebee780e348e5889db0da849ca363",
+      "partitions": "4.0.5/viethud28.partitions.bin",
+      "partitions_sha256": "bd0f7954aca2ef7d925ee21aaa1f3dc8822d1d6ce5cbbd26a135e5886bfff6ce",
+      "bootloader_addr": 0
     },
     "viethud154": {
       "name": "VietHUD Lite 1.54\"",
       "chip": "esp32s3",
-      "path": "4.0.4/viethud154.bin",
-      "size": 1566016,
-      "sha256": "0ada161c17600456f39aabd92bb22ed6b2daf3b55c5dbe1c87c3e39719c4e982"
+      "path": "4.0.5/viethud154.bin",
+      "size": 1568560,
+      "sha256": "3ad2a585ef8acb0e2440f6bcd3f6c3f2d24a2e5c3102ca639e26bfae978f9486",
+      "bootloader": "4.0.5/viethud154.bootloader.bin",
+      "bootloader_sha256": "2a71d69b471e20c2bac7fb469f3c6a807b3ebee780e348e5889db0da849ca363",
+      "partitions": "4.0.5/viethud154.partitions.bin",
+      "partitions_sha256": "eb46a448a19858c8acf4be7675215fd57514a5f27d71c04fd0638ade9a6a2d89",
+      "bootloader_addr": 0
     },
     "viethud43": {
       "name": "VietHUD 4.3\" (P4)",
       "chip": "esp32p4",
-      "path": "4.0.4/viethud43.bin",
-      "size": 2760992,
-      "sha256": "bf0041c078ac86cd3cdad46d81037e18071cd06b265980ca7efd21155304a0ab"
+      "path": "4.0.5/viethud43.bin",
+      "size": 2764400,
+      "sha256": "b821d3653b95bf588f4897032dc57da1d1afe5ed32391cd82ff008a140bda98a",
+      "bootloader": "4.0.5/viethud43.bootloader.bin",
+      "bootloader_sha256": "299613cd57450964a4c20572af335bbad436d4d048e6bbf864855e9bda871a64",
+      "partitions": "4.0.5/viethud43.partitions.bin",
+      "partitions_sha256": "ace02503447d0f470692e65fa76002f2d77a92dc81cd3813d8aa66718d716da9",
+      "bootloader_addr": 8192
     }
-  }
+  },
+  "boot_app0": "4.0.5/boot_app0.bin"
 }
