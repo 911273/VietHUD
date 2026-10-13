@@ -95,3 +95,7 @@ data_lite154/
 .pio_p4/
 speedmap_lite154/
 speedmap_p4/
+
+# SpeedMap Studio: OSM working set, publish staging, downloaded PBF (data lives on the Pi, not in git)
+data/studio/
+data/osm/

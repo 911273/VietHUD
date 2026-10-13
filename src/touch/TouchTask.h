@@ -18,6 +18,13 @@ struct TouchPoint {
 void touchTaskStart();
 TouchPoint touchSnapshot();
 
+#ifndef VIETHUD_P4
+// While set, the touch task publishes the controller's coordinates without
+// the user calibration (cfg.touchScale*/touchOffset*) — the calibration
+// screen fits those from raw taps.
+extern volatile bool gTouchRawMode;
+#endif
+
 #ifdef VIETHUD_P4
 // Touch calibration (touch/TouchTaskP4.cpp): 5-point affine fit, saved in NVS.
 extern volatile bool gTouchCalRequested; // set from UI/serial; main loop runs it

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # VietHUD road-name channels — weekly, OpenStreetMap only (ODbL).
-# Independent of every other data job: own checkout, own folders on GitHub
-# (roadnames/, roadnames_lite154/), own signed manifests. See
+# Independent of every other data job: own checkout, own signed channels served by
+# the Pi's nginx (/viethud/roadnames/, /viethud/roadnames_lite154/). See
 # tools/map_builder/publish_roadnames.py and src/net/NamesUpdater.cpp.
 set -euo pipefail
 JOB=/home/admin/viethud-names
 REPO=$JOB/repo
 PBF=$JOB/data/vietnam-latest.osm.pbf
+WEB=/var/www/viethud
 mkdir -p "$JOB/data" "$JOB/logs"
 exec >>"$JOB/logs/run_$(date +%Y%m).log" 2>&1
 echo "=== $(date '+%F %T') start"
@@ -27,5 +28,11 @@ curl -fsSL -z "$PBF" -o "$PBF.new" https://download.geofabrik.de/asia/vietnam-la
 ls -la "$PBF"
 
 # 3. build, sign (key ~/.viethud), publish only if the names changed
-python3 "$REPO/tools/map_builder/publish_roadnames.py" --pbf "$PBF" --repo "$REPO" --push
+python3 "$REPO/tools/map_builder/publish_roadnames.py" --pbf "$PBF" --repo "$REPO"
+# Data lives on the Pi only (2026-10-13): serve the signed channels from the web root.
+for c in roadnames roadnames_lite154; do
+    mkdir -p "$WEB/$c"
+    cp -f "$REPO/$c/roadnames.bin" "$REPO/$c/manifest.txt.sig" "$WEB/$c/"
+    cp -f "$REPO/$c/manifest.txt" "$WEB/$c/"   # manifest last: units only see a complete channel
+done
 echo "=== $(date '+%F %T') done"

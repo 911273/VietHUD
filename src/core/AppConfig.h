@@ -236,6 +236,10 @@ struct AppConfig {
     // Touch offset calibration (2026-10-01)
     float touchOffsetX = 0.0f;
     float touchOffsetY = 0.0f;
+    // Per-axis touch scale (2026-10-13 calibration rework): corrected =
+    // raw * scale + offset, fitted from the 4 calibration taps.
+    float touchScaleX = 1.0f;
+    float touchScaleY = 1.0f;
 };
 
 // Single shared instance, defined in main_ui_demo.cpp. NOTE: read without a
@@ -270,6 +274,8 @@ inline void clampConfig(AppConfig &c) {
     c.voicePack = constrain(c.voicePack, 0.0f, 6.0f);
     c.touchOffsetX = constrain(c.touchOffsetX, -50.0f, 50.0f);
     c.touchOffsetY = constrain(c.touchOffsetY, -50.0f, 50.0f);
+    c.touchScaleX = constrain(c.touchScaleX, 0.7f, 1.4f);
+    c.touchScaleY = constrain(c.touchScaleY, 0.7f, 1.4f);
     if (c.savedNetworkCount < 0) c.savedNetworkCount = 0;
     if (c.savedNetworkCount > AppConfig::kMaxSavedNetworks) c.savedNetworkCount = AppConfig::kMaxSavedNetworks;
 }
@@ -304,4 +310,6 @@ inline void sanitizeConfig(AppConfig &c) {
     if (!isfinite(c.voicePack)) c.voicePack = d.voicePack;
     if (!isfinite(c.touchOffsetX)) c.touchOffsetX = d.touchOffsetX;
     if (!isfinite(c.touchOffsetY)) c.touchOffsetY = d.touchOffsetY;
+    if (!isfinite(c.touchScaleX)) c.touchScaleX = d.touchScaleX;
+    if (!isfinite(c.touchScaleY)) c.touchScaleY = d.touchScaleY;
 }

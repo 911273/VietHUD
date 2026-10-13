@@ -10,7 +10,9 @@
 #include <esp_task_wdt.h>
 #include <string.h>
 
-#define NAMES_BASE "https://raw.githubusercontent.com/911273/VietHUD/main/" BOARD_NAMES_CHANNEL "/"
+#include "net/DataSources.h"
+#define NAMES_URL VH_PI_LAN BOARD_NAMES_CHANNEL "/"
+static String sBase; // the source that answered (Pi LAN / mDNS / Tailscale)
 
 static bool sAvailable = false;
 static char sRemoteVersion[24] = "";
@@ -20,8 +22,10 @@ static void localPath(char *out, size_t cap, const char *file) { snprintf(out, c
 static bool getText(const String &url, String &out) {
     WiFiClientSecure sclient;
     sclient.setInsecure(); // the manifest is signed and the file SHA-256 checked
+    WiFiClient client;
     HTTPClient http;
-    if (!http.begin(sclient, url)) return false;
+    bool https = url.startsWith("https");
+    if (!(https ? http.begin(sclient, url) : http.begin(client, url))) return false;
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
     http.setTimeout(15000);
     int code = http.GET();
@@ -34,8 +38,12 @@ static bool getText(const String &url, String &out) {
 
 // Signed manifest -> version, size, sha. False if unsigned / malformed.
 static bool fetchManifest(char *ver, size_t verCap, uint32_t *size, char sha[65]) {
-    String m, sig;
-    if (!getText(NAMES_BASE "manifest.txt", m) || !getText(NAMES_BASE "manifest.txt.sig", sig)) return false;
+    String m, sig, cands[3];
+    int nc = dataSourceCandidates(NAMES_URL, cands);
+    sBase = "";
+    for (int i = 0; i < nc && !sBase.length(); i++)
+        if (getText(cands[i] + "manifest.txt", m)) sBase = cands[i];
+    if (!sBase.length() || !getText(sBase + "manifest.txt.sig", sig)) return false;
     sig.trim();
     if (!installerVerifySignature(m.c_str(), m.length(), sig.c_str())) {
         Serial.println("[names] manifest signature INVALID — ignored");
@@ -114,8 +122,10 @@ int namesUpdateRun(uint8_t *buf, size_t bufSize, void (*progress)(int, const cha
             if (attempt) vTaskDelay(pdMS_TO_TICKS(2000));
             WiFiClientSecure sclient;
             sclient.setInsecure();
+            WiFiClient client;
             HTTPClient http;
-            if (!http.begin(sclient, NAMES_BASE "roadnames.bin")) continue;
+            String url = sBase + "roadnames.bin";
+            if (!(url.startsWith("https") ? http.begin(sclient, url) : http.begin(client, url))) continue;
             http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
             http.setTimeout(15000);
             if (have > 0) http.addHeader("Range", String("bytes=") + (uint32_t)have + "-");

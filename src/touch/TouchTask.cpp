@@ -19,6 +19,8 @@ TouchPoint touchSnapshot() {
     return copy;
 }
 
+volatile bool gTouchRawMode = false;
+
 static void touchTaskFn(void *) {
     if (!boardTouchBegin()) Serial.println("[touch] ERROR: touch I2C init failed");
     // Must numerically match display/DisplayDriver.cpp's gfx rotation —
@@ -37,8 +39,11 @@ static void touchTaskFn(void *) {
         xSemaphoreTake(touchMutex, portMAX_DELAY);
         sharedPoint.pressed = touched;
         if (touched) {
-            int32_t cx = (int32_t)x + (int32_t)lroundf(cfg.touchOffsetX);
-            int32_t cy = (int32_t)y + (int32_t)lroundf(cfg.touchOffsetY);
+            int32_t cx = x, cy = y;
+            if (!gTouchRawMode) { // user calibration: per-axis scale + offset
+                cx = (int32_t)lroundf(x * cfg.touchScaleX + cfg.touchOffsetX);
+                cy = (int32_t)lroundf(y * cfg.touchScaleY + cfg.touchOffsetY);
+            }
             uint16_t maxW = (cfg.screenRotation == 0 || cfg.screenRotation == 2) ? TFT_RES_W : TFT_RES_H;
             uint16_t maxH = (cfg.screenRotation == 0 || cfg.screenRotation == 2) ? TFT_RES_H : TFT_RES_W;
             if (cx < 0) cx = 0;

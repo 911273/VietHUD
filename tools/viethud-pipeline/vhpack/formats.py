@@ -48,6 +48,7 @@ SEGFLAG_ONEWAY = 0x02
 SEGFLAG_BRIDGE = 0x04  # bridge / viaduct / flyover (bridge=* other than "no", or layer >= 1)
 SEGFLAG_TUNNEL = 0x08  # tunnel / underpass (tunnel=* other than "no"/"building_passage", or layer <= -1)
 SEGFLAG_LINK = 0x10    # ramp / slip road (highway=*_link)
+SEGFLAG_NO_VEHICLE = 0x20  # footway/path/steps/...: drawn, never matched as the car's road
 
 
 def grade_flags(tags):

@@ -32,6 +32,9 @@ from models import MODELS, ROOT  # noqa: E402
 from build import image_path, run_env  # noqa: E402
 
 CHIP_IDS = {'esp32s3': 9, 'esp32p4': 18}  # esp_image_header_t.chip_id
+BOOTLOADER_ADDR = {'esp32s3': 0x0, 'esp32p4': 0x2000}  # where a USB flash writes bootloader.bin
+BOOT_APP0 = os.path.join(os.path.expanduser('~'), '.platformio', 'packages', 'framework-arduinoespressif32',
+                         'tools', 'partitions', 'boot_app0.bin')
 PI_HOST = 'admin@100.107.34.92'
 PI_WEBROOT = '/var/www/viethud'
 URL_BASES = {  # per-route keys of the legacy version.json
@@ -92,6 +95,16 @@ def main():
         shutil.copyfile(built, os.path.join(ROOT, 'firmware', path))
         release['images'][mid] = {'name': m['name'], 'chip': m['chip'], 'path': path, 'size': len(data),
                                   'sha256': hashlib.sha256(data).hexdigest()}
+        # For a USB flash (tools/update_tool): the model's bootloader + partition
+        # table, so a unit on an older table is brought up to date in one go.
+        bdir = os.path.dirname(built)
+        for part, fname in (('bootloader', 'bootloader.bin'), ('partitions', 'partitions.bin')):
+            blob = open(os.path.join(bdir, fname), 'rb').read()
+            rel = '%s/%s.%s.bin' % (a.version, mid, part)
+            open(os.path.join(ROOT, 'firmware', rel), 'wb').write(blob)
+            release['images'][mid][part] = rel
+            release['images'][mid][part + '_sha256'] = hashlib.sha256(blob).hexdigest()
+        release['images'][mid]['bootloader_addr'] = BOOTLOADER_ADDR[m['chip']]
         # Legacy per-model channel for units still on 3.x.
         legacy = {'model': mid, 'version': a.version, 'build': release['build']}
         for key, base in URL_BASES.items():
@@ -104,6 +117,8 @@ def main():
             f.write('\n')
         print('  %-11s %-8s %8d B  %s' % (mid, m['chip'], len(data), release['images'][mid]['sha256'][:16]))
 
+    shutil.copyfile(BOOT_APP0, os.path.join(rel_dir, 'boot_app0.bin'))  # otadata image (0xe000)
+    release['boot_app0'] = '%s/boot_app0.bin' % a.version
     rj = os.path.join(ROOT, 'firmware', 'release.json')
     with open(rj, 'w', encoding='utf-8') as f:
         json.dump(release, f, ensure_ascii=False, indent=2)
@@ -118,8 +133,9 @@ def main():
             subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', src, '%s:%s' % (PI_HOST, dst)], check=True)
         ssh('mkdir -p %s/firmware/%s %s' % (PI_WEBROOT, a.version,
                                             ' '.join('%s/firmware/%s' % (PI_WEBROOT, mid) for mid in MODELS)))
+        for f in sorted(os.listdir(rel_dir)):
+            scp(os.path.join(rel_dir, f), '%s/firmware/%s/%s' % (PI_WEBROOT, a.version, f))
         for mid in MODELS:
-            scp(os.path.join(rel_dir, mid + '.bin'), '%s/firmware/%s/%s.bin' % (PI_WEBROOT, a.version, mid))
             scp(os.path.join(ROOT, 'firmware', mid, 'version.json'), '%s/firmware/%s/version.json' % (PI_WEBROOT, mid))
         scp(rj, '%s/firmware/release.json' % PI_WEBROOT)  # last: devices only see a complete release
         print('uploaded to %s:%s/firmware' % (PI_HOST, PI_WEBROOT))

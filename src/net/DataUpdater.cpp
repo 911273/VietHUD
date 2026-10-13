@@ -3,6 +3,7 @@
 #include "map/SdCardManager.h"
 #include "update/DataInstaller.h" // staging + signature + atomic boot-time install
 #include "net/NamesUpdater.h"     // the separate road-name channel
+#include "net/DataSources.h"      // Pi LAN / mDNS / Tailscale
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -151,14 +152,15 @@ static int runUpdate(uint8_t *dlBuf, size_t dlBufSize) {
     setStatus(DU_RUNNING, "Loading the data list...");
 
     if (!cfg.dataUpdateUrl[0]) return 2; // board without a speed-map channel (road names only)
-    String base = cfg.dataUpdateUrl;
-    if (base.length() && !base.endsWith("/")) base += "/";
-    Serial.printf("[dataupd] STA ip=%s dns=%s  url=%s\n", WiFi.localIP().toString().c_str(),
-                  WiFi.dnsIP().toString().c_str(), (base + DU_MANIFEST_NAME).c_str());
-
+    String cands[3], base;
+    int nc = dataSourceCandidates(cfg.dataUpdateUrl, cands);
     String manifest, sig;
-    if (!httpGetText(base + DU_MANIFEST_NAME, manifest)) {
-        setStatus(DU_FAILED, "Could not load the data list");
+    for (int i = 0; i < nc && !base.length(); i++) {
+        Serial.printf("[dataupd] STA ip=%s  trying %s\n", WiFi.localIP().toString().c_str(), cands[i].c_str());
+        if (httpGetText(cands[i] + DU_MANIFEST_NAME, manifest)) base = cands[i];
+    }
+    if (!base.length()) {
+        setStatus(DU_FAILED, "Could not reach the data server (home Wi-Fi or Tailscale)");
         return 0;
     }
     if (!httpGetText(base + DU_MANIFEST_NAME ".sig", sig)) {
@@ -295,12 +297,15 @@ static void readLocalVersion(char *out, size_t cap) {
 
 static void checkTask(void *) {
     String remoteText;
-    String base = cfg.dataUpdateUrl;
-    if (base.length() && !base.endsWith("/")) base += "/";
+    String cands[3], base;
+    int nc = dataSourceCandidates(cfg.dataUpdateUrl, cands);
     readLocalVersion(s_localVersion, sizeof(s_localVersion));
     bool fetched = false;
-    if (base.length() && httpGetText(base + DU_MANIFEST_NAME, remoteText)) {
-        fetched = true;
+    for (int i = 0; i < nc && !fetched; i++) {
+        base = cands[i];
+        fetched = httpGetText(base + DU_MANIFEST_NAME, remoteText);
+    }
+    if (fetched) {
         extractVersion(remoteText.c_str(), s_remoteVersion, sizeof(s_remoteVersion));
         // "Update available" only for a NEWER release — a card carrying a more
         // recent local build must not be nagged into a downgrade.
@@ -310,7 +315,7 @@ static void checkTask(void *) {
         Serial.printf("[dataupd] check: local=\"%s\" remote=\"%s\" -> %s\n",
                       s_localVersion, s_remoteVersion,
                       newer ? "UPDATE AVAILABLE" : "up to date");
-    } else if (base.length()) {
+    } else if (nc) {
         Serial.println("[dataupd] check: could not fetch remote manifest");
     }
     bool namesOk = namesCheck() || namesRemoteVersion()[0];

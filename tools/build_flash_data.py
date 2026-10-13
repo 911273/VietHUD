@@ -18,12 +18,14 @@ Flash it with:  python tools/build.py viethud_lite154 uploadfs
 """
 import argparse
 import hashlib
+import math
 import os
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -70,6 +72,73 @@ def cut_alerts(d):
     print('  region alerts: %d cameras, %d signs' % (len(keep), len(pts)))
 
 
+# A flash cut keeps the roads you drive on between towns: motorway..tertiary
+# (road class 1-2), REGION only, no footways. Streets and alleys are named by
+# the separate road-name layer; the full OSM set (every alley) stays on the
+# microSD boards.
+FLASH_MAX_ROAD_CLASS = 2
+SEG = 28
+SEGFLAG_NO_VEHICLE = 0x20
+META_FMT = '<4sH16s16sQIIfiihI64sI'
+
+
+def keep_major(d, room):
+    """Rewrite tiles.bin / index.bin / metadata.bin of `d` in place: REGION only,
+    no footways; every class-1 road (motorway/trunk/primary) first, then class-2
+    roads (secondary/tertiary) tile by tile outward from HOME while they fit in
+    `room` bytes (segment 28 B + seg_names 4 B + index 28 B per tile). Segment
+    ids are kept (they index seg_names.bin; make_region_subset renumbers them)."""
+    idx = open(os.path.join(d, 'index.bin'), 'rb').read()
+    tiles = []  # (dist, tid, bbox, class1 bytes, class2 bytes)
+    with open(os.path.join(d, 'tiles.bin'), 'rb') as tf:
+        for i in range(0, len(idx) - len(idx) % 28, 28):
+            tid, a, b, c, e, off, size = struct.unpack_from('<IiiiiII', idx, i)
+            la, lo = (a + b) / 2e7, (c + e) / 2e7
+            if not in_region(la, lo):
+                continue
+            tf.seek(off)
+            blob = tf.read(size)
+            k1, k2 = bytearray(), bytearray()
+            for k in range(0, len(blob) - len(blob) % SEG, SEG):
+                rcls, flags = blob[k + 22], blob[k + 27]
+                if flags & SEGFLAG_NO_VEHICLE:
+                    continue
+                if rcls == 1:
+                    k1 += blob[k:k + SEG]
+                elif rcls == FLASH_MAX_ROAD_CLASS:
+                    k2 += blob[k:k + SEG]
+            if k1 or k2:
+                dist = math.hypot(la - HOME[0], (lo - HOME[1]) * math.cos(math.radians(HOME[0])))
+                tiles.append([dist, tid, (a, b, c, e), k1, k2])
+    cost = lambda n: n // SEG * (SEG + 4)
+    used = sum(cost(len(t[3])) + 28 for t in tiles if t[3])
+    radius = 0.0
+    for t in sorted(tiles, key=lambda t: t[0]):
+        extra = cost(len(t[4])) + (0 if t[3] else 28)
+        if not t[4]:
+            continue
+        if used + extra > room:
+            break
+        used += extra
+        t[3] += t[4]
+        radius = t[0] * 111.0
+    out_tiles, out_idx, nseg, ntile = bytearray(), bytearray(), 0, 0
+    for _, tid, (a, b, c, e), keep, _k2 in sorted(tiles, key=lambda t: t[1]):
+        if keep:
+            out_idx += struct.pack('<IiiiiII', tid, a, b, c, e, len(out_tiles), len(keep))
+            out_tiles += keep
+            nseg += len(keep) // SEG
+            ntile += 1
+    open(os.path.join(d, 'tiles.bin'), 'wb').write(out_tiles)
+    open(os.path.join(d, 'index.bin'), 'wb').write(out_idx)
+    meta = list(struct.unpack_from(META_FMT, open(os.path.join(d, 'metadata.bin'), 'rb').read()))
+    meta[5], meta[6] = ntile, nseg
+    meta[13] = zlib.crc32(bytes(out_idx)) & 0xFFFFFFFF
+    open(os.path.join(d, 'metadata.bin'), 'wb').write(struct.pack(META_FMT, *meta))
+    print('  roads: class 1 in all of REGION + class 2 within ~%.0f km: %d tiles, %d segments, %.1f MB'
+          % (radius, ntile, nseg, used / 1e6))
+
+
 def tree_size(d):
     return sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(d) for f in fs)
 
@@ -80,12 +149,18 @@ def stage_source(tmp):
         shutil.copy2(os.path.join(SRC, f), os.path.join(tmp, f))
     # Only sounds/vi/ — the firmware plays from /speedmap/sounds/vi/ (audio/
     # AudioPlayer.cpp VOICE_DIR); the clips loose in sounds/ duplicate it.
-    shutil.copytree(os.path.join(SRC, 'sounds', 'vi'), os.path.join(tmp, 'sounds', 'vi'),
-                    ignore=shutil.ignore_patterns('*.bak*'))
+    # (an OSM working set from SpeedMap Studio has no clips: take the checkout's voice set)
+    snd = os.path.join(SRC, 'sounds', 'vi')
+    if not os.path.isdir(snd):
+        snd = os.path.join(ROOT, 'speedmap', 'sounds', 'vi')
+    shutil.copytree(snd, os.path.join(tmp, 'sounds', 'vi'), ignore=shutil.ignore_patterns('*.bak*'))
 
 
 def write_manifest(d):
-    version = open(os.path.join(SRC, 'manifest.txt'), encoding='utf-8').readline().strip()
+    try:
+        version = open(os.path.join(SRC, 'manifest.txt'), encoding='utf-8').readline().strip()
+    except OSError:  # a Studio working set has no manifest yet: the publish job writes the real one
+        version = 'version ' + time.strftime('%Y.%m.%d.%H%M')
     lines = [version]
     for f in MANIFEST_FILES:
         data = open(os.path.join(d, f), 'rb').read()
@@ -117,6 +192,9 @@ def build(profile, publish):
         os.makedirs(src)
         stage_source(src)
         cut_alerts(src)
+        if os.path.abspath(SRC) != os.path.join(ROOT, 'speedmap'):  # OSM road classes (the legacy set uses another scale)
+            other = tree_size(src) - sum(os.path.getsize(os.path.join(src, f)) for f in ('tiles.bin', 'seg_names.bin', 'index.bin'))
+            keep_major(src, budget_mb * 1e6 - other - 64 * 1024)
         if os.path.exists(out):
             shutil.rmtree(out)
         if tree_size(src) <= budget_mb * 1e6:
@@ -139,8 +217,12 @@ def build(profile, publish):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('profile', choices=sorted(PROFILES) + ['all'])
+    ap.add_argument('--src', help='data set to cut from (default speedmap/; SpeedMap Studio passes its working set)')
     ap.add_argument('--publish', action='store_true', help='also refresh speedmap_<profile>/ (online channel)')
     a = ap.parse_args()
+    if a.src:
+        global SRC
+        SRC = os.path.abspath(a.src)
     for prof in (sorted(PROFILES) if a.profile == 'all' else [a.profile]):
         build(prof, a.publish)
 

@@ -31,6 +31,8 @@
 // fwUpdaterCheck() so the linker keeps it).
 #define VH_MARKER_PREFIX "VIETHUD-HW-ID:"
 static const char kModelMarker[] = VH_MARKER_PREFIX VIETHUD_MODEL_ID ";";
+// Version marker, read by tools/update_tool over USB to tell what a unit runs.
+static const char kFwMarker[] = "VIETHUD-FW:" VIETHUD_FW_VERSION ";";
 
 static bool s_fwRunning = false;
 
@@ -198,7 +200,7 @@ bool fwUpdaterCheck(FwUpdateInfo &info) {
     strncpy(info.currentVersion, VIETHUD_FW_VERSION, sizeof(info.currentVersion) - 1);
     // Also a real reference to the marker: without one the linker's
     // --gc-sections drops it from the image, and the next OTA's check 2 fails.
-    Serial.printf("[fwupd] %s %s\n", kModelMarker, VIETHUD_FW_VERSION);
+    Serial.printf("[fwupd] %s %s\n", kModelMarker, kFwMarker);
     if (WiFi.status() != WL_CONNECTED) return false;
 
     String json;

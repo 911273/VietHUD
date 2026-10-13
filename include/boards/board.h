@@ -47,7 +47,7 @@
 #define BOARD_DATA_PROFILE "speedmap"
 #endif
 #ifndef BOARD_DATA_URL // "" = no online speed-map/alert channel for this board
-#define BOARD_DATA_URL "https://raw.githubusercontent.com/911273/VietHUD/main/" BOARD_DATA_PROFILE "/"
+#define BOARD_DATA_URL "http://192.168.1.65/viethud/" BOARD_DATA_PROFILE "/" // Pi (net/DataSources.h)
 #endif
 // Road-name channel (net/NamesUpdater.h): OSM street names, own signed manifest.
 #ifndef BOARD_NAMES_CHANNEL

@@ -1096,12 +1096,12 @@ function closeSaveModal() {
   document.getElementById("saveModal").style.display = "none";
 }
 
-function executeSaveAll(mode) {
+function executeSaveAll() {
   showLoader(true);
   fetch("/api/save_all", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mode })
+    body: JSON.stringify({})
   })
   .then(r => r.json())
   .then(res => {
@@ -1113,6 +1113,67 @@ function executeSaveAll(mode) {
   .catch(err => alert("Lỗi khi lưu: " + err))
   .finally(() => showLoader(false));
 }
+
+// -----------------------------------------------------------------------------
+// OSM REBUILD + PUBLISH JOBS (server-side, one at a time)
+// -----------------------------------------------------------------------------
+let jobTimer = null;
+
+function loadDatasetChip() {
+  fetch("/api/dataset").then(r => r.json()).then(d => {
+    const chip = document.getElementById("datasetChip");
+    if (!chip) return;
+    chip.textContent = d.is_osm_work
+      ? `OSM ${d.pbf || "?"} · ${d.size_mb} MB · ${d.cameras} cam · ${d.signs} biển · ${d.edits} điểm riêng`
+      : `speedmap/ (chưa dựng OSM) · ${d.cameras} cam · ${d.signs} biển`;
+    chip.title = `${d.dir}\nDựng lúc: ${d.built || "?"}\nĐã xoá khỏi OSM: ${d.suppressed}\nLưu ý: OSM có rất ít camera — camera chủ yếu từ điểm tự khảo sát.`;
+    if (d.job) watchJob();
+  }).catch(() => {});
+}
+
+function startOsmBuild() {
+  if (!confirm("Tải bản OSM Việt Nam mới nhất và dựng lại toàn bộ dữ liệu (mọi loại đường, kể cả ngõ ngách)?\n\nMất khoảng 15–40 phút. Các điểm tự khảo sát / đã xoá được giữ nguyên.")) return;
+  fetch("/api/osm_build", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ roads: "everything" }) })
+    .then(r => r.json()).then(res => { if (res.error) alert(res.error); else watchJob(); });
+}
+
+function startPublish() {
+  const notes = prompt("Phát hành bộ dữ liệu lên Pi (2.8/3.5/P4 + bản cắt cho Lite).\nGhi chú cho lần phát hành (tuỳ chọn):", "");
+  if (notes === null) return;
+  fetch("/api/publish", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ notes }) })
+    .then(r => r.json()).then(res => { if (res.error) alert(res.error); else watchJob(); });
+}
+
+function closeJobModal() {
+  document.getElementById("jobModal").style.display = "none";
+}
+
+function watchJob() {
+  document.getElementById("jobModal").style.display = "flex";
+  if (jobTimer) return;
+  const tick = () => fetch("/api/job").then(r => r.json()).then(j => {
+    document.getElementById("jobTitle").textContent = j.name || "Tác vụ";
+    const mm = Math.floor(j.elapsed / 60), ss = j.elapsed % 60;
+    document.getElementById("jobStatus").textContent = j.running
+      ? `⏳ Đang chạy… ${mm}:${String(ss).padStart(2, "0")}`
+      : (j.ok ? "✅ Hoàn tất" : (j.ok === false ? "❌ Lỗi — xem log" : ""));
+    const log = document.getElementById("jobLog");
+    const atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+    log.textContent = j.lines.join("\n");
+    if (atEnd) log.scrollTop = log.scrollHeight;
+    if (!j.running) {
+      clearInterval(jobTimer);
+      jobTimer = null;
+      loadDatasetChip();
+      if (typeof loadDatasetInfo === "function") loadDatasetInfo();
+      if (typeof fetchViewportData === "function") fetchViewportData();
+    }
+  }).catch(() => {});
+  tick();
+  jobTimer = setInterval(tick, 2000);
+}
+
+document.addEventListener("DOMContentLoaded", loadDatasetChip);
 
 function downloadDataset(dataset, format) {
   window.location.href = `/api/export_download?dataset=${dataset}&format=${format}`;
