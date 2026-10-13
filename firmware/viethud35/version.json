@@ -1,10 +1,10 @@
 {
   "model": "viethud35",
-  "version": "4.0.4",
+  "version": "4.0.5",
   "build": "20261013",
-  "url_pi4": "http://192.168.1.65/viethud/firmware/4.0.4/viethud35.bin",
-  "url_pi4_mdns": "http://homebridge.local/viethud/firmware/4.0.4/viethud35.bin",
-  "url_pi4_tailscale": "http://100.107.34.92/viethud/firmware/4.0.4/viethud35.bin",
-  "url_github": "https://raw.githubusercontent.com/911273/VietHUD/main/firmware/4.0.4/viethud35.bin",
-  "notes": "Một nguồn bản đồ OSM, thông tin dữ liệu chi tiết, Wi-Fi chỉ lưu khi kết nối được, tự nhận GPS M10/P18"
+  "url_pi4": "http://192.168.1.65/viethud/firmware/4.0.5/viethud35.bin",
+  "url_pi4_mdns": "http://homebridge.local/viethud/firmware/4.0.5/viethud35.bin",
+  "url_pi4_tailscale": "http://100.107.34.92/viethud/firmware/4.0.5/viethud35.bin",
+  "url_github": "https://raw.githubusercontent.com/911273/VietHUD/main/firmware/4.0.5/viethud35.bin",
+  "notes": "Du lieu tu Pi (Wi-Fi nha / Tailscale), cham calib tot hon, ngo ngach"
 }
