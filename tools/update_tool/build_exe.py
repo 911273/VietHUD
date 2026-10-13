@@ -25,6 +25,9 @@ def main():
            '--collect-submodules', 'esptool',
            '--collect-data', 'esptool',
            '--hidden-import', 'serial.tools.list_ports',
+           ] + sum((['--exclude-module', m] for m in (  # big packages of this PC's Python the tool never uses
+               'numpy', 'pandas', 'scipy', 'matplotlib', 'PIL', 'osmium', 'IPython', 'jedi', 'lxml',
+               'shapely', 'pyproj', 'sqlalchemy', 'pytest', 'setuptools')), []) + [
            os.path.join(HERE, 'viethud_update_tool.py')]
     print('>', ' '.join(cmd))
     subprocess.run(cmd, check=True)
