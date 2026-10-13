@@ -561,6 +561,7 @@ static RoadClassStyle mapClassStyle(uint8_t roadClass) {
         case kMapLineCurrentRoad: return {lv_color_hex(pal().roadCurrent), 5}; // current road (cyan accent)
         case 1: return {lv_color_hex(pal().roadMajor), 4};  // major
         case 2: return {lv_color_hex(pal().roadMain), 3};   // main
+        case 4: return {lv_color_hex(pal().roadSmall), 1};  // footway/path/steps (OSM full detail)
         default: return {lv_color_hex(pal().roadSmall), 2}; // small/other
     }
 }

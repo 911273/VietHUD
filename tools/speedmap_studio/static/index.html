@@ -10,6 +10,9 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
+  <style>
+    .dataset-chip { font-size: 12px; opacity: .85; padding: 4px 8px; border: 1px solid rgba(255,255,255,.2); border-radius: 12px; white-space: nowrap; }
+  </style>
 </head>
 <body>
   <!-- Header -->
@@ -44,8 +47,11 @@
 
     <!-- Global Save as New Dataset Action Button -->
     <div class="header-actions">
+      <button class="hud-btn secondary" onclick="startOsmBuild()" title="Tải bản OSM Việt Nam mới nhất (Geofabrik) và dựng lại toàn bộ dữ liệu: mọi loại đường kể cả ngõ ngách, giữ các điểm tự khảo sát">🌐 Cập nhật OSM</button>
+      <button class="hud-btn primary" onclick="startPublish()" title="Ký và đưa bộ dữ liệu lên Pi (speedmap/ cho 2.8/3.5/P4, speedmap_lite154/ cho Lite), lưu điểm tự khảo sát vào git">🚀 Phát hành</button>
+      <span class="dataset-chip" id="datasetChip" title="">…</span>
       <button class="hud-btn save-glow" id="saveDatasetBtn" onclick="openSaveModal()">
-        💾 Lưu Thành Dữ Liệu Mới <span class="badge-count" id="dirtyChangesBadge">0</span>
+        💾 Lưu <span class="badge-count" id="dirtyChangesBadge">0</span>
       </button>
     </div>
   </header>
@@ -588,6 +594,23 @@
     </main>
   </div>
 
+  <!-- MODAL: JOB LOG (OSM build / publish) -->
+  <div class="modal-backdrop" id="jobModal">
+    <div class="modal-box" style="max-width: 860px; width: 92vw;">
+      <div class="modal-header">
+        <span class="modal-title" id="jobTitle">Tác vụ</span>
+        <button class="close-btn" onclick="closeJobModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="jobStatus" style="margin-bottom:8px;font-weight:600"></div>
+        <pre id="jobLog" style="height:55vh;overflow:auto;background:#0b0f14;color:#cfe3ff;padding:10px;border-radius:6px;font-size:12px;white-space:pre-wrap"></pre>
+      </div>
+      <div class="modal-footer">
+        <button class="hud-btn secondary" onclick="closeJobModal()">Đóng (tác vụ vẫn chạy)</button>
+      </div>
+    </div>
+  </div>
+
   <!-- MODAL: UNIFIED SAVE ALL AS NEW DATASET -->
   <div class="modal-backdrop" id="saveModal">
     <div class="modal-box">
@@ -597,36 +620,17 @@
       </div>
       <div class="modal-body">
         <div class="save-intro-banner">
-          <p>Tất cả các điểm Camera, Đèn giao thông và Biển báo đã chỉnh sửa hoặc thêm mới sẽ được đóng gói thành các <b>tệp dữ liệu độc lập mới</b>. File gốc ban đầu được giữ an toàn 100%.</p>
+          <p>Các điểm bạn thêm / sửa / xoá đã được ghi ngay vào <code>data/custom_alerts</code> (lần dựng OSM sau vẫn giữ). Bấm Lưu để ghi <code>cameras.bin</code> + <code>signs.bin</code> của bộ dữ liệu làm việc (có bản .bak), rồi <b>🚀 Phát hành</b> để đưa lên Pi.</p>
           <div class="changes-summary-pill" id="modalChangesCount">0 chỉnh sửa</div>
         </div>
-
-        <!-- 1-Click Primary Action -->
         <div class="unified-save-options">
-          <button class="hud-btn primary save-glow giant-btn" onclick="executeSaveAll('new_files')">
-            💾 XUẤT BỘ FILE MỚI (TỰ ĐỘNG LƯU CẢ CAMERA + BIỂN BÁO/ĐÈN ĐỎ)
+          <button class="hud-btn primary save-glow giant-btn" onclick="executeSaveAll()">
+            💾 LƯU VÀO BỘ DỮ LIỆU LÀM VIỆC
           </button>
-          <div class="save-desc-sub">Tự động tạo 2 tệp mới riêng biệt trong thư mục speedmap: <code>cameras_edited_*.csv</code> và <code>signs_edited_*.bin</code></div>
-
-          <div class="or-download-divider">
-            <span>HOẶC CẬP NHẬT TRỰC TIẾP FILE ĐANG DÙNG</span>
-          </div>
-
-          <button class="hud-btn secondary full-width-btn" onclick="executeSaveAll('overwrite_with_backup')">
-            🛡️ Ghi đè vào file đang dùng (Tự động tạo bản sao lưu .bak an toàn)
-          </button>
-
-          <div class="or-download-divider">
-            <span>TẢI TẬP TIN TRỰC TIẾP VỀ MÁY (BROWSER DOWNLOAD)</span>
-          </div>
-
+          <div class="or-download-divider"><span>TẢI VỀ MÁY</span></div>
           <div class="download-btn-row">
-            <button class="hud-btn secondary full-btn" onclick="downloadDataset('cameras', 'csv')">
-              ⬇️ Tải cameras.csv
-            </button>
-            <button class="hud-btn secondary full-btn" onclick="downloadDataset('signs', 'bin')">
-              ⬇️ Tải signs.bin
-            </button>
+            <button class="hud-btn secondary full-btn" onclick="downloadDataset('cameras', 'csv')">⬇️ cameras.csv</button>
+            <button class="hud-btn secondary full-btn" onclick="downloadDataset('signs', 'bin')">⬇️ signs.bin</button>
           </div>
         </div>
       </div>

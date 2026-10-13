@@ -108,6 +108,8 @@ enum RoadDirection : uint8_t {
 #define SEGFLAG_BRIDGE 0x04 // on a bridge/viaduct/flyover (OSM bridge=* other than "no", or layer >= 1)
 #define SEGFLAG_TUNNEL 0x08 // in a tunnel/underpass (OSM tunnel=* other than "no", or layer <= -1)
 #define SEGFLAG_LINK 0x10   // a ramp/slip road (OSM highway=*_link) — how traffic changes level
+#define SEGFLAG_NO_VEHICLE 0x20 // footway/path/steps/... (OSM, 2026-10-13): drawn on the map, never
+                               // matched as the car's road nor used to build its forward route
 #define SEGFLAG_ONEWAY 0x02          // a real legal one-way restriction (OSM oneway=yes), not just "this record only carries one direction's speed" — see SpeedLimitManager.cpp's matcher for why this is distinct from `direction`
 
 enum SpeedSource : uint8_t {

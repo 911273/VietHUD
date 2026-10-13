@@ -19,23 +19,22 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import studio_data as SD  # data set paths, alert types, edits layer, OSM build + publish jobs
+
 PORT = 8088
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_SPEEDMAP = BASE_DIR.parents[1] / "speedmap"
-DEFAULT_CSV = Path(r"c:\Users\phamq\Downloads\cameras.csv")
+DEFAULT_SPEEDMAP = SD.dataset_dir()  # Studio's OSM working set, else the repo's speedmap/
+DEFAULT_CSV = DEFAULT_SPEEDMAP / "cameras.bin"  # (name kept for older code paths)
+EDITS = SD.Edits()
+JOB = SD.Job()
 
 CAMERA_CATEGORIES = {"speed_cam", "red_light_cam"}
 SIGN_CATEGORIES = {"sign_speed", "sign_r420", "sign_r421", "sign_overtake", "traffic_light", "toll", "danger"}
 
-TYPE_MAP_SIGNS = {
-    "sign_speed": 1,
-    "sign_r420": 2,
-    "sign_r421": 3,
-    "sign_overtake": 7,
-    "traffic_light": 6,
-    "toll": 5,
-    "danger": 10
-}
+# Category -> firmware TrafficSignType (studio_data.CATS also carries the start/end sub-type).
+TYPE_MAP_SIGNS = {c: t for c, (t, _) in SD.CATS.items()}
+SIGN_CATEGORIES = SIGN_CATEGORIES | set(SD.CATS) - CAMERA_CATEGORIES
 
 def dist_point_to_seg(plat, plon, s_lat, s_lon, e_lat, e_lon):
     m_lat = 110540.0
@@ -207,7 +206,8 @@ class SpeedMapEngine:
                     "heading": heading,
                     "category": "speed_cam" if is_speed else "red_light_cam",
                     "desc": f"Camera tốc độ ({speed} km/h)" if is_speed else "Camera phạt nguội / đèn đỏ",
-                    "modified": False
+                    "modified": False,
+                    "eid": EDITS.match(lat_e7 / 1e7, lon_e7 / 1e7, 4)
                 }
                 records.append(rec)
                 self.camera_grid.add(rec)
@@ -256,15 +256,11 @@ class SpeedMapEngine:
                 magic, ver, count, res, crc_s, crc_b = struct.unpack("<4sHIHII", s_data[:20])
                 for i in range(count):
                     raw = s_data[20 + i*20 : 20 + (i+1)*20]
-                    seg_id, lat_e7, lon_e7, heading, stype, val, fl1, fl2, dist = struct.unpack("<IiiHBBBBH", raw)
-                    
-                    if stype == 1: cat = "sign_speed"
-                    elif stype == 2: cat = "sign_r420"
-                    elif stype == 3: cat = "sign_r421"
-                    elif stype in (7, 8): cat = "sign_overtake"
-                    elif stype == 6: cat = "traffic_light"
-                    elif stype == 5: cat = "toll"
-                    else: cat = "danger"
+                    sid0, lat_e7, lon_e7, heading, stype, val, sub, fl, _res = struct.unpack("<IiiHBBBBH", raw)
+                    if stype == 4:
+                        continue  # cameras: shown from cameras.bin
+                    seg_id, fl1, dist = sid0, fl, 0
+                    cat = SD.category_of(stype, sub)
 
                     rec = {
                         "id": i + 1,
@@ -273,12 +269,14 @@ class SpeedMapEngine:
                         "lon": round(lon_e7 / 1e7, 7),
                         "heading": heading,
                         "type": stype,
+                        "sub": sub,
                         "category": cat,
                         "value": val,
                         "flags": fl1,
                         "dist": dist,
-                        "desc": "Đèn giao thông" if stype == 6 else f"Biển báo ({cat})",
-                        "modified": False
+                        "desc": SD.CAT_LABEL.get(cat, cat),
+                        "modified": False,
+                        "eid": EDITS.match(lat_e7 / 1e7, lon_e7 / 1e7, stype)
                     }
                     records.append(rec)
                     self.sign_grid.add(rec)
@@ -527,6 +525,8 @@ class SpeedMapEngine:
                 "modified": True,
                 "is_new": True
             }
+            rec["eid"] = "s%d" % cid
+            EDITS.upsert(rec["eid"], rec)
             self.camera_records.append(rec)
             self.camera_records_map[cid] = rec
             self.camera_grid.add(rec)
@@ -550,6 +550,9 @@ class SpeedMapEngine:
                 "modified": True,
                 "is_new": True
             }
+            rec["sub"] = SD.CATS.get(cat, (stype, 0))[1]
+            rec["eid"] = "s%d" % sid
+            EDITS.upsert(rec["eid"], rec)
             self.sign_records.append(rec)
             self.sign_records_map[sid] = rec
             self.sign_grid.add(rec)
@@ -571,6 +574,12 @@ class SpeedMapEngine:
 
         in_camera = item_id in self.camera_records_map
         in_sign = item_id in self.sign_records_map
+        old = dict(self.camera_records_map.get(item_id) or self.sign_records_map.get(item_id) or {})
+        eid = old.get("eid")
+        if old and not eid:
+            # An OSM point changed by hand: drop the OSM one at every rebuild, keep ours.
+            EDITS.remove_or_suppress(None, old)
+        eid = eid or "s%d" % int(time.time() * 1000)
 
         if is_dest_camera:
             if in_sign:
@@ -595,6 +604,8 @@ class SpeedMapEngine:
             rec["category"] = new_cat
             if desc: rec["desc"] = desc
             rec["modified"] = True
+            rec["eid"] = eid
+            EDITS.upsert(eid, rec)
             self.camera_grid.add(rec)
             return {"record": rec, "target_type": "camera"}
         else: # is_dest_sign
@@ -620,8 +631,11 @@ class SpeedMapEngine:
             rec["type"] = stype
             rec["category"] = new_cat
             rec["value"] = spd
+            rec["sub"] = SD.CATS.get(new_cat, (stype, 0))[1]
             if desc: rec["desc"] = desc
             rec["modified"] = True
+            rec["eid"] = eid
+            EDITS.upsert(eid, rec)
             self.sign_grid.add(rec)
             return {"record": rec, "target_type": "sign"}
 
@@ -629,6 +643,9 @@ class SpeedMapEngine:
         self.changes_count += 1
         item_id = int(item_id) if str(item_id).isdigit() else item_id
         ok = False
+        rec = self.camera_records_map.get(item_id) or self.sign_records_map.get(item_id)
+        if rec:
+            EDITS.remove_or_suppress(rec.get("eid"), rec)
         if item_id in self.camera_records_map:
             del self.camera_records_map[item_id]
             self.camera_records = [c for c in self.camera_records if c["id"] != item_id]
@@ -848,6 +865,37 @@ class SpeedMapEngine:
             "save_results": results
         }
 
+    def signs_blob(self):
+        """signs.bin as the firmware reads it (VNSG v1: id, lat, lon, dir, type,
+        speed, sub, flags, reserved); cameras go in too, as type-4 points."""
+        body = bytearray()
+        n = 0
+        for c in self.camera_records:
+            n += 1
+            body += struct.pack("<IiiHBBBBH", n, int(round(c["lat"] * 1e7)), int(round(c["lon"] * 1e7)),
+                                int(c.get("heading", 0xFFFF)) & 0xFFFF, 4, max(0, min(255, int(c.get("speed", 0)))), 0, 0, 0)
+        for r in self.sign_records:
+            n += 1
+            t, sub = SD.CATS.get(r["category"], (int(r.get("type", 10)), int(r.get("sub", 0))))
+            body += struct.pack("<IiiHBBBBH", n, int(round(r["lat"] * 1e7)), int(round(r["lon"] * 1e7)),
+                                int(r.get("heading", 0xFFFF)) & 0xFFFF, t, max(0, min(255, int(r.get("value", 0)))),
+                                sub, int(r.get("flags", 0)) & 0xFF, 0)
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        return struct.pack("<4sHIHII", b"VNSG", 1, n, 0, crc, int(time.time())) + bytes(body)
+
+    def reload_all(self):
+        """Point at the (possibly new) Studio working set and read it again."""
+        global DEFAULT_SPEEDMAP
+        DEFAULT_SPEEDMAP = SD.dataset_dir()
+        self.road_files = {k: DEFAULT_SPEEDMAP / v.name for k, v in self.road_files.items()}
+        EDITS.points.clear()
+        EDITS.suppress.clear()
+        EDITS.load()
+        self.load_roads()
+        self.load_cameras(str(DEFAULT_SPEEDMAP / "cameras.bin"))
+        self.load_signs(str(DEFAULT_SPEEDMAP / "signs.bin"))
+        self.changes_count = 0
+
     def export_dataset(self, dataset: str, target_format: str, target_path: str):
         p = Path(target_path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -895,20 +943,7 @@ class SpeedMapEngine:
                             s.get("value", 0)
                         ])
             else: # BIN
-                records_blob = bytearray()
-                for s in self.sign_records:
-                    lat_e7 = int(round(s["lat"] * 1e7))
-                    lon_e7 = int(round(s["lon"] * 1e7))
-                    records_blob.extend(struct.pack(
-                        "<IiiHBBBBH",
-                        s.get("seg_id", 0), lat_e7, lon_e7,
-                        int(s["heading"]), int(s["type"]), int(s.get("value", 0)),
-                        s.get("flags", 0), 0, s.get("dist", 0)
-                    ))
-                count = len(self.sign_records)
-                crc = zlib.crc32(records_blob) & 0xFFFFFFFF
-                header = struct.pack("<4sHIHII", b"VNSG", 1, count, 0, count, crc)
-                p.write_bytes(header + bytes(records_blob))
+                p.write_bytes(self.signs_blob())
             return len(self.sign_records)
 
 ENGINE = SpeedMapEngine()
@@ -940,6 +975,27 @@ class SpeedMapHandler(SimpleHTTPRequestHandler):
                 "vietnam_bbox": [8.5, 102.1, 23.4, 109.5]
             }
             self.send_json(info)
+            return
+
+        elif path == "/api/job":
+            self.send_json(JOB.state())
+            return
+
+        elif path == "/api/dataset":
+            meta = DEFAULT_SPEEDMAP / "metadata.bin"
+            man = DEFAULT_SPEEDMAP / "manifest.txt"
+            self.send_json({
+                "dir": str(DEFAULT_SPEEDMAP),
+                "is_osm_work": DEFAULT_SPEEDMAP == SD.WORK,
+                "built": time.strftime("%Y-%m-%d %H:%M", time.localtime(meta.stat().st_mtime)) if meta.exists() else None,
+                "version": man.read_text(encoding="utf-8").splitlines()[0] if man.exists() else None,
+                "pbf": time.strftime("%Y-%m-%d", time.localtime(SD.PBF.stat().st_mtime)) if SD.PBF.exists() else None,
+                "size_mb": round(sum(f.stat().st_size for f in DEFAULT_SPEEDMAP.glob("*.bin")) / 1e6, 1),
+                "edits": len(EDITS.points), "suppressed": len(EDITS.suppress),
+                "cameras": len(ENGINE.camera_records), "signs": len(ENGINE.sign_records),
+                "tiles": len(ENGINE.tile_entries), "names": len(ENGINE.names_cache),
+                "job": JOB.state()["running"],
+            })
             return
 
         elif path == "/api/roads":
@@ -1025,20 +1081,7 @@ class SpeedMapHandler(SimpleHTTPRequestHandler):
                     mime = "text/csv; charset=utf-8"
                     ext = "csv"
                 else:
-                    records_blob = bytearray()
-                    for s in ENGINE.sign_records:
-                        lat_e7 = int(round(s["lat"] * 1e7))
-                        lon_e7 = int(round(s["lon"] * 1e7))
-                        records_blob.extend(struct.pack(
-                            "<IiiHBBBBH",
-                            s.get("seg_id", 0), lat_e7, lon_e7,
-                            int(s["heading"]), int(s["type"]), int(s.get("value", 0)),
-                            s.get("flags", 0), 0, s.get("dist", 0)
-                        ))
-                    count = len(ENGINE.sign_records)
-                    crc = zlib.crc32(records_blob) & 0xFFFFFFFF
-                    header = struct.pack("<4sHIHII", b"VNSG", 1, count, 0, count, crc)
-                    data = header + bytes(records_blob)
+                    data = ENGINE.signs_blob()
                     mime = "application/octet-stream"
                     ext = "bin"
 
@@ -1119,51 +1162,44 @@ class SpeedMapHandler(SimpleHTTPRequestHandler):
             return
 
         elif parsed.path == "/api/save_all":
-            # Smart unified persistence: writes both cameras & signs at once!
-            mode = data.get("mode", "new_files") # "new_files" or "overwrite_with_backup"
+            # Write cameras.bin + signs.bin of the working set in place (with a .bak).
+            # Your edits are already in data/custom_alerts, so a later OSM rebuild keeps them.
             ts = int(time.time())
-            results = {}
-
-            if mode == "overwrite_with_backup":
-                cam_p = Path(DEFAULT_CSV) if DEFAULT_CSV.exists() else Path(ENGINE.active_camera_file)
-                sign_p = Path(DEFAULT_SPEEDMAP / "signs.bin")
-                
-                # Backup
-                if cam_p.exists():
-                    shutil.copy2(cam_p, cam_p.with_suffix(f".bak_{ts}"))
-                if sign_p.exists():
-                    shutil.copy2(sign_p, sign_p.with_suffix(f".bak_{ts}"))
-
-                # Write in-place
-                ENGINE.export_dataset("cameras", "csv", str(cam_p))
-                ENGINE.export_dataset("signs", "bin", str(sign_p))
-                ENGINE.active_camera_file = str(cam_p)
-                ENGINE.active_sign_file = str(sign_p)
-                results["cameras"] = str(cam_p)
-                results["signs"] = str(sign_p)
-                results["msg"] = f"Đã cập nhật trực tiếp vào file gốc:\n+ {cam_p}\n+ {sign_p}\n(Kèm bản sao lưu .bak an toàn)"
-            else:
-                # Save into new files in speedmap folder
-                out_cam = DEFAULT_SPEEDMAP / f"cameras_edited_{ts}.csv"
-                out_sign = DEFAULT_SPEEDMAP / f"signs_edited_{ts}.bin"
-                ENGINE.export_dataset("cameras", "csv", str(out_cam))
-                ENGINE.export_dataset("signs", "bin", str(out_sign))
-                
-                # Update active files so studio keeps using them!
-                ENGINE.active_camera_file = str(out_cam)
-                ENGINE.active_sign_file = str(out_sign)
-                results["cameras"] = str(out_cam)
-                results["signs"] = str(out_sign)
-                results["msg"] = f"Đã lưu thành bộ dữ liệu mới:\n+ {out_cam.name}\n+ {out_sign.name}"
-
+            cam_p = DEFAULT_SPEEDMAP / "cameras.bin"
+            sign_p = DEFAULT_SPEEDMAP / "signs.bin"
+            for f in (cam_p, sign_p):
+                if f.exists():
+                    shutil.copy2(f, f.with_suffix(".bak"))
+            ENGINE.export_dataset("cameras", "bin", str(cam_p))
+            ENGINE.export_dataset("signs", "bin", str(sign_p))
+            ENGINE.active_camera_file = str(cam_p)
+            ENGINE.active_sign_file = str(sign_p)
             ENGINE.changes_count = 0
             self.send_json({
                 "status": "ok",
-                "results": results,
+                "results": {"cameras": str(cam_p), "signs": str(sign_p),
+                            "msg": "Đã lưu vào bộ dữ liệu làm việc:\n+ %s\n+ %s\n(%d điểm tự khảo sát / đã xoá trong data/custom_alerts)\nBấm 🚀 Phát hành để đưa lên Pi." % (cam_p, sign_p, EDITS.count())},
                 "changes_count": 0,
                 "active_camera_file": ENGINE.active_camera_file,
                 "active_sign_file": ENGINE.active_sign_file
             })
+            return
+
+        elif parsed.path == "/api/osm_build":
+            if not JOB.start("Cập nhật OSM", SD.job_osm_build, data.get("roads", "everything"), ENGINE.reload_all):
+                self.send_json({"error": "Đang có tác vụ chạy"}, status=409)
+                return
+            self.send_json({"status": "ok"})
+            return
+
+        elif parsed.path == "/api/publish":
+            if ENGINE.changes_count:
+                self.send_json({"error": "Còn thay đổi chưa lưu — bấm Lưu trước"}, status=409)
+                return
+            if not JOB.start("Phát hành", SD.job_publish, data.get("notes", "")):
+                self.send_json({"error": "Đang có tác vụ chạy"}, status=409)
+                return
+            self.send_json({"status": "ok"})
             return
 
         elif parsed.path == "/api/save_dataset":

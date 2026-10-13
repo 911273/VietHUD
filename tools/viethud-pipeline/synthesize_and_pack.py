@@ -45,11 +45,41 @@ DEFAULT_SPEED_BY_HIGHWAY = {
     "motorway": 100, "motorway_link": 60, "trunk": 80, "primary": 80,
     "secondary": 70, "tertiary": 60, "residential": 50, "living_street": 50,
 }
+# Which OSM highway=* make up the map (2026-10-13): only roads a car drives
+# on — footways, paths, steps, cycleways, bridleways, construction etc. used to
+# be packed too and bloated the nationwide set for nothing.
+MAJOR_HIGHWAYS = {
+    "motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link",
+    "secondary", "secondary_link", "tertiary", "tertiary_link",
+}
+LOCAL_HIGHWAYS = {"unclassified", "residential", "living_street", "road"}
+
+
+class _Everything(set):
+    """highway=* that exists on the ground — every road, alley, service way,
+    track, path, footway, steps... (2026-10-13: "không bỏ sót bất kỳ thông tin
+    nào, cả ngõ ngách"). Only planned / removed / indoor / non-linear values
+    are left out."""
+    EXCLUDE = {"proposed", "construction", "abandoned", "disused", "razed", "planned", "no",
+               "corridor", "elevator", "platform", "bus_stop", "rest_area", "services", "emergency_bay",
+               "street_lamp", "traffic_signals", "crossing", "turning_circle", "turning_loop", "milestone",
+               "give_way", "stop", "speed_camera", "mini_roundabout", "motorway_junction", "passing_place"}
+
+    def __contains__(self, hw):
+        return bool(hw) and hw not in self.EXCLUDE
+
+
+HIGHWAY_SETS = {"major": MAJOR_HIGHWAYS, "all": MAJOR_HIGHWAYS | LOCAL_HIGHWAYS, "everything": _Everything()}
+# Ways a car can't use: drawn on the map, never matched as the car's road.
+NON_VEHICLE_HIGHWAYS = {"footway", "path", "steps", "pedestrian", "cycleway", "bridleway", "corridor",
+                        "via_ferrata", "ladder"}
+
 ROAD_CLASS_BY_HIGHWAY = {
     "motorway": 1, "motorway_link": 1, "trunk": 1, "trunk_link": 1,
     "primary": 1, "primary_link": 1,
     "secondary": 2, "secondary_link": 2, "tertiary": 2, "tertiary_link": 2,
     "residential": 3, "living_street": 3, "unclassified": 3, "service": 3, "track": 3,
+    "road": 3, "footway": 4, "path": 4, "steps": 4, "pedestrian": 4, "cycleway": 4, "bridleway": 4,
 }
 
 
@@ -107,11 +137,89 @@ def angle_diff(a, b):
     return 360.0 - d if d > 180.0 else d
 
 
+
+def in_box(lat, lon, box):
+    return box[0] <= lat <= box[1] and box[2] <= lon <= box[3]
+
+
+def way_selected(t, highways, detail_bbox, w=None):
+    """Main roads everywhere; local streets only inside detail_bbox (if set)."""
+    hw = t.get("highway")
+    if hw not in highways or t.get("area") == "yes":
+        return False
+    if t.get("access") in ("no", "private") and hw not in MAJOR_HIGHWAYS and not isinstance(highways, _Everything):
+        return False
+    if hw not in MAJOR_HIGHWAYS and detail_bbox is not None and w is not None:
+        for nr in w.nodes:
+            loc = nr.location
+            if loc.valid() and in_box(loc.lat, loc.lon, detail_bbox):
+                return True
+        return False
+    return True
+
+
+def simplify_keep_nodes(coords, refs, keep_ids, tol_deg):
+    """Douglas-Peucker on one way, never removing its end points or any node
+    shared with another kept way (the firmware chains segments by exact shared
+    node coordinates, so junctions must survive)."""
+    anchors = [i for i, r in enumerate(refs) if i == 0 or i == len(refs) - 1 or r in keep_ids]
+    keep = set(anchors)
+    tol2 = tol_deg * tol_deg
+    for a, b in zip(anchors, anchors[1:]):
+        stack = [(a, b)]
+        while stack:
+            i, j = stack.pop()
+            if j - i < 2:
+                continue
+            (y0, x0), (y1, x1) = coords[i], coords[j]
+            dx, dy = x1 - x0, y1 - y0
+            L = dx * dx + dy * dy
+            best, bk = -1.0, -1
+            for k in range(i + 1, j):
+                y, x = coords[k]
+                if L == 0:
+                    d = (x - x0) ** 2 + (y - y0) ** 2
+                else:
+                    tt = max(0.0, min(1.0, ((x - x0) * dx + (y - y0) * dy) / L))
+                    d = (x - x0 - tt * dx) ** 2 + (y - y0 - tt * dy) ** 2
+                if d > best:
+                    best, bk = d, k
+            if best > tol2:
+                keep.add(bk)
+                stack += [(i, bk), (bk, j)]
+    return [c for k, c in enumerate(coords) if k in keep]
+
+
+if osmium is not None:
+    class JunctionCounter(osmium.SimpleHandler):
+        """Pass 1: node ids referenced by two or more selected ways."""
+        def __init__(self, highways, detail_bbox):
+            super().__init__()
+            self.highways, self.detail_bbox = highways, detail_bbox
+            self.seen, self.junctions = set(), set()
+
+        def way(self, w):
+            if not way_selected(w.tags, self.highways, self.detail_bbox, w):
+                return
+            refs = [n.ref for n in w.nodes]
+            for r in (refs[0], refs[-1]):
+                self.junctions.add(r)
+            for r in refs:
+                if r in self.seen:
+                    self.junctions.add(r)
+                else:
+                    self.seen.add(r)
+
 # ---------------------------------------------------------------------------
 if osmium is not None:
     class VietHudOsmHandler(osmium.SimpleHandler):
-        def __init__(self):
+        def __init__(self, highways=None, bbox=None, junctions=None, simplify_m=0.0, detail_bbox=None):
             super().__init__()
+            self.highways = highways or HIGHWAY_SETS["all"]
+            self.bbox = bbox  # (min_lat, max_lat, min_lon, max_lon) or None
+            self.junctions = junctions or set()  # node ids used by >= 2 kept ways: never simplified away
+            self.simplify_deg = simplify_m / 111000.0
+            self.detail_bbox = detail_bbox  # local roads only inside this box (None = everywhere)
             self.segments = []
             self.seg_name = {}      # segId -> street name (str)
             self.cameras = []
@@ -120,6 +228,9 @@ if osmium is not None:
 
         def node(self, n):
             if not n.location.valid():
+                return
+            if self.bbox and not (self.bbox[0] <= n.location.lat <= self.bbox[1] and
+                                  self.bbox[2] <= n.location.lon <= self.bbox[3]):
                 return
             t = n.tags
             hw = t.get("highway")
@@ -140,13 +251,20 @@ if osmium is not None:
 
         def way(self, w):
             t = w.tags
-            if "highway" not in t:
+            if not way_selected(t, self.highways, self.detail_bbox, w):
+                return
+            if t.get("access") in ("no", "private") and t.get("highway") not in MAJOR_HIGHWAYS:
                 return
             coords = []
             for nr in w.nodes:
                 loc = nr.location
                 coords.append((loc.lat, loc.lon) if loc.valid() else None)
             if len(coords) < 2:
+                return
+            if self.simplify_deg > 0 and None not in coords:
+                coords = simplify_keep_nodes(coords, [nr.ref for nr in w.nodes], self.junctions, self.simplify_deg)
+            if self.bbox and not any(c and self.bbox[0] <= c[0] <= self.bbox[1] and
+                                     self.bbox[2] <= c[1] <= self.bbox[3] for c in coords):
                 return
             name = t.get("name:vi") or t.get("name") or t.get("ref")
             hw = t.get("highway")
@@ -155,6 +273,8 @@ if osmium is not None:
             has_cond = "maxspeed:conditional" in t
             fwd, bwd, plain = t.get("maxspeed:forward"), t.get("maxspeed:backward"), t.get("maxspeed")
             base_flags = (F.SEGFLAG_HAS_CONDITIONAL if has_cond else 0) | F.grade_flags(t)
+            if hw in NON_VEHICLE_HIGHWAYS or t.get("motor_vehicle") == "no" or t.get("vehicle") == "no":
+                base_flags |= F.SEGFLAG_NO_VEHICLE
 
             for i in range(len(coords) - 1):
                 a, b = coords[i], coords[i + 1]
@@ -188,14 +308,16 @@ if osmium is not None:
 
 
 # ---------------------------------------------------------------------------
-def load_custom_alerts():
+def load_custom_alerts(folder=None):
     """Read every input/custom_alerts/*.csv. Columns (header row required):
        lat, lon, sign_type, [speed_limit], [heading|direction], [sub_type]
     sign_type uses the firmware TrafficSignType numbers (1 speed,2 resident,
     3 no-overtake,4 camera,5 toll,6 traffic-light,10 danger). heading is in
     degrees 0..359 (or blank => omnidirectional)."""
     alerts = []
-    for path in sorted(glob.glob(str(CUSTOM_ALERTS_DIR / "*.csv"))):
+    for path in sorted(glob.glob(os.path.join(str(folder or CUSTOM_ALERTS_DIR), "*.csv"))):
+        if os.path.basename(path) == "suppress.csv":
+            continue
         try:
             with open(path, "r", encoding="utf-8-sig") as f:
                 for row in csv.DictReader(f):
@@ -214,6 +336,45 @@ def load_custom_alerts():
         except Exception as e:
             LOG.error("custom_alerts: failed to read %s: %s", path, e)
     return alerts
+
+
+def load_suppressed(folder=None):
+    """suppress.csv (lat, lon, sign_type): OSM points the operator deleted in
+    SpeedMap Studio. They are dropped at every rebuild (<= 12 m, same type)."""
+    path = os.path.join(str(folder or CUSTOM_ALERTS_DIR), "suppress.csv")
+    out = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                try:
+                    out.append((float(row["lat"]), float(row["lon"]), int(float(row["sign_type"]))))
+                except (KeyError, ValueError):
+                    continue
+        LOG.info("suppress: %d deleted point(s)", len(out))
+    return out
+
+
+def drop_suppressed(points, suppressed, type_key, radius_m=12.0):
+    if not suppressed:
+        return points
+    cell = 0.0002
+    grid = {}
+    for la, lo, st in suppressed:
+        grid.setdefault((int(la / cell), int(lo / cell)), []).append((la, lo, st))
+    keep = []
+    for p in points:
+        k = (int(p["lat"] / cell), int(p["lon"] / cell))
+        hit = False
+        for dk in ((k[0] + a, k[1] + b) for a in (-1, 0, 1) for b in (-1, 0, 1)):
+            for la, lo, st in grid.get(dk, ()):
+                if st == type_key(p) and haversine_m(la, lo, p["lat"], p["lon"]) <= radius_m:
+                    hit = True
+                    break
+            if hit:
+                break
+        if not hit:
+            keep.append(p)
+    return keep
 
 
 def spatial_dedup(osm_signs, custom_signs, radius_m=10.0, angle_deg=45.0):
@@ -260,6 +421,13 @@ def main():
     ap.add_argument("--sounds-src", default=os.environ.get("VIETHUD_SOUNDS_SRC", ""))
     ap.add_argument("--region", default=REGION_CODE)
     ap.add_argument("--map-version", default=time.strftime("%Y.%m.%d.%H%M"))
+    ap.add_argument("--roads", choices=sorted(HIGHWAY_SETS), default="everything",
+                    help="major = motorway..tertiary; all = + local streets; everything = every way on the ground")
+    ap.add_argument("--bbox", nargs=4, type=float, metavar=("MINLAT", "MAXLAT", "MINLON", "MAXLON"))
+    ap.add_argument("--custom-alerts", default=None, help="folder of surveyed/edited alert CSVs")
+    ap.add_argument("--detail-bbox", nargs=4, type=float, metavar=("MINLAT", "MAXLAT", "MINLON", "MAXLON"),
+                    help="local streets (with --roads all) only inside this box; main roads everywhere")
+    ap.add_argument("--simplify-m", type=float, default=4.0, help="shape simplification tolerance (0 = off)")
     ap.add_argument("--osm-index", default=os.environ.get("VIETHUD_OSM_INDEX", "flex_mem"),
                     help="pyosmium node-location index (flex_mem | sparse_file_array,<path>)")
     args = ap.parse_args()
@@ -274,7 +442,17 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     t0 = time.time()
     LOG.info("parsing OSM %s (index=%s) ...", args.pbf, args.osm_index)
-    h = VietHudOsmHandler()
+    hw = HIGHWAY_SETS[args.roads]
+    detail = tuple(args.detail_bbox) if args.detail_bbox else None
+    junctions = set()
+    if args.simplify_m > 0:
+        LOG.info("pass 1: junction nodes ...")
+        jc = JunctionCounter(hw, detail)
+        jc.apply_file(args.pbf, locations=True, idx=args.osm_index)
+        junctions = jc.junctions
+        jc.seen = None
+        LOG.info("pass 1: %d junction/end nodes", len(junctions))
+    h = VietHudOsmHandler(hw, tuple(args.bbox) if args.bbox else None, junctions, args.simplify_m, detail)
     h.apply_file(args.pbf, locations=True, idx=args.osm_index)
     LOG.info("parsed: %d segments, %d OSM signs, %d cameras in %.0fs",
              len(h.segments), len(h.signs), len(h.cameras), time.time() - t0)
@@ -284,7 +462,10 @@ def main():
         return 2
 
     # Merge operator's surveyed alerts.
-    custom = load_custom_alerts()
+    custom = load_custom_alerts(args.custom_alerts)
+    suppressed = load_suppressed(args.custom_alerts)
+    h.signs = drop_suppressed(h.signs, suppressed, lambda p: p["sign_type"])
+    h.cameras = drop_suppressed(h.cameras, suppressed, lambda p: F.SIGN_TYPE_CAMERA)
     custom_cams = [c for c in custom if c["sign_type"] == F.SIGN_TYPE_CAMERA]
     signs = spatial_dedup(h.signs, custom)
     cameras = h.cameras + [dict(id=9_000_000_000 + i, lat=c["lat"], lon=c["lon"],
@@ -311,7 +492,8 @@ def main():
 
     # Drop a machine-readable summary for github_and_notify.py.
     import json
-    (SPEEDMAP_OUT.parent / "last_pack_summary.json").write_text(json.dumps(summary, indent=2))
+    open(os.path.join(os.path.dirname(os.path.abspath(args.out)), "last_pack_summary.json"), "w").write(
+        json.dumps(summary, indent=2))
     print(json.dumps(summary))
     return 0
 

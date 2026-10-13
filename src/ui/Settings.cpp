@@ -877,8 +877,13 @@ static void onBackToDashboard(lv_event_t *) { lv_screen_load(dashboardScreen); }
 // is showing. Checked once a second, not on every tick: a 5s timeout only
 // needs ~1s granularity, and this runs even while idle on Settings so it
 // isn't worth being more precise than a human would notice.
+static int s_calibStep = -1; // touch calibration step in progress (calibration screen below), -1 = none
 static void checkIdleReturnToDashboard(lv_timer_t *) {
     if (lv_screen_active() != settingsScreen) return;
+    // Never leave in the middle of a touch calibration: the touch task is in
+    // raw mode then, and dropping back to the Dashboard left the screen
+    // uncalibrated and the calibration half-done.
+    if (s_calibStep >= 0) return;
     // Do NOT auto-exit while the user is in the WiFi menu (user-requested
     // 2026-09-26). Scanning, picking a network and typing a password on the
     // on-screen keyboard legitimately take longer than the 5s idle window, and
@@ -957,10 +962,12 @@ static lv_obj_t *calibTargetObj = nullptr;
 static lv_obj_t *calibPromptLbl = nullptr;
 static lv_obj_t *calibSubLbl = nullptr;
 static lv_obj_t *calibCancelBtn = nullptr;
-static int s_calibStep = -1;
 static lv_point_t s_calibTargets[4];
-static int16_t s_calibErrX[4];
-static int16_t s_calibErrY[4];
+static float s_calibRawX[4], s_calibRawY[4];
+// Samples of the press in progress: averaged over the hold, the first few
+// (finger still landing) skipped.
+static int32_t s_pressSumX = 0, s_pressSumY = 0, s_pressN = 0, s_pressSeen = 0;
+static uint32_t s_pressStartMs = 0;
 
 static void updateCalibTargetDisplay() {
     if (s_calibStep < 0 || s_calibStep >= 4) return;
@@ -968,92 +975,135 @@ static void updateCalibTargetDisplay() {
     int ty = s_calibTargets[s_calibStep].y;
     lv_obj_set_pos(calibTargetObj, tx - 20, ty - 20);
     lv_obj_clear_flag(calibTargetObj, LV_OBJ_FLAG_HIDDEN);
-
-    char buf[48];
-    snprintf(buf, sizeof(buf), "Chạm chính xác vào tâm điểm %d/4", s_calibStep + 1);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Chạm và giữ vào tâm điểm %d/4", s_calibStep + 1);
     lv_label_set_text(calibPromptLbl, buf);
+    lv_label_set_text(calibSubLbl, "Giữ ngón tay yên ~1/2 giây rồi nhấc lên");
+}
 
-    char coordBuf[48];
-    snprintf(coordBuf, sizeof(coordBuf), "Tọa độ mục tiêu: (%d, %d)", tx, ty);
-    lv_label_set_text(calibSubLbl, coordBuf);
+static void calibEnd() {
+#ifndef VIETHUD_P4
+    gTouchRawMode = false;
+#endif
+    s_calibStep = -1;
 }
 
 static void onCalibCloseTimer(lv_timer_t *t) {
     if (touchCalibOverlay) lv_obj_add_flag(touchCalibOverlay, LV_OBJ_FLAG_HIDDEN);
-    s_calibStep = -1;
-    lv_timer_del(t);
+    lv_timer_delete(t);
 }
 
 static void onCalibCancelClicked(lv_event_t *) {
-    s_calibStep = -1;
+    calibEnd();
     if (touchCalibOverlay) lv_obj_add_flag(touchCalibOverlay, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(settingsStatusLabel, "Touch calib canceled");
 }
 
-static void onCalibOverlayClicked(lv_event_t *e) {
-    if (s_calibStep < 0 || s_calibStep >= 4) return;
-    lv_obj_t *target = lv_event_get_target_obj(e);
-    if (target == calibCancelBtn) return;
+// Least-squares fit target = raw * scale + offset for one axis (4 points).
+static bool fitAxis(const float *raw, const float *tgt, float *scale, float *off) {
+    float mr = 0, mt = 0;
+    for (int i = 0; i < 4; i++) { mr += raw[i]; mt += tgt[i]; }
+    mr /= 4; mt /= 4;
+    float sxx = 0, sxy = 0;
+    for (int i = 0; i < 4; i++) { sxx += (raw[i] - mr) * (raw[i] - mr); sxy += (raw[i] - mr) * (tgt[i] - mt); }
+    if (sxx < 100.0f) return false; // taps not spread out — can't fit a scale
+    *scale = sxy / sxx;
+    *off = mt - *scale * mr;
+    return true;
+}
 
-    lv_indev_t *indev = lv_event_get_indev(e);
-    if (!indev) indev = lv_indev_get_act();
-    lv_point_t p = {0, 0};
-    if (indev) lv_indev_get_point(indev, &p);
-
-    s_calibErrX[s_calibStep] = (int16_t)(s_calibTargets[s_calibStep].x - p.x);
-    s_calibErrY[s_calibStep] = (int16_t)(s_calibTargets[s_calibStep].y - p.y);
-    Serial.printf("[touch] Calib pt %d: target=(%d,%d) tap=(%d,%d) err=(%d,%d)\n",
-                  s_calibStep + 1, (int)s_calibTargets[s_calibStep].x, (int)s_calibTargets[s_calibStep].y,
-                  (int)p.x, (int)p.y, (int)s_calibErrX[s_calibStep], (int)s_calibErrY[s_calibStep]);
-
-    s_calibStep++;
-    if (s_calibStep < 4) {
-        updateCalibTargetDisplay();
-    } else {
-        float avgDx = (float)(s_calibErrX[0] + s_calibErrX[1] + s_calibErrX[2] + s_calibErrX[3]) / 4.0f;
-        float avgDy = (float)(s_calibErrY[0] + s_calibErrY[1] + s_calibErrY[2] + s_calibErrY[3]) / 4.0f;
-        cfg.touchOffsetX += avgDx;
-        cfg.touchOffsetY += avgDy;
+static void calibFinish() {
+    float tx[4], ty[4];
+    for (int i = 0; i < 4; i++) { tx[i] = s_calibTargets[i].x; ty[i] = s_calibTargets[i].y; }
+    float sx, ox, sy, oy;
+    bool ok = fitAxis(s_calibRawX, tx, &sx, &ox) && fitAxis(s_calibRawY, ty, &sy, &oy);
+    float worst = 0;
+    if (ok) {
+        for (int i = 0; i < 4; i++) {
+            float ex = s_calibRawX[i] * sx + ox - tx[i], ey = s_calibRawY[i] * sy + oy - ty[i];
+            float e = sqrtf(ex * ex + ey * ey);
+            if (e > worst) worst = e;
+        }
+        ok = sx > 0.7f && sx < 1.4f && sy > 0.7f && sy < 1.4f && fabsf(ox) < 80 && fabsf(oy) < 80 && worst < 18.0f;
+    }
+    calibEnd();
+    lv_obj_add_flag(calibTargetObj, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(calibCancelBtn, LV_OBJ_FLAG_HIDDEN);
+    char res[96];
+    if (ok) {
+        cfg.touchScaleX = sx; cfg.touchOffsetX = ox;
+        cfg.touchScaleY = sy; cfg.touchOffsetY = oy;
         clampConfig(cfg);
         saveConfigToNVS(cfg);
         refreshAllSliders();
-
-        lv_obj_add_flag(calibTargetObj, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(calibCancelBtn, LV_OBJ_FLAG_HIDDEN);
-
         lv_label_set_text(calibPromptLbl, "HIỆU CHUẨN THÀNH CÔNG!");
-        char resBuf[64];
-        snprintf(resBuf, sizeof(resBuf), "Độ lệch mới: X=%.0f px, Y=%.0f px", (double)cfg.touchOffsetX, (double)cfg.touchOffsetY);
-        lv_label_set_text(calibSubLbl, resBuf);
+        snprintf(res, sizeof(res), "Sai số còn lại tối đa %.0f px", (double)worst);
+        lv_label_set_text(settingsStatusLabel, "Touch calibrated");
+    } else {
+        lv_label_set_text(calibPromptLbl, "CHƯA ĐẠT - GIỮ NGUYÊN HIỆU CHUẨN CŨ");
+        snprintf(res, sizeof(res), "Các điểm chạm lệch nhiều (%.0f px). Hãy làm lại.", (double)worst);
+        lv_label_set_text(settingsStatusLabel, "Touch calib rejected");
+    }
+    lv_label_set_text(calibSubLbl, res);
+    Serial.printf("[touch] calib %s: X=%.3f*x%+.1f Y=%.3f*y%+.1f worst=%.1fpx\n", ok ? "OK" : "REJECTED", (double)sx,
+                  (double)ox, (double)sy, (double)oy, (double)worst);
+    lv_timer_create(onCalibCloseTimer, 1800, NULL);
+}
 
-        char stBuf[48];
-        snprintf(stBuf, sizeof(stBuf), "Touch: X=%.0f, Y=%.0f", (double)cfg.touchOffsetX, (double)cfg.touchOffsetY);
-        lv_label_set_text(settingsStatusLabel, stBuf);
-
-        lv_timer_create(onCalibCloseTimer, 1400, NULL);
+static void onCalibOverlayEvent(lv_event_t *e) {
+    if (s_calibStep < 0 || s_calibStep >= 4) return;
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_indev_t *indev = lv_indev_active();
+    if (!indev) return;
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    if (code == LV_EVENT_PRESSED) {
+        s_pressSumX = s_pressSumY = s_pressN = s_pressSeen = 0;
+        s_pressStartMs = millis();
+    } else if (code == LV_EVENT_PRESSING) {
+        if (++s_pressSeen > 3) { s_pressSumX += p.x; s_pressSumY += p.y; s_pressN++; }
+    } else if (code == LV_EVENT_RELEASED) {
+        if (s_pressN < 3 || millis() - s_pressStartMs < 150) {
+            lv_label_set_text(calibSubLbl, "Giữ lâu hơn một chút rồi nhấc lên");
+            return;
+        }
+        s_calibRawX[s_calibStep] = (float)s_pressSumX / s_pressN;
+        s_calibRawY[s_calibStep] = (float)s_pressSumY / s_pressN;
+        Serial.printf("[touch] calib pt %d: target=(%d,%d) raw=(%.1f,%.1f) n=%d\n", s_calibStep + 1,
+                      (int)s_calibTargets[s_calibStep].x, (int)s_calibTargets[s_calibStep].y,
+                      (double)s_calibRawX[s_calibStep], (double)s_calibRawY[s_calibStep], (int)s_pressN);
+        if (++s_calibStep < 4) updateCalibTargetDisplay();
+        else calibFinish();
     }
 }
 
 static void onTouchCalibStartClicked(lv_event_t *) {
+#ifdef VIETHUD_P4
+    gTouchCalRequested = true; // the P4 has its own full-screen calibration (TouchTaskP4)
+    return;
+#else
     if (!touchCalibOverlay) return;
     int scrW = gfx ? gfx->width() : 480;
     int scrH = gfx ? gfx->height() : 320;
-    int mx = 45;
-    int my = 45;
+    int mx = scrW / 8, my = scrH / 8; // near the corners, clear of the bezel
     s_calibTargets[0] = {(int32_t)mx, (int32_t)my};
     s_calibTargets[1] = {(int32_t)(scrW - mx), (int32_t)my};
     s_calibTargets[2] = {(int32_t)(scrW - mx), (int32_t)(scrH - my)};
     s_calibTargets[3] = {(int32_t)mx, (int32_t)(scrH - my)};
-
+    gTouchRawMode = true; // fit from the controller's own coordinates
     s_calibStep = 0;
     lv_obj_clear_flag(calibCancelBtn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(touchCalibOverlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(touchCalibOverlay);
     updateCalibTargetDisplay();
+#endif
 }
 
 static void onTouchResetClicked(lv_event_t *) {
     cfg.touchOffsetX = 0.0f;
     cfg.touchOffsetY = 0.0f;
+    cfg.touchScaleX = 1.0f;
+    cfg.touchScaleY = 1.0f;
     clampConfig(cfg);
     saveConfigToNVS(cfg);
     refreshAllSliders();
@@ -1074,7 +1124,9 @@ static void buildTouchCalibOverlay(lv_obj_t *parent) {
     lv_obj_clear_flag(touchCalibOverlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(touchCalibOverlay, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(touchCalibOverlay, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(touchCalibOverlay, onCalibOverlayClicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(touchCalibOverlay, onCalibOverlayEvent, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(touchCalibOverlay, onCalibOverlayEvent, LV_EVENT_PRESSING, NULL);
+    lv_obj_add_event_cb(touchCalibOverlay, onCalibOverlayEvent, LV_EVENT_RELEASED, NULL);
 
     lv_obj_t *title = lv_label_create(touchCalibOverlay);
     lv_label_set_text(title, "HIỆU CHUẨN CẢM ỨNG (4 ĐIỂM)");
@@ -1099,6 +1151,7 @@ static void buildTouchCalibOverlay(lv_obj_t *parent) {
     lv_obj_set_style_border_width(calibTargetObj, 2, 0);
     lv_obj_set_style_radius(calibTargetObj, LV_RADIUS_CIRCLE, 0);
     lv_obj_clear_flag(calibTargetObj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(calibTargetObj, LV_OBJ_FLAG_CLICKABLE); // the press goes to the overlay
 
     lv_obj_t *dot = lv_obj_create(calibTargetObj);
     lv_obj_set_size(dot, 6, 6);
@@ -1108,6 +1161,7 @@ static void buildTouchCalibOverlay(lv_obj_t *parent) {
     lv_obj_set_style_border_width(dot, 0, 0);
     lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
     lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
 
     calibCancelBtn = lv_button_create(touchCalibOverlay);
     lv_obj_set_size(calibCancelBtn, 100, 32);

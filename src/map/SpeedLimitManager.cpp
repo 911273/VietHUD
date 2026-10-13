@@ -169,6 +169,7 @@ struct MatchCandidate {
 
 static bool evaluateSegment(const RoadSegment &seg, float fixLat, float fixLon, bool headingValid, float headingDeg,
                              bool headingPredicted, MatchCandidate &outCand) {
+    if (seg.flags & SEGFLAG_NO_VEHICLE) return false; // footway/path/steps: map only
     float maxMatchDistanceM = kMaxMatchDistanceM;
 
     float startLat = seg.startLatE7 / 1e7f, startLon = seg.startLonE7 / 1e7f;
@@ -900,6 +901,7 @@ static void nearestRoadNameFallback(const GnssSnapshot &gnss, RoadInfoSnapshot &
         if (!tile) continue;
         for (int i = 0; i < tile->segCount; i++) {
             const RoadSegment &sg = tile->segments[i];
+            if (sg.flags & SEGFLAG_NO_VEHICLE) continue; // name the car's road, not a footway beside it
             float d = pointSegmentDistanceM(gnss.latDeg, gnss.lonDeg, sg.startLatE7 / 1e7f, sg.startLonE7 / 1e7f,
                                             sg.endLatE7 / 1e7f, sg.endLonE7 / 1e7f);
             if (d > kNameFallbackM) continue;

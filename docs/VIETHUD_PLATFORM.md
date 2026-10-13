@@ -103,11 +103,16 @@ Build/flash one model: `python tools/build.py <env> [upload|uploadfs] [--port CO
 
 ## Data
 
-Two independent online channels, each with its own ECDSA-signed manifest:
+Firmware goes to GitHub + the Pi; **data lives on the Pi only**
+(`http://<pi>/viethud/`, no 100 MB GitHub limit). A unit reaches it on the
+home Wi-Fi (LAN `192.168.1.65`, then mDNS `homebridge.local`) and away from
+home through a phone hotspot whose phone runs Tailscale (`100.107.34.92`) —
+`net/DataSources.h` tries the three in that order.
 
 | channel | content | publisher | read by |
 |---|---|---|---|
-| `speedmap/` | speed map + cameras/signs | the Pi's existing 02:00 data job | `net/DataUpdater` (3.5", 2.8", P4 with a card) |
+| `speedmap/` | full OSM set: **every** road incl. alleys (footways drawn, never matched), cameras/signs, your surveyed points | SpeedMap Studio → 🚀 Phát hành | `net/DataUpdater` (3.5", 2.8", P4 with a card) |
+| `speedmap_lite154/` | main roads of the north (class 1 everywhere, class 2 ~100 km round Ha Noi, 15 m simplified) + the region's alerts + Lite names | same | `net/DataUpdater` (Lite) |
 | `roadnames/` | every named road incl. alleys, whole country (OSM) | `tools/roadnames-job` on the Pi, weekly | `net/NamesUpdater` (card boards) |
 | `roadnames_lite154/` | same, ~33 km around Ha Noi | same job | `net/NamesUpdater` (Lite) |
 
@@ -116,15 +121,43 @@ a check the user asks for runs at once. Updates download in update mode
 (reboot), are SHA-256 checked, and the speed-map set installs atomically with
 rollback.
 
-Flash-only boards get an image cut from `speedmap/` + `roadnames_lite154/`
-(`python tools/build_flash_data.py all`): every main road of the north, the
-region's cameras/signs, Ha Noi street names, `sounds/vi/`; the Lite keeps ~2 MB
-free to stage updates. That image contains the third-party alert data, so it
-is loaded over USB (`tools/build.py viethud_lite154 uploadfs`) or pushed from
-this PC (`tools/push_data.py --dir data_lite154/speedmap`) — never published.
-The Lite therefore has no online speed-map channel (`BOARD_DATA_URL ""`), only
-its road-name channel. The P4 without a card cannot install data (read-only
-flash).
+### SpeedMap Studio (`python tools/speedmap_studio/server.py`, http://localhost:8088)
+
+- **🌐 Cập nhật OSM** downloads the latest Geofabrik Vietnam extract
+  (`data/osm/`, only when newer) and rebuilds the working set
+  `data/studio/speedmap/` with `--roads everything` (~20 min, ~290 MB).
+- View / add / move / delete cameras, signs, lights. Every edit is written at
+  once to `data/custom_alerts/` (`studio.csv` = your points, `suppress.csv` =
+  OSM points you deleted); the next OSM rebuild merges them back in. That
+  folder is the only data in git.
+- **💾 Lưu** writes `cameras.bin` + `signs.bin` of the working set.
+- **🚀 Phát hành** signs and uploads `speedmap/` to the Pi (upload to
+  `<channel>.new`, then one swap), builds the Lite flash set
+  (`data/studio/flash/`, `--roads major --bbox north --simplify-m 15`), cuts the
+  Lite/P4 flash images (`tools/build_flash_data.py all --src ...`), publishes
+  `speedmap_lite154/`, and commits + pushes `data/custom_alerts/`.
+
+OSM has very few cameras (≈40 nationwide): camera coverage comes from your
+own surveyed points.
+
+### Flash boards
+
+`python tools/build_flash_data.py all --src data/studio/flash/speedmap` cuts the
+Lite (11.1 MB, ~2 MB kept free to stage updates) and P4-without-card (9.4 MB,
+read-only) images: class-1 roads of the whole north first, then class-2 roads
+outward from Ha Noi while they fit; the region's alerts; Ha Noi street names;
+`sounds/vi/`. Load over USB (`tools/build.py viethud_lite154 uploadfs`, or the
+Update Tool).
+
+### VIETHUD_UPDATE_TOOL (`tools/update_tool`)
+
+Plug a unit in by USB: it identifies the board (chip + `VIETHUD-HW-ID` marker
+in the running image), flashes the matching firmware from the Pi/GitHub release
+(full flash incl. bootloader + table when the partition table differs), and
+updates data — flash boards: image cut from Studio's flash set (or the Pi's
+`speedmap_lite154/`) written with uploadfs; card boards: the Pi's `speedmap/`
+downloaded (resumable, SHA-checked) and pushed over Wi-Fi. It also publishes
+firmware (`release.py --upload-pi`) and opens Studio.
 
 ## Old stand-alone Lite (3.x) units
 

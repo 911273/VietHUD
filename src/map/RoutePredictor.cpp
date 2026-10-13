@@ -168,6 +168,7 @@ int Route::build(const RoadSegment &startSeg, float startHeadingDeg, float ahead
                 // that doesn't, this candidate is unusable here. Tolerant match,
                 // same reason as startsHere/endsHere above.
                 if (!segNodesCoincide(cStartLat, cStartLon, nodeLat, nodeLon)) continue;
+                if (seg.flags & SEGFLAG_NO_VEHICLE) continue; // a car's route never follows a footway
 
                 float turn = angDiff(incomingHeading, cHeading);
                 if (turn <= kForkTurnDeg) plausible++;

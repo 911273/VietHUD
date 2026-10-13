@@ -79,8 +79,8 @@ void loadConfigFromNVS(AppConfig &cfg) {
     String durl = prefs.getString("dataUrl", cfg.dataUpdateUrl);
     strncpy(cfg.dataUpdateUrl, durl.c_str(), sizeof(cfg.dataUpdateUrl) - 1);
     cfg.dataUpdateUrl[sizeof(cfg.dataUpdateUrl) - 1] = '\0';
-    // The Lite's online speed-map channel was retired before it shipped (2026-10-13).
-    if (strstr(cfg.dataUpdateUrl, "speedmap_lite154")) {
+    // Data moved from GitHub to the Pi (2026-10-13): old default URLs follow.
+    if (strstr(cfg.dataUpdateUrl, "raw.githubusercontent.com") || !cfg.dataUpdateUrl[0]) {
         strncpy(cfg.dataUpdateUrl, BOARD_DATA_URL, sizeof(cfg.dataUpdateUrl) - 1);
         cfg.dataUpdateUrl[sizeof(cfg.dataUpdateUrl) - 1] = '\0';
     }
@@ -105,6 +105,8 @@ void loadConfigFromNVS(AppConfig &cfg) {
     cfg.voicePack = prefs.getFloat("voicePack", cfg.voicePack);
     cfg.touchOffsetX = prefs.getFloat("touchOffX", cfg.touchOffsetX);
     cfg.touchOffsetY = prefs.getFloat("touchOffY", cfg.touchOffsetY);
+    cfg.touchScaleX = prefs.getFloat("touchSclX", cfg.touchScaleX);
+    cfg.touchScaleY = prefs.getFloat("touchSclY", cfg.touchScaleY);
 
     // One-time config migration (2026-09-25). Older builds shipped a 90 km/h
     // fallback and persisted it, so devices carry a stale defLimitKmh=90 in NVS
@@ -252,5 +254,7 @@ void saveConfigToNVS(const AppConfig &cfg) {
     prefs.putFloat("voicePack", cfg.voicePack);
     prefs.putFloat("touchOffX", cfg.touchOffsetX);
     prefs.putFloat("touchOffY", cfg.touchOffsetY);
+    prefs.putFloat("touchSclX", cfg.touchScaleX);
+    prefs.putFloat("touchSclY", cfg.touchScaleY);
     prefs.end();
 }
